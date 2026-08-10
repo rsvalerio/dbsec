@@ -1,0 +1,24 @@
+# Canonical rustfmt configuration.
+#
+# Non-dotted spelling, matching config/clippy.toml (PLAN.md §3.3); event0's `.rustfmt.toml`
+# should be renamed on adoption rather than kept alongside.
+#
+# `edition` is deliberately absent. `cargo fmt` passes the edition from each crate's
+# Cargo.toml, and hardcoding it here would silently format a 2024-edition crate under 2021
+# rules. event0's copy pins `edition = "2021"`; that pin is dropped rather than propagated.
+
+max_width = 100
+use_small_heuristics = "Max"
+newline_style = "Auto"
+hard_tabs = false
+tab_spaces = 4
+
+# Everything below requires nightly rustfmt. CI runs stable, so they are listed rather than
+# enabled — uncommenting them on stable makes rustfmt emit warnings and ignore them, which
+# reads as "configured" while doing nothing.
+#
+# imports_granularity = "Crate"
+# group_imports = "StdExternalCrate"
+# wrap_comments = true
+# comment_width = 100
+# format_code_in_doc_comments = true

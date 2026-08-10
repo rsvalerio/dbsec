@@ -1,0 +1,15 @@
+name: Bump
+on:
+  workflow_run:
+    workflows: ["CI"]
+    types: [completed]
+    branches: [main]
+
+jobs:
+  bump:
+    if: ${{ github.event.workflow_run.conclusion == 'success' }}
+    uses: rsvalerio/forge/.github/workflows/bump.yml@v1
+    with:
+      branch: ${{ github.event.workflow_run.head_branch }}
+    secrets:
+      GH_APP_PRIVATE_KEY: ${{ secrets.GH_APP_PRIVATE_KEY }}

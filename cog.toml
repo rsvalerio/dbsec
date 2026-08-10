@@ -1,0 +1,8 @@
+# Conventional-commit driven versioning (cocogitto), bumped by forge's bump.yml.
+# Signed mode: no push hooks — the workflow pushes commit + tag via the GitHub API.
+tag_prefix = "v"
+branch_whitelist = ["main"]
+skip_ci = "[skip ci]"
+
+pre_bump_hooks = ["cargo set-version {{version}}"]
+post_bump_hooks = []

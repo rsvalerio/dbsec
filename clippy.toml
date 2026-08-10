@@ -1,0 +1,27 @@
+# Canonical clippy configuration.
+#
+# Note the filename: ops uses `clippy.toml` and event0 uses `.clippy.toml` for the same
+# purpose. Cargo documents the non-dotted spelling, so that is the standard here (PLAN.md
+# §3.3). Consumers adopting this should rename, not add a second file — clippy reads only
+# one, and having both is how the two spellings silently disagree.
+#
+# `msrv` is deliberately absent: it differs per repo (ops 1.80, oxydraw 1.85, event0 1.92)
+# and belongs next to the `rust-version` it must match. Set it in the consumer's own file.
+
+# ops used 25; event0 used 10 to match its stricter internal guideline. 25 is the baseline
+# a repo can adopt without a refactor first — tighten locally rather than loosening here.
+cognitive-complexity-threshold = 25
+
+too-many-arguments-threshold = 5
+type-complexity-threshold = 250
+
+# Builder and extension patterns legitimately take many lines; this only fires as a lint
+# when the corresponding pedantic lint is enabled.
+too-many-lines-threshold = 100
+
+# Short binding names that are clearer than any expansion in loops, closures and channels.
+allowed-idents-below-min-chars = ["x", "y", "i", "j", "k", "n", "id", "tx", "rx", "db", "ok"]
+
+# These crates publish to crates.io eventually; renaming a public item is a breaking change,
+# so clippy should not propose one.
+avoid-breaking-exported-api = true

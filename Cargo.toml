@@ -1,0 +1,50 @@
+[workspace]
+resolver = "2"
+members = ["crates/core", "crates/proxy"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+repository = "https://github.com/rsvalerio/dbsec"
+
+[workspace.dependencies]
+dbsec-core = { path = "crates/core" }
+
+# async runtime + protocol
+tokio = { version = "1", features = ["rt-multi-thread", "net", "io-util", "macros", "signal", "time"] }
+postgres-protocol = "0.6"
+tokio-postgres = "0.7"
+tokio-postgres-rustls = "0.13"
+sqlparser = "0.53"
+
+# crypto
+aes-gcm = "0.10"
+hmac = "0.12"
+sha2 = "0.10"
+rand = "0.8"
+zeroize = { version = "1", features = ["derive"] }
+fpe = "0.6"
+hex = "0.4"
+
+# tls
+rustls = "0.23"
+tokio-rustls = "0.26"
+rustls-pki-types = "1"
+
+# kms
+vaultrs = "0.7"
+
+# config / errors / logging
+serde = { version = "1", features = ["derive"] }
+toml = "0.8"
+thiserror = "2"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# test-only
+proptest = "1"
+
+[profile.release]
+lto = "thin"
+strip = true
