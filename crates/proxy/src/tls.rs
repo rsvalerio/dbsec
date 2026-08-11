@@ -27,8 +27,19 @@ pub struct TlsContext {
     pub upstream_client: Option<Arc<ClientConfig>>,
 }
 
+/// Installs the process-wide rustls crypto provider. The dependency graph
+/// enables both `aws-lc-rs` (our rustls) and `ring` (vaultrs via reqwest),
+/// so rustls cannot pick a default automatically.
+pub fn install_crypto_provider() {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+    });
+}
+
 impl TlsContext {
     pub fn from_config(config: &Config) -> Result<Self, Error> {
+        install_crypto_provider();
         let acceptor = match &config.tls.downstream {
             Some(down) => {
                 let certs = load_certs(&down.cert)?;
