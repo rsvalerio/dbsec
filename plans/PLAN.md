@@ -83,19 +83,28 @@ TLS: `MaybeTls` stream enum both hops. Downstream handles `SSLRequest` from clie
    demand and cached. Index keys live in one KV secret, minted on first use.
    Needs live-server integration coverage in milestone 10)*
 10. **Hardening** — cargo-fuzz on the frame parser; driver integration suite (sqlx,
-    psycopg) over TLS against dockerized Postgres. *(done for the core scope:
-    `fuzz/` has `pgwire` and `envelope` targets (`make fuzz`; smoke-ran millions
-    of execs clean), and `make e2e` runs the real binary between tokio-postgres
-    (both protocols, TLS client hop) and dockerized Postgres 17, verifying
+    psycopg) over TLS against dockerized Postgres. *(done; `fuzz/` has `pgwire` and
+    `envelope` targets (`make fuzz`; smoke-ran millions of execs clean). `make e2e`
+    runs the real binary between dockerized Postgres 17 and three driver families
+    over the TLS client hop — tokio-postgres (both protocols), sqlx (cached named
+    statements, binary results, text-format BYTEA decoding) and psycopg 2/3 (unnamed
+    statements, prepared statements, client-side binding) — verifying
     encrypt/decrypt, FPE, tokens, masking, searchable equality and at-rest
-    ciphertext. Remaining nice-to-haves: sqlx/psycopg driver matrix, Vault e2e
-    against a live OpenBao)*
+    ciphertext. `make e2e-vault` repeats the core of that against a live dev-mode
+    OpenBao, covering cross-restart DEK unwrap through Transit and index-key reuse
+    from KV. Both targets take an already-running service via `DBSEC_E2E_DSN` /
+    `DBSEC_E2E_VAULT_ADDR` instead of starting a container. The matrix paid for
+    itself immediately: it found decrypted BYTEA handed back raw in text result
+    format (undecodable by typed drivers) and `'\x…'::bytea` literals from
+    client-side binding passing through unencrypted — both fixed)*
 
 ## Caveats (accepted trade-offs)
 
 - Deterministic blind index / tokens leak equality and frequency patterns.
 - sqlparser-rs won't parse all exotic PG syntax; those queries pass through unencrypted —
-  log loudly. `COPY FROM` is not encrypted; warn or reject on protected tables.
+  log loudly. Literals wrapped in casts (`'\x…'::bytea`, as psycopg's client-side binding
+  emits) are understood, but function calls and other computed values are not. `COPY FROM`
+  is not encrypted; warn or reject on protected tables.
 - FF1 on tiny domains (<6 digits) is brute-forceable — refuse in config validation.
 - Rotating the blind-index/FPE/token keys breaks determinism; only DEKs rotate freely.
 - Masking is enforced only for traffic through this proxy.
@@ -104,6 +113,9 @@ TLS: `MaybeTls` stream enum both hops. Downstream handles `SSLRequest` from clie
 
 - CI/release via forge (`rsvalerio/forge`): `ci.yml` and `bump.yml` are thin wrappers;
   deny/clippy/rustfmt configs copied from `forge/config` (keep in sync).
-  Note: forge has no `v1` tag yet — workflows fail until it's tagged.
+- `e2e.yml` is repo-local rather than a forge wrapper: the forge gates run `cargo test`,
+  which skips both e2e suites (they are `#[ignore]`d without a database). It supplies
+  Postgres and a dev-mode OpenBao as job services and points the suites at them with
+  `DBSEC_E2E_DSN` / `DBSEC_E2E_VAULT_ADDR`, so no containers are started by the build.
 - Build commands via `ops` (`make check` → `ops verify qa`).
 - Conventional commits + cocogitto (`cog.toml`, signed mode: no push hooks).

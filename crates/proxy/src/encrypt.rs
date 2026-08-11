@@ -421,21 +421,18 @@ fn rewrite_equality(
     if !transform.supports_search() {
         return Ok(false);
     }
-    match value {
-        Expr::Value(Value::SingleQuotedString(_) | Value::Number(..)) => {
-            let plaintext = match value {
-                Expr::Value(Value::SingleQuotedString(s)) => s.as_bytes().to_vec(),
-                Expr::Value(Value::Number(n, _)) => n.as_bytes().to_vec(),
-                _ => unreachable!(),
-            };
-            let Some(token) = transform.search_index(&plaintext)? else { return Ok(false) };
-            *value = Expr::Value(Value::SingleQuotedString(format!("\\x{}", hex::encode(token))));
-        }
+    match unwrap_casts(value) {
         Expr::Value(Value::Placeholder(p)) => {
             let Some(index) = placeholder_index(p) else { return Ok(false) };
             params.push((index, ParamAction::SearchIndex(transform.clone())));
         }
-        _ => return Ok(false),
+        _ => {
+            let Some(plaintext) = literal_plaintext(value, transform.wire()) else {
+                return Ok(false);
+            };
+            let Some(token) = transform.search_index(&plaintext)? else { return Ok(false) };
+            *value = Expr::Value(Value::SingleQuotedString(format!("\\x{}", hex::encode(token))));
+        }
     }
     *column = index_prefix(std::mem::replace(column, Expr::Value(Value::Null)));
     Ok(true)
@@ -456,6 +453,34 @@ fn placeholder_index(placeholder: &str) -> Option<usize> {
     placeholder.strip_prefix('$').and_then(|n| n.parse::<usize>().ok()).map(|n| n - 1)
 }
 
+/// Peels the casts and parentheses drivers wrap literals in — psycopg's
+/// client-side binding renders every bytes parameter as `'\x…'::bytea` — so
+/// the value underneath can be recognised.
+fn unwrap_casts(expr: &Expr) -> &Expr {
+    match expr {
+        Expr::Cast { expr, .. } | Expr::Nested(expr) => unwrap_casts(expr),
+        other => other,
+    }
+}
+
+/// The plaintext a literal expression stands for, or `None` when it is not a
+/// literal at all. For BYTEA-form columns a `\x`-prefixed string is
+/// Postgres' hex input syntax, so it denotes the bytes it encodes rather than
+/// its own characters — sealing it verbatim would round-trip the hex text.
+fn literal_plaintext(expr: &Expr, wire: WireForm) -> Option<Vec<u8>> {
+    match unwrap_casts(expr) {
+        Expr::Value(Value::SingleQuotedString(s)) => Some(match wire {
+            WireForm::Bytea => s
+                .strip_prefix("\\x")
+                .and_then(|hex| hex::decode(hex).ok())
+                .unwrap_or_else(|| s.as_bytes().to_vec()),
+            WireForm::Text => s.as_bytes().to_vec(),
+        }),
+        Expr::Value(Value::Number(n, _)) => Some(n.as_bytes().to_vec()),
+        _ => None,
+    }
+}
+
 /// Seals one literal in place, or records the placeholder for Bind time.
 /// Returns whether the statement text changed.
 fn seal_expr(
@@ -463,9 +488,7 @@ fn seal_expr(
     transform: &Arc<dyn FieldTransform>,
     params: &mut ParamTransforms,
 ) -> Result<bool, Error> {
-    let sealed = match expr {
-        Expr::Value(Value::SingleQuotedString(s)) => transform.seal(s.as_bytes())?,
-        Expr::Value(Value::Number(n, _)) => transform.seal(n.as_bytes())?,
+    match unwrap_casts(expr) {
         Expr::Value(Value::Placeholder(p)) => {
             if let Some(index) = placeholder_index(p) {
                 params.push((index, ParamAction::Seal(transform.clone())));
@@ -473,14 +496,16 @@ fn seal_expr(
             return Ok(false);
         }
         Expr::Value(Value::Null) => return Ok(false),
-        other => {
-            tracing::warn!(
-                expr = %other,
-                "unsupported expression for a protected column; passing through unencrypted"
-            );
-            return Ok(false);
-        }
+        _ => {}
+    }
+    let Some(plaintext) = literal_plaintext(expr, transform.wire()) else {
+        tracing::warn!(
+            expr = %expr,
+            "unsupported expression for a protected column; passing through unencrypted"
+        );
+        return Ok(false);
     };
+    let sealed = transform.seal(&plaintext)?;
     let literal = match transform.wire() {
         WireForm::Bytea => format!("\\x{}", hex::encode(sealed)),
         WireForm::Text => String::from_utf8_lossy(&sealed).into_owned(),
@@ -564,6 +589,36 @@ mod tests {
         let stored = hex::decode(&sql[start..end]).unwrap();
         let (index, _) = blind_index::split(&stored).unwrap();
         assert_eq!(index, blind_index::compute(&crate::rows::tests::INDEX_KEY, b"bob@example.com"));
+    }
+
+    /// psycopg (client-side binding, and psycopg2 always) renders a bytes
+    /// parameter as `'\x…'::bytea`: the cast has to be seen through, and the
+    /// hex decoded, or the column would store the hex text — or plaintext.
+    #[test]
+    fn cast_wrapped_bytea_literals_are_sealed_as_the_bytes_they_denote() {
+        let mut rewriter = QueryRewriter::new(catalog(false));
+        let hex = hex::encode("alice@example.com");
+        let body = query_frame(&format!("INSERT INTO users (email) VALUES ('\\x{hex}'::bytea)"));
+        let rewritten = rewriter.on_frame(b'Q', &body).unwrap().unwrap();
+        let sql = std::str::from_utf8(&rewritten[..rewritten.len() - 1]).unwrap();
+        assert!(!sql.contains(&hex), "the plaintext bytes are still on the wire: {sql}");
+        assert_eq!(open_hex_literal(sql, false), b"alice@example.com");
+    }
+
+    #[test]
+    fn cast_wrapped_searchable_equality_is_rewritten() {
+        use crate::rows::tests::INDEX_KEY;
+        use dbsec_core::blind_index;
+
+        let mut rewriter = QueryRewriter::new(catalog(true));
+        let hex = hex::encode("alice@example.com");
+        let body = query_frame(&format!("SELECT id FROM users WHERE email = '\\x{hex}'::bytea"));
+        let rewritten = rewriter.on_frame(b'Q', &body).unwrap().unwrap();
+        let sql = std::str::from_utf8(&rewritten[..rewritten.len() - 1]).unwrap();
+
+        let expected = blind_index::compute(&INDEX_KEY, b"alice@example.com");
+        assert!(sql.contains("SUBSTRING(email FROM 1 FOR 32)"), "{sql}");
+        assert!(sql.contains(&format!("'\\x{}'", hex::encode(expected))), "{sql}");
     }
 
     #[test]

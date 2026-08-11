@@ -1,0 +1,112 @@
+name: e2e
+# The forge `rust-ci` workflow runs the QA gates, and `cargo test` skips the
+# e2e suites because they are `#[ignore]`d — they need a database. This
+# workflow supplies the services and runs them, using the same
+# DBSEC_E2E_DSN / DBSEC_E2E_VAULT_ADDR hooks the Makefile takes, so nothing
+# here starts containers of its own.
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  DBSEC_E2E_DSN: postgres://dbsec:dbsec@127.0.0.1:5433/dbsec
+
+jobs:
+  drivers:
+    name: driver matrix
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    services:
+      postgres:
+        image: postgres:17-alpine
+        env:
+          POSTGRES_USER: dbsec
+          POSTGRES_PASSWORD: dbsec
+          POSTGRES_DB: dbsec
+        ports: ['5433:5432']
+        options: >-
+          --health-cmd "pg_isready -U dbsec"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 20
+    env:
+      # CI installs the Python drivers, so a missing one is a failure rather
+      # than a silently skipped third of the matrix.
+      DBSEC_E2E_STRICT_DRIVERS: '1'
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.x'
+      - name: Install the psycopg drivers
+        run: pip install --quiet 'psycopg[binary]' psycopg2-binary
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          # Keyed per job: both jobs finish together, and a shared key means
+          # one of them loses the race and saves nothing.
+          key: e2e-${{ runner.os }}-${{ github.job }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: e2e-${{ runner.os }}-${{ github.job }}-
+      - run: make e2e
+
+  vault:
+    name: openbao key source
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    services:
+      postgres:
+        image: postgres:17-alpine
+        env:
+          POSTGRES_USER: dbsec
+          POSTGRES_PASSWORD: dbsec
+          POSTGRES_DB: dbsec
+        ports: ['5433:5432']
+        options: >-
+          --health-cmd "pg_isready -U dbsec"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 20
+      openbao:
+        image: openbao/openbao:latest
+        env:
+          BAO_DEV_ROOT_TOKEN_ID: root
+          BAO_DEV_LISTEN_ADDRESS: 0.0.0.0:8200
+        ports: ['8200:8200']
+    env:
+      DBSEC_E2E_VAULT_ADDR: http://127.0.0.1:8200
+      DBSEC_E2E_VAULT_TOKEN: root
+    steps:
+      - uses: actions/checkout@v4
+      - name: Enable Transit on the dev server
+        # The image has no healthcheck, so wait for it here. Transit is
+        # mounted over the HTTP API rather than the CLI — the runner has curl
+        # and does not need `bao`.
+        run: |
+          for _ in $(seq 60); do
+            curl -sf "$DBSEC_E2E_VAULT_ADDR/v1/sys/health" >/dev/null && break
+            sleep 1
+          done
+          curl -sf -X POST -H "X-Vault-Token: $DBSEC_E2E_VAULT_TOKEN" \
+            -d '{"type":"transit"}' "$DBSEC_E2E_VAULT_ADDR/v1/sys/mounts/transit"
+          curl -sf -X POST -H "X-Vault-Token: $DBSEC_E2E_VAULT_TOKEN" \
+            -d '{}' "$DBSEC_E2E_VAULT_ADDR/v1/transit/keys/dbsec"
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          # Keyed per job: both jobs finish together, and a shared key means
+          # one of them loses the race and saves nothing.
+          key: e2e-${{ runner.os }}-${{ github.job }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: e2e-${{ runner.os }}-${{ github.job }}-
+      - run: make e2e-vault
