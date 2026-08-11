@@ -1,6 +1,7 @@
 [workspace]
 resolver = "2"
 members = ["crates/core", "crates/proxy"]
+exclude = ["fuzz"]
 
 [workspace.package]
 version = "0.1.0"
@@ -19,6 +20,7 @@ tokio-postgres-rustls = "0.13"
 sqlparser = "0.53"
 
 # crypto
+aes = "0.8"
 aes-gcm = "0.10"
 hmac = "0.12"
 sha2 = "0.10"
@@ -34,6 +36,7 @@ rustls-pki-types = "1"
 
 # kms
 vaultrs = "0.7"
+base64 = "0.22"
 
 # config / errors / logging
 serde = { version = "1", features = ["derive"] }
