@@ -70,16 +70,30 @@ impl RowDecryptor {
                 let mut changed = false;
                 for (position, column) in &self.active {
                     let Some(Some(value)) = values.get_mut(*position) else { continue };
-                    let opened = match &column.transform {
-                        Some(transform) => open_value(transform.as_ref(), value)?,
-                        None => None,
+                    let (replacement, hex_text) = {
+                        let (stored, hex_text) = match &column.transform {
+                            Some(transform) => decode_wire(transform.as_ref(), value),
+                            None => (Cow::Borrowed(&**value), false),
+                        };
+                        let opened = match &column.transform {
+                            Some(transform) => transform.open(&stored)?,
+                            None => None,
+                        };
+                        // Mask what the client would otherwise see: the opened
+                        // plaintext, or the raw value when nothing opened.
+                        let masked = column
+                            .mask
+                            .map(|mask| mask.apply(opened.as_deref().unwrap_or(&stored)));
+                        (masked.or(opened), hex_text)
                     };
-                    // Mask what the client would otherwise see: the opened
-                    // plaintext, or the raw value when nothing opened.
-                    let masked =
-                        column.mask.map(|mask| mask.apply(opened.as_deref().unwrap_or(value)));
-                    if let Some(replacement) = masked.or(opened) {
-                        *value = Cow::Owned(replacement);
+                    if let Some(replacement) = replacement {
+                        // A value that arrived hex-encoded goes back the same
+                        // way, or the client cannot decode the column.
+                        *value = Cow::Owned(if hex_text {
+                            format!("\\x{}", hex::encode(replacement)).into_bytes()
+                        } else {
+                            replacement
+                        });
                         changed = true;
                     }
                 }
@@ -90,17 +104,19 @@ impl RowDecryptor {
     }
 }
 
-/// Opens one column value, or returns `None` for pre-migration plaintext.
-/// BYTEA-form transforms see both wire representations: raw bytes (binary
-/// format) and `\x`-prefixed hex (text format); text-form transforms (FPE,
-/// tokens) get the bytes as-is. Opened plaintext is returned raw.
-fn open_value(transform: &dyn FieldTransform, raw: &[u8]) -> Result<Option<Vec<u8>>, Error> {
-    let decoded = match transform.wire() {
-        WireForm::Bytea => raw.strip_prefix(b"\\x").and_then(|h| hex::decode(h).ok()),
-        WireForm::Text => None,
-    };
-    let stored = decoded.as_deref().unwrap_or(raw);
-    Ok(transform.open(stored)?)
+/// Decodes one column value's wire representation into its stored form.
+/// BYTEA-form transforms see both: raw bytes (binary result format) and
+/// `\x`-prefixed hex (text result format, e.g. the simple protocol);
+/// text-form transforms (FPE, tokens) are the same bytes either way. The flag
+/// reports the hex-text case, which the reply has to reproduce.
+fn decode_wire<'a>(transform: &dyn FieldTransform, raw: &'a [u8]) -> (Cow<'a, [u8]>, bool) {
+    match transform.wire() {
+        WireForm::Bytea => match raw.strip_prefix(b"\\x").and_then(|h| hex::decode(h).ok()) {
+            Some(decoded) => (Cow::Owned(decoded), true),
+            None => (Cow::Borrowed(raw), false),
+        },
+        WireForm::Text => (Cow::Borrowed(raw), false),
+    }
 }
 
 #[cfg(test)]
@@ -180,12 +196,13 @@ pub mod tests {
             vec![Some(b"42".as_slice()), Some(b"alice@example.com".as_slice())]
         );
 
-        // Text-format (hex) representation decrypts too.
+        // Text-format (hex) representation decrypts too, and goes back in the
+        // same shape — a client decoding BYTEA text expects `\x` hex.
         let hex_row = data_row(&[Some(b"42"), Some(format!("\\x{}", hex::encode(&ct)).as_bytes())]);
         let rewritten = decryptor.on_frame(b'D', &hex_row).unwrap().unwrap();
         assert_eq!(
             pgwire::parse_data_row(&rewritten).unwrap()[1],
-            Some(b"alice@example.com".as_slice())
+            Some(format!("\\x{}", hex::encode("alice@example.com")).as_bytes())
         );
 
         // Plaintext (pre-migration) and NULL pass through untouched.
@@ -253,6 +270,22 @@ pub mod tests {
         assert_eq!(
             pgwire::parse_data_row(&rewritten).unwrap()[1],
             Some(b"************1111".as_slice())
+        );
+    }
+
+    #[test]
+    fn text_format_bytea_keeps_its_hex_shape_through_the_mask() {
+        let mask = MaskSpec { keep_first: 0, keep_last: 4, mask_with: '*' };
+        let ctx = context_with(ReadColumn { transform: Some(transform(false)), mask: Some(mask) });
+        let mut decryptor = ctx.decryptor();
+        decryptor.on_frame(b'T', &row_description(&[(1234, 2)])).unwrap();
+
+        let ct = envelope::encrypt(&KEY, &KEY_ID, b"4111111111111111").unwrap();
+        let row = data_row(&[Some(format!("\\x{}", hex::encode(&ct)).as_bytes())]);
+        let rewritten = decryptor.on_frame(b'D', &row).unwrap().unwrap();
+        assert_eq!(
+            pgwire::parse_data_row(&rewritten).unwrap()[0],
+            Some(format!("\\x{}", hex::encode("************1111")).as_bytes())
         );
     }
 
