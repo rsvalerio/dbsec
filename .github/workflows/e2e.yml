@@ -6,7 +6,7 @@ name: e2e
 # here starts containers of its own.
 on:
   push:
-    branches: [main, 'claude/**']
+    branches: [main]
   pull_request:
     branches: [main]
   workflow_dispatch:

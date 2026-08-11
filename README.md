@@ -21,6 +21,9 @@ make e2e       # driver matrix through the real binary (needs docker)
 make e2e-vault # OpenBao-backed keys against a live dev-mode server (needs docker)
 ```
 
+Both e2e targets also run in CI (`.github/workflows/e2e.yml`) against service
+containers, since the QA gates alone never reach them.
+
 `make e2e` runs the proxy between a dockerized Postgres and tokio-postgres, sqlx
 and psycopg 2/3; the Python cases are skipped unless
 `pip install 'psycopg[binary]' psycopg2-binary` has run — set

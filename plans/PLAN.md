@@ -113,6 +113,9 @@ TLS: `MaybeTls` stream enum both hops. Downstream handles `SSLRequest` from clie
 
 - CI/release via forge (`rsvalerio/forge`): `ci.yml` and `bump.yml` are thin wrappers;
   deny/clippy/rustfmt configs copied from `forge/config` (keep in sync).
-  Note: forge has no `v1` tag yet — workflows fail until it's tagged.
+- `e2e.yml` is repo-local rather than a forge wrapper: the forge gates run `cargo test`,
+  which skips both e2e suites (they are `#[ignore]`d without a database). It supplies
+  Postgres and a dev-mode OpenBao as job services and points the suites at them with
+  `DBSEC_E2E_DSN` / `DBSEC_E2E_VAULT_ADDR`, so no containers are started by the build.
 - Build commands via `ops` (`make check` → `ops verify qa`).
 - Conventional commits + cocogitto (`cog.toml`, signed mode: no push hooks).
