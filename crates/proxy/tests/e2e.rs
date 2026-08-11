@@ -1,170 +1,25 @@
-//! End-to-end suite (milestone 10): the real `dbsec` binary between a real
-//! PostgreSQL driver (tokio-postgres, both protocols) and a dockerized
-//! Postgres, with TLS on the client hop.
+//! End-to-end suite (milestone 10): the real `dbsec` binary between
+//! tokio-postgres (both protocols) and a real Postgres, with TLS on the
+//! client hop. The sibling suites cover the other drivers (`e2e_sqlx`,
+//! `e2e_psycopg`) and the OpenBao key source (`e2e_vault`).
 //!
-//! Ignored by default — `make e2e` starts the database and runs it:
-//! `DBSEC_E2E_DSN` points at a superuser DSN, default
-//! `postgres://dbsec:dbsec@127.0.0.1:5433/dbsec`.
+//! Ignored by default — `make e2e` starts the database and runs it.
 
-use std::io::Write as _;
+mod common;
 
-const PROXY_PORT: u16 = 16432;
+use common::PORT_TOKIO_POSTGRES as PORT;
 
-const KEYFILE: &str = "\
-active = \"00112233445566778899aabbccddeeff\"
-
-[keys]
-00112233445566778899aabbccddeeff = \"0707070707070707070707070707070707070707070707070707070707070707\"
-
-[index_keys]
-\"public.users.email\" = \"0303030303030303030303030303030303030303030303030303030303030303\"
-\"public.users.phone\" = \"0404040404040404040404040404040404040404040404040404040404040404\"
-\"public.users.ssn\" = \"0505050505050505050505050505050505050505050505050505050505050505\"
-";
-
-fn dsn() -> String {
-    std::env::var("DBSEC_E2E_DSN")
-        .unwrap_or_else(|_| "postgres://dbsec:dbsec@127.0.0.1:5433/dbsec".to_owned())
-}
-
-/// Client-hop TLS config trusting the proxy's self-signed cert.
-fn client_tls(cert_pem: &str) -> tokio_postgres_rustls::MakeRustlsConnect {
-    use rustls::pki_types::pem::PemObject;
-    // Both `ring` and `aws-lc-rs` are in the dependency graph, so rustls
-    // needs an explicit process-level provider (same as the proxy itself).
-    let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
-    let mut roots = rustls::RootCertStore::empty();
-    for cert in rustls::pki_types::CertificateDer::pem_slice_iter(cert_pem.as_bytes()) {
-        roots.add(cert.unwrap()).unwrap();
-    }
-    let config =
-        rustls::ClientConfig::builder().with_root_certificates(roots).with_no_client_auth();
-    tokio_postgres_rustls::MakeRustlsConnect::new(config)
-}
-
-async fn connect_direct() -> tokio_postgres::Client {
-    let (client, connection) = tokio_postgres::connect(&dsn(), tokio_postgres::NoTls)
-        .await
-        .expect("is the e2e database up? run `make e2e`");
-    tokio::spawn(async move {
-        let _ = connection.await;
-    });
-    client
-}
-
-struct Proxy(std::process::Child);
-
-impl Drop for Proxy {
-    fn drop(&mut self) {
-        let _ = self.0.kill();
-        let _ = self.0.wait();
-    }
-}
-
-/// Writes keyfile/certs/config into `dir` and launches the dbsec binary.
-async fn spawn_proxy(dir: &std::path::Path) -> Proxy {
-    let cert = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
-    std::fs::write(dir.join("cert.pem"), cert.cert.pem()).unwrap();
-    std::fs::write(dir.join("key.pem"), cert.key_pair.serialize_pem()).unwrap();
-    std::fs::write(dir.join("keys.toml"), KEYFILE).unwrap();
-
-    let config = format!(
-        r#"
-listen = "127.0.0.1:{PROXY_PORT}"
-upstream = "{upstream}"
-keys_file = {keys:?}
-control_dsn = "{dsn}"
-
-[tls.downstream]
-cert = {cert:?}
-key = {key:?}
-
-[[column]]
-table = "users"
-column = "email"
-searchable = true
-
-[[column]]
-table = "users"
-column = "phone"
-transform = "fpe"
-
-[[column]]
-table = "users"
-column = "ssn"
-transform = "token"
-
-[[column]]
-table = "users"
-column = "note"
-transform = "none"
-mask = {{ keep_first = 2 }}
-"#,
-        upstream = upstream_addr(),
-        dsn = dsn(),
-        keys = dir.join("keys.toml"),
-        cert = dir.join("cert.pem"),
-        key = dir.join("key.pem"),
-    );
-    let config_path = dir.join("dbsec.toml");
-    std::fs::File::create(&config_path).unwrap().write_all(config.as_bytes()).unwrap();
-
-    // Wrapped immediately so the child is killed and reaped even when the
-    // readiness loop below panics.
-    let proxy = Proxy(
-        std::process::Command::new(env!("CARGO_BIN_EXE_dbsec")).arg(&config_path).spawn().unwrap(),
-    );
-
-    for _ in 0..100 {
-        if tokio::net::TcpStream::connect(("127.0.0.1", PROXY_PORT)).await.is_ok() {
-            return proxy;
-        }
-        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-    }
-    panic!("proxy did not start listening");
-}
-
-/// Host:port of the dockerized Postgres, extracted from the DSN.
-fn upstream_addr() -> String {
-    let dsn = dsn();
-    let rest = dsn.split('@').nth(1).expect("dsn has host part");
-    rest.split('/').next().unwrap().to_owned()
-}
-
-async fn connect_via_proxy(dir: &std::path::Path) -> tokio_postgres::Client {
-    let cert_pem = std::fs::read_to_string(dir.join("cert.pem")).unwrap();
-    let user_pass = dsn();
-    let creds = user_pass.split("//").nth(1).unwrap().split('@').next().unwrap().to_owned();
-    let proxy_dsn = format!("postgres://{creds}@localhost:{PROXY_PORT}/dbsec?sslmode=require");
-    let (client, connection) =
-        tokio_postgres::connect(&proxy_dsn, client_tls(&cert_pem)).await.unwrap();
-    tokio::spawn(async move {
-        let _ = connection.await;
-    });
-    client
-}
+const TABLE: &str = "users";
 
 #[tokio::test]
-#[ignore = "needs the dockerized Postgres from `make e2e`"]
+#[ignore = "needs the Postgres from `make e2e`"]
 async fn transparent_encryption_end_to_end() {
-    let direct = connect_direct().await;
-    direct
-        .batch_execute(
-            "DROP TABLE IF EXISTS users;
-             CREATE TABLE users (
-                 id SERIAL PRIMARY KEY,
-                 email BYTEA,
-                 phone TEXT,
-                 ssn TEXT,
-                 note TEXT
-             )",
-        )
-        .await
-        .unwrap();
+    let direct = common::connect_direct().await;
+    common::create_table(&direct, TABLE).await;
 
     let dir = tempfile::tempdir().unwrap();
-    let _proxy = spawn_proxy(dir.path()).await;
-    let client = connect_via_proxy(dir.path()).await;
+    let _proxy = common::spawn_proxy(dir.path(), &common::ProxyOpts::file_keys(PORT, TABLE)).await;
+    let client = common::connect_via_proxy(dir.path(), PORT).await;
 
     // Extended protocol: Parse/Bind with binary and text params.
     client
