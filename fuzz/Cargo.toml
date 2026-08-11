@@ -1,0 +1,29 @@
+[package]
+name = "dbsec-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+dbsec-core = { path = "../crates/core" }
+
+[[bin]]
+name = "pgwire"
+path = "fuzz_targets/pgwire.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "envelope"
+path = "fuzz_targets/envelope.rs"
+test = false
+doc = false
+bench = false
+
+[profile.release]
+debug = 1

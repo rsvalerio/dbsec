@@ -1,6 +1,6 @@
 # Developer entrypoint for dbsec. `make help` lists targets.
 SHELL := /bin/bash
-.PHONY: help build release run test fmt clippy check deny cog-check pre-release clean
+.PHONY: help build release run test e2e fuzz fmt clippy check deny cog-check pre-release clean
 
 help: ## Show this help
 	@grep -E '^[a-zA-Z_-]+:.*?## ' $(MAKEFILE_LIST) | awk 'BEGIN {FS = ":.*?## "}; {printf "  \033[36m%-12s\033[0m %s\n", $$1, $$2}'
@@ -16,6 +16,19 @@ run: ## Run the proxy
 
 test: ## Run the test suite
 	cargo test --all --all-features
+
+e2e: ## Driver integration suite against dockerized Postgres (needs docker)
+	@docker rm -f dbsec-e2e-pg >/dev/null 2>&1 || true
+	docker run -d --name dbsec-e2e-pg \
+		-e POSTGRES_USER=dbsec -e POSTGRES_PASSWORD=dbsec -e POSTGRES_DB=dbsec \
+		-p 5433:5432 postgres:17-alpine >/dev/null
+	@until docker exec dbsec-e2e-pg pg_isready -U dbsec >/dev/null 2>&1; do sleep 0.5; done
+	cargo test -p dbsec --test e2e -- --ignored --nocapture; \
+		status=$$?; docker rm -f dbsec-e2e-pg >/dev/null; exit $$status
+
+fuzz: ## Smoke-run each fuzz target for 30s (needs nightly + cargo-fuzz)
+	cd fuzz && cargo +nightly fuzz run pgwire -- -max_total_time=30
+	cd fuzz && cargo +nightly fuzz run envelope -- -max_total_time=30
 
 fmt: ## Format all crates
 	cargo fmt --all
