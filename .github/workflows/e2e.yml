@@ -52,8 +52,10 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             target
-          key: e2e-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}
-          restore-keys: e2e-${{ runner.os }}-
+          # Keyed per job: both jobs finish together, and a shared key means
+          # one of them loses the race and saves nothing.
+          key: e2e-${{ runner.os }}-${{ github.job }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: e2e-${{ runner.os }}-${{ github.job }}-
       - run: make e2e
 
   vault:
@@ -103,6 +105,8 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             target
-          key: e2e-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}
-          restore-keys: e2e-${{ runner.os }}-
+          # Keyed per job: both jobs finish together, and a shared key means
+          # one of them loses the race and saves nothing.
+          key: e2e-${{ runner.os }}-${{ github.job }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: e2e-${{ runner.os }}-${{ github.job }}-
       - run: make e2e-vault
