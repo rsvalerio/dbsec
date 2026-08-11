@@ -1,20 +1,29 @@
-//! The decrypt path (milestone 4): RowDescription/DataRow interception in the
-//! upstream→client relay. Configured columns are matched by table OID +
-//! attnum; values in a transform's stored form are opened, everything else
-//! passes through untouched. Crypto errors fail the session — never a silent
-//! passthrough of ciphertext.
+//! The read path: RowDescription/DataRow interception in the upstream→client
+//! relay. Configured columns are matched by table OID + attnum; values in a
+//! transform's stored form are opened, then masked when a mask is configured.
+//! Everything else passes through untouched. Crypto errors fail the session —
+//! never a silent passthrough of ciphertext.
 
 use std::borrow::Cow;
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use dbsec_core::mask::MaskSpec;
 use dbsec_core::pgwire;
-use dbsec_core::transform::{EncryptTransform, FieldTransform};
+use dbsec_core::transform::{FieldTransform, WireForm};
 
 use crate::Error;
 
+/// What the read path does to one column: open with the transform (when
+/// present and readable), then mask what the client would see.
+#[derive(Clone)]
+pub struct ReadColumn {
+    pub transform: Option<Arc<dyn FieldTransform>>,
+    pub mask: Option<MaskSpec>,
+}
+
 /// Configured columns keyed by `(table oid, attnum)`, resolved at startup.
-pub type ColumnMap = HashMap<(u32, i16), Arc<EncryptTransform>>;
+pub type ColumnMap = HashMap<(u32, i16), ReadColumn>;
 
 /// Shared, per-process state for the decrypt path.
 pub struct RowContext {
@@ -31,7 +40,7 @@ impl RowContext {
 /// protected. Set by each RowDescription, used by the DataRows that follow.
 pub struct RowDecryptor {
     ctx: Arc<RowContext>,
-    active: Vec<(usize, Arc<EncryptTransform>)>,
+    active: Vec<(usize, ReadColumn)>,
 }
 
 impl RowDecryptor {
@@ -48,7 +57,7 @@ impl RowDecryptor {
                         self.ctx
                             .columns
                             .get(&(f.table_oid, f.attnum))
-                            .map(|transform| (i, transform.clone()))
+                            .map(|column| (i, column.clone()))
                     })
                     .collect();
                 Ok(None)
@@ -59,10 +68,18 @@ impl RowDecryptor {
                     .map(|v| v.map(Cow::Borrowed))
                     .collect();
                 let mut changed = false;
-                for (position, transform) in &self.active {
+                for (position, column) in &self.active {
                     let Some(Some(value)) = values.get_mut(*position) else { continue };
-                    if let Some(plaintext) = open_value(transform.as_ref(), value)? {
-                        *value = Cow::Owned(plaintext);
+                    let opened = match &column.transform {
+                        Some(transform) => open_value(transform.as_ref(), value)?,
+                        None => None,
+                    };
+                    // Mask what the client would otherwise see: the opened
+                    // plaintext, or the raw value when nothing opened.
+                    let masked =
+                        column.mask.map(|mask| mask.apply(opened.as_deref().unwrap_or(value)));
+                    if let Some(replacement) = masked.or(opened) {
+                        *value = Cow::Owned(replacement);
                         changed = true;
                     }
                 }
@@ -74,10 +91,14 @@ impl RowDecryptor {
 }
 
 /// Opens one column value, or returns `None` for pre-migration plaintext.
-/// Handles both wire representations of BYTEA: raw bytes (binary format) and
-/// `\x`-prefixed hex (text format); the opened plaintext is returned raw.
-fn open_value(transform: &EncryptTransform, raw: &[u8]) -> Result<Option<Vec<u8>>, Error> {
-    let decoded = raw.strip_prefix(b"\\x").and_then(|h| hex::decode(h).ok());
+/// BYTEA-form transforms see both wire representations: raw bytes (binary
+/// format) and `\x`-prefixed hex (text format); text-form transforms (FPE,
+/// tokens) get the bytes as-is. Opened plaintext is returned raw.
+fn open_value(transform: &dyn FieldTransform, raw: &[u8]) -> Result<Option<Vec<u8>>, Error> {
+    let decoded = match transform.wire() {
+        WireForm::Bytea => raw.strip_prefix(b"\\x").and_then(|h| hex::decode(h).ok()),
+        WireForm::Text => None,
+    };
     let stored = decoded.as_deref().unwrap_or(raw);
     Ok(transform.open(stored)?)
 }
@@ -112,15 +133,19 @@ pub mod tests {
         }
     }
 
-    pub fn transform(searchable: bool) -> Arc<EncryptTransform> {
+    pub fn transform(searchable: bool) -> Arc<dyn FieldTransform> {
         let index_key = searchable.then(|| "public.users.email".to_owned());
-        Arc::new(EncryptTransform::new(Arc::new(OneKey), index_key))
+        Arc::new(dbsec_core::transform::EncryptTransform::new(Arc::new(OneKey), index_key))
+    }
+
+    fn context_with(column: ReadColumn) -> Arc<RowContext> {
+        let mut columns = ColumnMap::new();
+        columns.insert((1234, 2), column);
+        Arc::new(RowContext { columns })
     }
 
     fn context(searchable: bool) -> Arc<RowContext> {
-        let mut columns = ColumnMap::new();
-        columns.insert((1234, 2), transform(searchable));
-        Arc::new(RowContext { columns })
+        context_with(ReadColumn { transform: Some(transform(searchable)), mask: None })
     }
 
     fn row_description(fields: &[(u32, i16)]) -> Vec<u8> {
@@ -204,6 +229,43 @@ pub mod tests {
         let ct = envelope::encrypt(&KEY, &[9u8; KEY_ID_LEN], b"secret").unwrap();
         let row = data_row(&[Some(&ct)]);
         assert!(decryptor.on_frame(b'D', &row).is_err());
+    }
+
+    #[test]
+    fn mask_applies_after_decryption_and_to_plaintext() {
+        let mask = MaskSpec { keep_first: 0, keep_last: 4, mask_with: '*' };
+        let ctx = context_with(ReadColumn { transform: Some(transform(false)), mask: Some(mask) });
+        let mut decryptor = ctx.decryptor();
+        decryptor.on_frame(b'T', &row_description(&[(1234, 1), (1234, 2)])).unwrap();
+
+        // Decrypted value is masked before it reaches the client.
+        let ct = envelope::encrypt(&KEY, &KEY_ID, b"4111111111111111").unwrap();
+        let row = data_row(&[Some(b"42"), Some(&ct)]);
+        let rewritten = decryptor.on_frame(b'D', &row).unwrap().unwrap();
+        assert_eq!(
+            pgwire::parse_data_row(&rewritten).unwrap()[1],
+            Some(b"************1111".as_slice())
+        );
+
+        // Pre-migration plaintext is masked too — the mask is a read policy.
+        let plain_row = data_row(&[Some(b"42"), Some(b"4111111111111111")]);
+        let rewritten = decryptor.on_frame(b'D', &plain_row).unwrap().unwrap();
+        assert_eq!(
+            pgwire::parse_data_row(&rewritten).unwrap()[1],
+            Some(b"************1111".as_slice())
+        );
+    }
+
+    #[test]
+    fn mask_only_column_masks_without_any_crypto() {
+        let mask = MaskSpec { keep_first: 2, keep_last: 0, mask_with: '#' };
+        let ctx = context_with(ReadColumn { transform: None, mask: Some(mask) });
+        let mut decryptor = ctx.decryptor();
+        decryptor.on_frame(b'T', &row_description(&[(1234, 2)])).unwrap();
+
+        let row = data_row(&[Some(b"secret")]);
+        let rewritten = decryptor.on_frame(b'D', &row).unwrap().unwrap();
+        assert_eq!(pgwire::parse_data_row(&rewritten).unwrap()[0], Some(b"se####".as_slice()));
     }
 
     #[test]

@@ -64,11 +64,32 @@ TLS: `MaybeTls` stream enum both hops. Downstream handles `SSLRequest` from clie
    INSERT...SELECT, and non-literal expressions pass through with loud warnings;
    COPY on protected tables warns)*
 6. **Pseudonymization** — FPE + HMAC token transforms; optional detokenize-on-read.
-7. **Masking** — read-path mask transform + TOML mask specs.
-8. **Searchable** — HMAC prefix + WHERE equality rewrite.
+   *(done; `transform = "fpe" | "token"` per column, FF1 over decimal digits with
+   separators preserved (<6 digits refused at seal time), tokens are irreversible
+   hex HMACs. Transforms declare a `WireForm` so text-shaped stored forms are not
+   hex-mangled; write-only columns never join the read map)*
+7. **Masking** — read-path mask transform + TOML mask specs. *(done;
+   `mask = { keep_first, keep_last, mask_with }` per column, applied after
+   open (or to raw values when nothing opens). `transform = "none"` allows
+   mask-only columns; too-short values mask entirely)*
+8. **Searchable** — HMAC prefix + WHERE equality rewrite. *(done; `col = <value>`
+   on searchable columns becomes `substring(col from 1 for 32) = <index>` in
+   SELECT/UPDATE/DELETE WHERE clauses — literals inline, placeholders replaced
+   with the index at Bind. Traverses AND/OR/NOT and parens; alias-qualified
+   references resolve, ambiguous ones are skipped with a warning)*
 9. **Vault/OpenBao KeySource** — DEKs by key_id + blind-index/FPE/token-HMAC keys; DEK cache.
+   *(done; `[vault]` config section. Fresh Transit data key per startup, wrapped blob
+   stored in KV v2 under the envelope key id; older DEKs unwrapped via Transit on
+   demand and cached. Index keys live in one KV secret, minted on first use.
+   Needs live-server integration coverage in milestone 10)*
 10. **Hardening** — cargo-fuzz on the frame parser; driver integration suite (sqlx,
-    psycopg) over TLS against dockerized Postgres.
+    psycopg) over TLS against dockerized Postgres. *(done for the core scope:
+    `fuzz/` has `pgwire` and `envelope` targets (`make fuzz`; smoke-ran millions
+    of execs clean), and `make e2e` runs the real binary between tokio-postgres
+    (both protocols, TLS client hop) and dockerized Postgres 17, verifying
+    encrypt/decrypt, FPE, tokens, masking, searchable equality and at-rest
+    ciphertext. Remaining nice-to-haves: sqlx/psycopg driver matrix, Vault e2e
+    against a live OpenBao)*
 
 ## Caveats (accepted trade-offs)
 

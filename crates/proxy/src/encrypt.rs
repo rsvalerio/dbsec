@@ -12,7 +12,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use dbsec_core::pgwire;
-use dbsec_core::transform::{EncryptTransform, FieldTransform};
+use dbsec_core::transform::{FieldTransform, WireForm};
 use sqlparser::ast::{
     Assignment, AssignmentTarget, Expr, Ident, ObjectName, SetExpr, Statement, Value,
 };
@@ -25,17 +25,19 @@ use crate::Error;
 /// Protected columns keyed by name for SQL matching:
 /// `(schema, table) → column → transform`.
 pub struct WriteCatalog {
-    tables: HashMap<(String, String), HashMap<String, Arc<EncryptTransform>>>,
+    tables: HashMap<(String, String), HashMap<String, Arc<dyn FieldTransform>>>,
 }
 
 impl WriteCatalog {
     pub fn new(columns: &[ProtectedColumn]) -> Self {
         let mut tables: HashMap<_, HashMap<_, _>> = HashMap::new();
+        // Mask-only columns have no transform; their writes pass through.
         for column in columns {
+            let Some(transform) = &column.transform else { continue };
             tables
                 .entry((column.schema.clone(), column.table.clone()))
                 .or_default()
-                .insert(column.column.clone(), column.transform.clone());
+                .insert(column.column.clone(), transform.clone());
         }
         Self { tables }
     }
@@ -43,7 +45,7 @@ impl WriteCatalog {
     /// Looks a table up the way Postgres would resolve the SQL name: the last
     /// identifier is the table, the one before it the schema, and bare names
     /// fall back to `public` (search_path is not consulted — a caveat).
-    fn table(&self, name: &ObjectName) -> Option<&HashMap<String, Arc<EncryptTransform>>> {
+    fn table(&self, name: &ObjectName) -> Option<&HashMap<String, Arc<dyn FieldTransform>>> {
         let mut parts = name.0.iter().rev();
         let table = normalize(parts.next()?);
         let schema = parts.next().map_or_else(|| "public".to_owned(), normalize);
@@ -60,9 +62,19 @@ fn normalize(ident: &Ident) -> String {
     }
 }
 
-/// Which parameter placeholders of a prepared statement feed protected
-/// columns.
-type ParamTransforms = Vec<(usize, Arc<EncryptTransform>)>;
+/// What Bind must do to one parameter of a prepared statement.
+#[derive(Clone)]
+enum ParamAction {
+    /// The parameter feeds a protected column: seal it.
+    Seal(Arc<dyn FieldTransform>),
+    /// The parameter is compared for equality against a searchable column:
+    /// replace it with the blind index (the SQL was rewritten to match the
+    /// index prefix).
+    SearchIndex(Arc<dyn FieldTransform>),
+}
+
+/// Which parameter placeholders of a prepared statement need transforming.
+type ParamTransforms = Vec<(usize, ParamAction)>;
 
 /// Per-session write-path state: rewrites Query/Parse SQL and Bind
 /// parameters using the shared catalog, remembering prepared statements.
@@ -108,14 +120,30 @@ impl QueryRewriter {
                 }
                 let mut values: Vec<Option<Cow<'_, [u8]>>> =
                     bind.params.iter().map(|p| p.map(Cow::Borrowed)).collect();
-                for (index, transform) in params {
+                for (index, action) in params {
                     let Some(Some(value)) = values.get_mut(*index) else { continue };
-                    let sealed = transform.seal(value)?;
-                    *value = if bind.param_format(*index) == 1 {
-                        Cow::Owned(sealed)
-                    } else {
+                    let (replacement, wire) = match action {
+                        ParamAction::Seal(transform) => (transform.seal(value)?, transform.wire()),
+                        ParamAction::SearchIndex(transform) => {
+                            let Some(token) = transform.search_index(value)? else {
+                                return Err(Error::Wire(dbsec_core::Error::Malformed));
+                            };
+                            // The index prefix is BYTEA regardless of the
+                            // transform's own stored form.
+                            (token, WireForm::Bytea)
+                        }
+                    };
+                    *value = match wire {
+                        // Text-shaped stored forms (FPE digits, hex tokens)
+                        // are the same bytes in either parameter format.
+                        WireForm::Text => Cow::Owned(replacement),
+                        WireForm::Bytea if bind.param_format(*index) == 1 => {
+                            Cow::Owned(replacement)
+                        }
                         // Text-format parameter for a BYTEA column: hex form.
-                        Cow::Owned(format!("\\x{}", hex::encode(sealed)).into_bytes())
+                        WireForm::Bytea => {
+                            Cow::Owned(format!("\\x{}", hex::encode(replacement)).into_bytes())
+                        }
                     };
                 }
                 Ok(Some(pgwire::encode_bind(
@@ -182,7 +210,7 @@ impl QueryRewriter {
                     );
                     return Ok(false);
                 }
-                let protected: Vec<(usize, Arc<EncryptTransform>)> = insert
+                let protected: Vec<(usize, Arc<dyn FieldTransform>)> = insert
                     .columns
                     .iter()
                     .enumerate()
@@ -209,17 +237,42 @@ impl QueryRewriter {
                 }
                 Ok(changed)
             }
-            Statement::Update { table, assignments, .. } => {
-                let sqlparser::ast::TableFactor::Table { name, .. } = &table.relation else {
-                    return Ok(false);
-                };
-                let Some(columns) = self.catalog.table(name) else { return Ok(false) };
+            Statement::Update { table, assignments, selection, .. } => {
                 let mut changed = false;
-                for Assignment { target, value } in assignments {
-                    let AssignmentTarget::ColumnName(column) = target else { continue };
-                    let Some(ident) = column.0.last() else { continue };
-                    let Some(transform) = columns.get(&normalize(ident)) else { continue };
-                    changed |= seal_expr(value, transform, params)?;
+                if let sqlparser::ast::TableFactor::Table { name, .. } = &table.relation {
+                    if let Some(columns) = self.catalog.table(name) {
+                        for Assignment { target, value } in assignments {
+                            let AssignmentTarget::ColumnName(column) = target else { continue };
+                            let Some(ident) = column.0.last() else { continue };
+                            let Some(transform) = columns.get(&normalize(ident)) else { continue };
+                            changed |= seal_expr(value, transform, params)?;
+                        }
+                    }
+                }
+                let scope = self.scope(std::slice::from_ref(table));
+                if let Some(selection) = selection {
+                    changed |= rewrite_selection(selection, &scope, params)?;
+                }
+                Ok(changed)
+            }
+            Statement::Query(query) => {
+                let SetExpr::Select(select) = query.body.as_mut() else { return Ok(false) };
+                let scope = self.scope(&select.from);
+                let mut changed = false;
+                if let Some(selection) = select.selection.as_mut() {
+                    changed |= rewrite_selection(selection, &scope, params)?;
+                }
+                Ok(changed)
+            }
+            Statement::Delete(delete) => {
+                let tables = match &delete.from {
+                    sqlparser::ast::FromTable::WithFromKeyword(tables)
+                    | sqlparser::ast::FromTable::WithoutKeyword(tables) => tables,
+                };
+                let scope = self.scope(tables);
+                let mut changed = false;
+                if let Some(selection) = delete.selection.as_mut() {
+                    changed |= rewrite_selection(selection, &scope, params)?;
                 }
                 Ok(changed)
             }
@@ -237,21 +290,185 @@ impl QueryRewriter {
             _ => Ok(false),
         }
     }
+
+    /// Collects the protected tables visible to a WHERE clause, with their
+    /// aliases, so column references can be resolved.
+    fn scope<'a>(&'a self, from: &'a [sqlparser::ast::TableWithJoins]) -> TableScope<'a> {
+        let mut tables = Vec::new();
+        for table_with_joins in from {
+            let factors = std::iter::once(&table_with_joins.relation)
+                .chain(table_with_joins.joins.iter().map(|join| &join.relation));
+            for factor in factors {
+                let sqlparser::ast::TableFactor::Table { name, alias, .. } = factor else {
+                    continue;
+                };
+                let Some(columns) = self.catalog.table(name) else { continue };
+                tables.push(ScopedTable {
+                    alias: alias.as_ref().map(|a| normalize(&a.name)),
+                    name,
+                    columns,
+                });
+            }
+        }
+        TableScope { tables }
+    }
+}
+
+struct ScopedTable<'a> {
+    alias: Option<String>,
+    name: &'a ObjectName,
+    columns: &'a HashMap<String, Arc<dyn FieldTransform>>,
+}
+
+/// Protected tables a WHERE clause can reference.
+struct TableScope<'a> {
+    tables: Vec<ScopedTable<'a>>,
+}
+
+impl TableScope<'_> {
+    /// Resolves a (possibly qualified) column reference to its transform.
+    /// Unqualified names matching more than one protected table are skipped —
+    /// ambiguity must not guess.
+    fn resolve(&self, idents: &[Ident]) -> Option<&Arc<dyn FieldTransform>> {
+        let (column, qualifiers) = idents.split_last()?;
+        let column = normalize(column);
+        let matches: Vec<_> = self
+            .tables
+            .iter()
+            .filter(|table| table.matches(qualifiers))
+            .filter_map(|table| table.columns.get(&column))
+            .collect();
+        match matches.as_slice() {
+            [transform] => Some(transform),
+            [] => None,
+            _ => {
+                tracing::warn!(column, "ambiguous column reference; equality not rewritten");
+                None
+            }
+        }
+    }
+}
+
+impl ScopedTable<'_> {
+    fn matches(&self, qualifiers: &[Ident]) -> bool {
+        match qualifiers {
+            [] => true,
+            [qualifier] => {
+                let qualifier = normalize(qualifier);
+                self.alias.as_deref() == Some(qualifier.as_str())
+                    || self.name.0.last().is_some_and(|last| normalize(last) == qualifier)
+            }
+            _ => {
+                // schema.table (or longer): compare the trailing parts.
+                let want: Vec<String> = qualifiers.iter().map(normalize).collect();
+                let have: Vec<String> = self.name.0.iter().map(normalize).collect();
+                have.len() >= want.len() && have[have.len() - want.len()..] == want[..]
+            }
+        }
+    }
+}
+
+/// Recursively rewrites `col = value` equality against searchable columns
+/// into a blind-index prefix match. Traverses AND/OR/NOT and parentheses;
+/// anything else is left untouched.
+fn rewrite_selection(
+    expr: &mut Expr,
+    scope: &TableScope<'_>,
+    params: &mut ParamTransforms,
+) -> Result<bool, Error> {
+    use sqlparser::ast::BinaryOperator;
+    match expr {
+        Expr::BinaryOp { left, op: BinaryOperator::Eq, right } => {
+            if let Some(transform) = column_ref(scope, left) {
+                let transform = transform.clone();
+                rewrite_equality(left, right, &transform, params)
+            } else if let Some(transform) = column_ref(scope, right) {
+                let transform = transform.clone();
+                rewrite_equality(right, left, &transform, params)
+            } else {
+                Ok(false)
+            }
+        }
+        Expr::BinaryOp { left, op: BinaryOperator::And | BinaryOperator::Or, right } => {
+            let l = rewrite_selection(left, scope, params)?;
+            let r = rewrite_selection(right, scope, params)?;
+            Ok(l | r)
+        }
+        Expr::Nested(inner) => rewrite_selection(inner, scope, params),
+        Expr::UnaryOp { op: sqlparser::ast::UnaryOperator::Not, expr: inner } => {
+            rewrite_selection(inner, scope, params)
+        }
+        _ => Ok(false),
+    }
+}
+
+fn column_ref<'a>(scope: &'a TableScope<'_>, expr: &Expr) -> Option<&'a Arc<dyn FieldTransform>> {
+    match expr {
+        Expr::Identifier(ident) => scope.resolve(std::slice::from_ref(ident)),
+        Expr::CompoundIdentifier(idents) => scope.resolve(idents),
+        _ => None,
+    }
+}
+
+/// Turns `col = <value>` into `substring(col from 1 for 32) = <index>`.
+/// Literals get the index inline; placeholders are indexed at Bind time.
+fn rewrite_equality(
+    column: &mut Expr,
+    value: &mut Expr,
+    transform: &Arc<dyn FieldTransform>,
+    params: &mut ParamTransforms,
+) -> Result<bool, Error> {
+    if !transform.supports_search() {
+        return Ok(false);
+    }
+    match value {
+        Expr::Value(Value::SingleQuotedString(_) | Value::Number(..)) => {
+            let plaintext = match value {
+                Expr::Value(Value::SingleQuotedString(s)) => s.as_bytes().to_vec(),
+                Expr::Value(Value::Number(n, _)) => n.as_bytes().to_vec(),
+                _ => unreachable!(),
+            };
+            let Some(token) = transform.search_index(&plaintext)? else { return Ok(false) };
+            *value = Expr::Value(Value::SingleQuotedString(format!("\\x{}", hex::encode(token))));
+        }
+        Expr::Value(Value::Placeholder(p)) => {
+            let Some(index) = placeholder_index(p) else { return Ok(false) };
+            params.push((index, ParamAction::SearchIndex(transform.clone())));
+        }
+        _ => return Ok(false),
+    }
+    *column = index_prefix(std::mem::replace(column, Expr::Value(Value::Null)));
+    Ok(true)
+}
+
+/// `substring(col from 1 for 32)` — the stored blind-index prefix.
+fn index_prefix(column: Expr) -> Expr {
+    let number = |n: &str| Box::new(Expr::Value(Value::Number(n.into(), false)));
+    Expr::Substring {
+        expr: Box::new(column),
+        substring_from: Some(number("1")),
+        substring_for: Some(number(&dbsec_core::blind_index::BLIND_INDEX_LEN.to_string())),
+        special: false,
+    }
+}
+
+fn placeholder_index(placeholder: &str) -> Option<usize> {
+    placeholder.strip_prefix('$').and_then(|n| n.parse::<usize>().ok()).map(|n| n - 1)
 }
 
 /// Seals one literal in place, or records the placeholder for Bind time.
 /// Returns whether the statement text changed.
 fn seal_expr(
     expr: &mut Expr,
-    transform: &Arc<EncryptTransform>,
+    transform: &Arc<dyn FieldTransform>,
     params: &mut ParamTransforms,
 ) -> Result<bool, Error> {
     let sealed = match expr {
         Expr::Value(Value::SingleQuotedString(s)) => transform.seal(s.as_bytes())?,
         Expr::Value(Value::Number(n, _)) => transform.seal(n.as_bytes())?,
         Expr::Value(Value::Placeholder(p)) => {
-            if let Some(index) = p.strip_prefix('$').and_then(|n| n.parse::<usize>().ok()) {
-                params.push((index - 1, transform.clone()));
+            if let Some(index) = placeholder_index(p) {
+                params.push((index, ParamAction::Seal(transform.clone())));
             }
             return Ok(false);
         }
@@ -264,7 +481,11 @@ fn seal_expr(
             return Ok(false);
         }
     };
-    *expr = Expr::Value(Value::SingleQuotedString(format!("\\x{}", hex::encode(sealed))));
+    let literal = match transform.wire() {
+        WireForm::Bytea => format!("\\x{}", hex::encode(sealed)),
+        WireForm::Text => String::from_utf8_lossy(&sealed).into_owned(),
+    };
+    *expr = Expr::Value(Value::SingleQuotedString(literal));
     Ok(true)
 }
 
@@ -287,13 +508,20 @@ mod tests {
     use crate::rows::tests::transform;
     use dbsec_core::blind_index;
 
-    fn catalog(searchable: bool) -> Arc<WriteCatalog> {
-        Arc::new(WriteCatalog::new(&[ProtectedColumn {
+    fn column(name: &str, transform: Arc<dyn FieldTransform>, searchable: bool) -> ProtectedColumn {
+        ProtectedColumn {
             schema: "public".into(),
             table: "users".into(),
-            column: "email".into(),
-            transform: transform(searchable),
-        }]))
+            column: name.into(),
+            transform: Some(transform),
+            searchable,
+            readable: true,
+            mask: None,
+        }
+    }
+
+    fn catalog(searchable: bool) -> Arc<WriteCatalog> {
+        Arc::new(WriteCatalog::new(&[column("email", transform(searchable), searchable)]))
     }
 
     fn query_frame(sql: &str) -> Vec<u8> {
@@ -418,6 +646,139 @@ mod tests {
         let sql = std::str::from_utf8(reparsed.query).unwrap();
         assert!(!sql.contains("eve@example.com"));
         assert_eq!(open_hex_literal(sql, false), b"eve@example.com");
+    }
+
+    #[test]
+    fn text_shaped_transforms_seal_as_plain_literals_and_params() {
+        use crate::rows::tests::OneKey;
+        use dbsec_core::transform::{FpeTransform, TokenTransform};
+
+        let fpe: Arc<dyn FieldTransform> =
+            Arc::new(FpeTransform::new(Arc::new(OneKey), "public.users.phone".into(), true));
+        let token: Arc<dyn FieldTransform> =
+            Arc::new(TokenTransform::new(Arc::new(OneKey), "public.users.ssn".into()));
+        let catalog = Arc::new(WriteCatalog::new(&[
+            column("phone", fpe.clone(), false),
+            column("ssn", token.clone(), false),
+        ]));
+        let mut rewriter = QueryRewriter::new(catalog);
+
+        // FPE literal keeps its digit shape — no \x hex, no plaintext.
+        let body = query_frame("INSERT INTO users (phone, ssn) VALUES ('555-867-5309', 'abc')");
+        let rewritten = rewriter.on_frame(b'Q', &body).unwrap().unwrap();
+        let sql = std::str::from_utf8(&rewritten[..rewritten.len() - 1]).unwrap();
+        assert!(!sql.contains("555-867-5309") && !sql.contains("\\x"), "{sql}");
+        let pseudonym = sql.split('\'').nth(1).expect("first literal");
+        assert_eq!(pseudonym.len(), 12);
+        assert_eq!(&pseudonym[3..4], "-");
+        assert_eq!(fpe.open(pseudonym.as_bytes()).unwrap().unwrap(), b"555-867-5309");
+        // Token literal is the 64-char hex HMAC.
+        let token_literal = sql.split('\'').nth(3).expect("second literal");
+        assert_eq!(token_literal.len(), 64);
+        assert_eq!(token_literal.as_bytes(), token.seal(b"abc").unwrap().as_slice());
+
+        // Bound text-format param for an FPE column stays digit-shaped.
+        let parse = pgwire::encode_parse(
+            b"s1",
+            b"UPDATE users SET phone = $1 WHERE id = $2",
+            &0i16.to_be_bytes(),
+        );
+        assert!(rewriter.on_frame(b'P', &parse).unwrap().is_none());
+        let bind = pgwire::encode_bind(
+            b"",
+            b"s1",
+            &[],
+            &[
+                Some(Cow::Borrowed(b"555-867-5309".as_slice())),
+                Some(Cow::Borrowed(b"7".as_slice())),
+            ],
+            &0i16.to_be_bytes(),
+        );
+        let rewritten = rewriter.on_frame(b'B', &bind).unwrap().unwrap();
+        let bound = pgwire::parse_bind(&rewritten).unwrap();
+        let sealed = bound.params[0].unwrap();
+        assert!(!sealed.starts_with(b"\\x"));
+        assert_eq!(fpe.open(sealed).unwrap().unwrap(), b"555-867-5309");
+        assert_eq!(bound.params[1], Some(b"7".as_slice()));
+    }
+
+    #[test]
+    fn fpe_seal_of_tiny_domain_fails_closed() {
+        use crate::rows::tests::OneKey;
+        use dbsec_core::transform::FpeTransform;
+
+        let fpe: Arc<dyn FieldTransform> =
+            Arc::new(FpeTransform::new(Arc::new(OneKey), "public.users.pin".into(), true));
+        let catalog = Arc::new(WriteCatalog::new(&[column("pin", fpe, false)]));
+        let mut rewriter = QueryRewriter::new(catalog);
+        let body = query_frame("INSERT INTO users (pin) VALUES ('1234')");
+        assert!(rewriter.on_frame(b'Q', &body).is_err());
+    }
+
+    #[test]
+    fn searchable_equality_rewrites_to_index_prefix_match() {
+        use crate::rows::tests::INDEX_KEY;
+        use dbsec_core::blind_index;
+
+        let mut rewriter = QueryRewriter::new(catalog(true));
+        let body = query_frame("SELECT id FROM users WHERE email = 'alice@example.com'");
+        let rewritten = rewriter.on_frame(b'Q', &body).unwrap().unwrap();
+        let sql = std::str::from_utf8(&rewritten[..rewritten.len() - 1]).unwrap();
+
+        let expected = blind_index::compute(&INDEX_KEY, b"alice@example.com");
+        assert!(!sql.contains("alice@example.com"), "{sql}");
+        assert!(sql.contains("SUBSTRING(email FROM 1 FOR 32)"), "prefix match missing: {sql}");
+        assert!(sql.contains(&format!("'\\x{}'", hex::encode(expected))), "{sql}");
+
+        // Aliased and AND-nested references rewrite too; DELETE works.
+        let body = query_frame(
+            "DELETE FROM users u WHERE u.id > 4 AND (u.email = 'bob@x.io' OR u.email = 'c@y.io')",
+        );
+        let rewritten = rewriter.on_frame(b'Q', &body).unwrap().unwrap();
+        let sql = std::str::from_utf8(&rewritten[..rewritten.len() - 1]).unwrap();
+        assert!(!sql.contains("bob@x.io") && !sql.contains("c@y.io"), "{sql}");
+        assert_eq!(sql.matches("SUBSTRING(u.email FROM 1 FOR 32)").count(), 2, "{sql}");
+    }
+
+    #[test]
+    fn searchable_equality_placeholder_binds_the_index() {
+        use crate::rows::tests::INDEX_KEY;
+        use dbsec_core::blind_index;
+
+        let mut rewriter = QueryRewriter::new(catalog(true));
+        let parse = pgwire::encode_parse(
+            b"find",
+            b"SELECT id FROM users WHERE email = $1",
+            &0i16.to_be_bytes(),
+        );
+        let rewritten = rewriter.on_frame(b'P', &parse).unwrap().unwrap();
+        let reparsed = pgwire::parse_parse(&rewritten).unwrap();
+        let sql = std::str::from_utf8(reparsed.query).unwrap();
+        assert!(sql.contains("SUBSTRING(email FROM 1 FOR 32) = $1"), "{sql}");
+
+        let bind = pgwire::encode_bind(
+            b"",
+            b"find",
+            &[],
+            &[Some(Cow::Borrowed(b"alice@example.com".as_slice()))],
+            &0i16.to_be_bytes(),
+        );
+        let rewritten = rewriter.on_frame(b'B', &bind).unwrap().unwrap();
+        let bound = pgwire::parse_bind(&rewritten).unwrap();
+        let expected = blind_index::compute(&INDEX_KEY, b"alice@example.com");
+        assert_eq!(bound.params[0].unwrap(), format!("\\x{}", hex::encode(expected)).as_bytes());
+    }
+
+    #[test]
+    fn non_searchable_equality_is_left_alone() {
+        let mut rewriter = QueryRewriter::new(catalog(false));
+        for sql in [
+            "SELECT id FROM users WHERE email = 'alice@example.com'",
+            "SELECT id FROM other WHERE email = 'x'",
+            "SELECT id FROM users WHERE id = 4",
+        ] {
+            assert!(rewriter.on_frame(b'Q', &query_frame(sql)).unwrap().is_none(), "{sql}");
+        }
     }
 
     #[test]

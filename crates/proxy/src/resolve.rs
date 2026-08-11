@@ -39,14 +39,23 @@ pub async fn resolve_columns(
         let table_oid: u32 = row.get(0);
         let attnum: i16 = row.get(1);
         tracing::info!(
-            table = %format!("{}.{}", column.schema, column.table),
-            column = %column.column,
+            column = %column.qualified_name(),
             table_oid,
             attnum,
-            searchable = column.transform.searchable(),
+            searchable = column.searchable,
+            readable = column.readable,
             "protected column resolved"
         );
-        map.insert((table_oid, attnum), column.transform.clone());
+        // Only columns the read path acts on join the map: openable
+        // transforms and/or masks. Write-only columns (tokens, FPE without
+        // detokenize) relay untouched unless masked.
+        if column.readable || column.mask.is_some() {
+            let transform = column.readable.then(|| column.transform.clone()).flatten();
+            map.insert(
+                (table_oid, attnum),
+                crate::rows::ReadColumn { transform, mask: column.mask },
+            );
+        }
     }
     Ok(map)
 }

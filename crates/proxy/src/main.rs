@@ -9,6 +9,7 @@ mod resolve;
 mod rows;
 mod session;
 mod tls;
+mod vault;
 
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
@@ -46,6 +47,8 @@ pub enum Error {
     UpstreamTlsRefused { addr: String },
     #[error("invalid config: {0}")]
     InvalidConfig(String),
+    #[error("vault: {0}")]
+    Vault(String),
     #[error("control connection: {0}")]
     Control(String),
     #[error("configured column {table}.{column} does not exist")]
@@ -108,8 +111,13 @@ async fn serve(config: Config) -> Result<(), Error> {
     let (rows, writes) = if config.columns.is_empty() {
         (None, None)
     } else {
-        let keys_file = config.keys_file.as_deref().expect("validated: columns require keys_file");
-        let keys: Arc<dyn dbsec_core::keys::KeySource> = Arc::new(FileKeySource::load(keys_file)?);
+        let keys: Arc<dyn dbsec_core::keys::KeySource> = match (&config.keys_file, &config.vault) {
+            (Some(keys_file), None) => Arc::new(FileKeySource::load(keys_file)?),
+            (None, Some(vault_config)) => {
+                Arc::new(vault::VaultKeySource::connect(vault_config).await?)
+            }
+            _ => unreachable!("validated: columns require exactly one key source"),
+        };
         let protected = columns::build(&config, &keys);
         let dsn = config.control_dsn.as_deref().expect("validated: columns require control_dsn");
         let column_map = resolve::resolve_columns(dsn, &tls, &protected).await?;

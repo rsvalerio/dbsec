@@ -4,6 +4,7 @@
 pub mod blind_index;
 pub mod envelope;
 pub mod keys;
+pub mod mask;
 pub mod pgwire;
 pub mod transform;
 
@@ -19,6 +20,10 @@ pub enum Error {
     MalformedBackend,
     #[error("unknown key: {0}")]
     UnknownKey(String),
+    #[error("FPE requires at least {} digits", transform::MIN_FPE_DIGITS)]
+    FpeDomain,
+    #[error("FPE: {0}")]
+    Fpe(String),
     #[error("key source: {0}")]
     KeySource(String),
 }

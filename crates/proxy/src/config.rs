@@ -16,9 +16,11 @@ pub struct Config {
     /// Address of the real PostgreSQL server.
     #[serde(default = "default_upstream")]
     pub upstream: String,
-    /// TOML keyfile for `FileKeySource` (see `dbsec_core::keys`). Required
-    /// when any `[[column]]` is configured.
+    /// TOML keyfile for `FileKeySource` (see `dbsec_core::keys`). Columns
+    /// require either this or `[vault]`.
     pub keys_file: Option<PathBuf>,
+    /// OpenBao/Vault key source (Transit-wrapped DEKs + KV index keys).
+    pub vault: Option<VaultConfig>,
     /// DSN for the startup control connection that resolves configured
     /// columns to table OID + attnum. Required when any `[[column]]` is
     /// configured, e.g. `postgres://dbsec:secret@127.0.0.1:5432/app`.
@@ -36,10 +38,91 @@ pub struct ColumnConfig {
     pub table: String,
     /// Column name within the table.
     pub column: String,
+    #[serde(default)]
+    pub transform: TransformKind,
     /// Searchable columns carry a blind index before the envelope (stripped
     /// on read; equality rewrite arrives with the searchable milestone).
+    /// Only valid with `transform = "encrypt"`.
     #[serde(default)]
     pub searchable: bool,
+    /// Whether FPE values are detokenized on the read path. Only meaningful
+    /// for `transform = "fpe"`; tokens are irreversible, envelopes always
+    /// decrypt.
+    #[serde(default = "default_true")]
+    pub detokenize: bool,
+    /// Read-path mask applied after decryption/detokenization, e.g.
+    /// `mask = { keep_last = 4 }`.
+    pub mask: Option<dbsec_core::mask::MaskSpec>,
+}
+
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum TransformKind {
+    /// AES-256-GCM envelope, stored as BYTEA.
+    #[default]
+    Encrypt,
+    /// FF1 format-preserving encryption over decimal digits, stored in the
+    /// column's original text shape.
+    Fpe,
+    /// Irreversible deterministic HMAC token (hex), stored as text.
+    Token,
+    /// No crypto — writes pass through untouched. Only valid together with
+    /// `mask`, for columns that should be masked but stay plaintext at rest.
+    None,
+}
+
+fn default_true() -> bool {
+    true
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct VaultConfig {
+    /// e.g. `https://bao.internal:8200`.
+    pub addr: String,
+    /// Static token; prefer `token_file` outside of dev.
+    pub token: Option<String>,
+    /// File containing the token (e.g. written by an agent sidecar).
+    pub token_file: Option<PathBuf>,
+    /// KV v2 mount holding wrapped DEKs and index keys.
+    #[serde(default = "default_vault_mount")]
+    pub mount: String,
+    /// Base path within the mount.
+    #[serde(default = "default_vault_path")]
+    pub path: String,
+    /// Transit mount used to wrap/unwrap DEKs.
+    #[serde(default = "default_transit_mount")]
+    pub transit_mount: String,
+    /// Transit key name the DEK envelope is encrypted under.
+    #[serde(default = "default_vault_path")]
+    pub transit_key: String,
+}
+
+impl VaultConfig {
+    pub fn token(&self) -> Result<String, Error> {
+        match (&self.token, &self.token_file) {
+            (Some(token), None) => Ok(token.clone()),
+            (None, Some(path)) => Ok(std::fs::read_to_string(path)
+                .map_err(|e| Error::Vault(format!("reading {}: {e}", path.display())))?
+                .trim()
+                .to_owned()),
+            _ => {
+                Err(Error::InvalidConfig("[vault] needs exactly one of token or token_file".into()))
+            }
+        }
+    }
+}
+
+fn default_vault_mount() -> String {
+    "secret".to_owned()
+}
+
+fn default_vault_path() -> String {
+    "dbsec".to_owned()
+}
+
+fn default_transit_mount() -> String {
+    "transit".to_owned()
 }
 
 impl ColumnConfig {
@@ -95,6 +178,7 @@ impl Default for Config {
             listen: default_listen(),
             upstream: default_upstream(),
             keys_file: None,
+            vault: None,
             control_dsn: None,
             tls: TlsSection::default(),
             columns: Vec::new(),
@@ -114,20 +198,46 @@ impl Config {
 
     fn validate(&self) -> Result<(), Error> {
         if !self.columns.is_empty() {
-            if self.keys_file.is_none() {
-                return Err(Error::InvalidConfig("[[column]] entries require keys_file".into()));
+            match (&self.keys_file, &self.vault) {
+                (Some(_), None) | (None, Some(_)) => {}
+                (None, None) => {
+                    return Err(Error::InvalidConfig(
+                        "[[column]] entries require keys_file or [vault]".into(),
+                    ))
+                }
+                (Some(_), Some(_)) => {
+                    return Err(Error::InvalidConfig(
+                        "keys_file and [vault] are mutually exclusive".into(),
+                    ))
+                }
             }
             if self.control_dsn.is_none() {
                 return Err(Error::InvalidConfig("[[column]] entries require control_dsn".into()));
             }
         }
+        if let Some(vault) = &self.vault {
+            vault.token()?;
+        }
         let mut seen = std::collections::HashSet::new();
         for column in &self.columns {
             let (schema, table) = column.schema_and_table();
-            if !seen.insert((schema.to_owned(), table.to_owned(), column.column.clone())) {
+            let name = format!("{schema}.{table}.{}", column.column);
+            if !seen.insert(name.clone()) {
+                return Err(Error::InvalidConfig(format!("duplicate [[column]] entry for {name}")));
+            }
+            if column.searchable && column.transform != TransformKind::Encrypt {
                 return Err(Error::InvalidConfig(format!(
-                    "duplicate [[column]] entry for {schema}.{table}.{}",
-                    column.column
+                    "{name}: searchable requires transform = \"encrypt\""
+                )));
+            }
+            if !column.detokenize && column.transform != TransformKind::Fpe {
+                return Err(Error::InvalidConfig(format!(
+                    "{name}: detokenize = false is only meaningful for transform = \"fpe\""
+                )));
+            }
+            if column.transform == TransformKind::None && column.mask.is_none() {
+                return Err(Error::InvalidConfig(format!(
+                    "{name}: transform = \"none\" does nothing without a mask"
                 )));
             }
         }
@@ -174,6 +284,54 @@ mod tests {
         )
         .unwrap();
         assert!(matches!(dup.validate(), Err(Error::InvalidConfig(_))));
+    }
+
+    #[test]
+    fn transform_kinds_parse_and_validate() {
+        let cfg: Config = toml::from_str(
+            "keys_file = \"k\"\ncontrol_dsn = \"d\"\n\n[[column]]\ntable = \"cards\"\ncolumn = \"pan\"\ntransform = \"fpe\"\ndetokenize = false\n\n[[column]]\ntable = \"users\"\ncolumn = \"ssn\"\ntransform = \"token\"\n",
+        )
+        .unwrap();
+        cfg.validate().unwrap();
+        assert_eq!(cfg.columns[0].transform, TransformKind::Fpe);
+        assert!(!cfg.columns[0].detokenize);
+        assert_eq!(cfg.columns[1].transform, TransformKind::Token);
+        assert!(cfg.columns[1].detokenize);
+
+        let searchable_fpe: Config = toml::from_str(
+            "keys_file = \"k\"\ncontrol_dsn = \"d\"\n\n[[column]]\ntable = \"cards\"\ncolumn = \"pan\"\ntransform = \"fpe\"\nsearchable = true\n",
+        )
+        .unwrap();
+        assert!(matches!(searchable_fpe.validate(), Err(Error::InvalidConfig(_))));
+
+        let no_detok_encrypt: Config = toml::from_str(
+            "keys_file = \"k\"\ncontrol_dsn = \"d\"\n\n[[column]]\ntable = \"users\"\ncolumn = \"email\"\ndetokenize = false\n",
+        )
+        .unwrap();
+        assert!(matches!(no_detok_encrypt.validate(), Err(Error::InvalidConfig(_))));
+    }
+
+    #[test]
+    fn vault_section_parses_and_is_exclusive_with_keys_file() {
+        let cfg: Config = toml::from_str(
+            "control_dsn = \"d\"\n\n[vault]\naddr = \"http://127.0.0.1:8200\"\ntoken = \"root\"\n\n[[column]]\ntable = \"users\"\ncolumn = \"email\"\n",
+        )
+        .unwrap();
+        cfg.validate().unwrap();
+        let vault = cfg.vault.as_ref().unwrap();
+        assert_eq!(vault.mount, "secret");
+        assert_eq!(vault.path, "dbsec");
+        assert_eq!(vault.transit_mount, "transit");
+        assert_eq!(vault.token().unwrap(), "root");
+
+        let both: Config = toml::from_str(
+            "keys_file = \"k\"\ncontrol_dsn = \"d\"\n\n[vault]\naddr = \"a\"\ntoken = \"t\"\n\n[[column]]\ntable = \"users\"\ncolumn = \"email\"\n",
+        )
+        .unwrap();
+        assert!(matches!(both.validate(), Err(Error::InvalidConfig(_))));
+
+        let no_token: Config = toml::from_str("[vault]\naddr = \"a\"\n").unwrap();
+        assert!(matches!(no_token.validate(), Err(Error::InvalidConfig(_))));
     }
 
     #[test]
