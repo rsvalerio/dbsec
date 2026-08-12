@@ -25,6 +25,30 @@
 //! refresher replaces, not a startup constant, and
 //! [`RowDecryptor::check_for_stale_mapping`] is what makes a session notice
 //! the gap between two refreshes (CL-3).
+//!
+//! # Refusals
+//!
+//! This path has two of them: a DataRow no described statement covers
+//! ([`Error::UndescribedRow`]) and a result column a stale mapping would
+//! under-match under `on_unprotected = "reject"`
+//! ([`Error::StaleColumnMap`]). Both are statement-level, not
+//! connection-level: the client gets a PostgreSQL ErrorResponse (SQLSTATE
+//! 42501, the same one a refused write carries), the rest of the result set is
+//! discarded, and the backend's own ReadyForQuery ends the batch — see
+//! [`RowDecryptor::on_frame`]. Crypto failures are not refusals and still fail
+//! the session.
+//!
+//! Whether the second one deserves a knob of its own, separate from
+//! `on_unprotected`, was decided here rather than left open: **it does not**.
+//! `on_unprotected` is not a write-path setting that the read path borrowed —
+//! it is the one answer to "this may be unprotected, would you rather have an
+//! error than a guess", and both paths are asking exactly that question about
+//! the same columns. Splitting it would let a deployment be strict about
+//! writing plaintext and lax about handing back stored bytes, which is the
+//! half-enforced state the setting exists to rule out; and the operator who
+//! turns on `reject` has to reason about one behaviour instead of two. A
+//! separate knob only earns its place if a real deployment needs the mixed
+//! mode, and none has asked.
 
 use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
@@ -38,6 +62,7 @@ use tokio::sync::Notify;
 
 use crate::config::OnUnprotected;
 use crate::portal::{Positions, RowSource, SessionPortals};
+use crate::session::FrameAction;
 use crate::Error;
 
 /// What the read path does to one column: open with the transform (when
@@ -124,7 +149,13 @@ impl RowContext {
     }
 
     pub fn decryptor(self: &Arc<Self>, portals: Arc<SessionPortals>) -> RowDecryptor {
-        RowDecryptor { ctx: self.clone(), portals, described: None, warned_stale: false }
+        RowDecryptor {
+            ctx: self.clone(),
+            portals,
+            described: None,
+            warned_stale: false,
+            refusing: false,
+        }
     }
 }
 
@@ -140,12 +171,82 @@ pub struct RowDecryptor {
     /// session is enough to act on; one per result set would be a log flood
     /// for exactly as long as the migration goes unnoticed.
     warned_stale: bool,
+    /// Set after refusing a result set: the client has its ErrorResponse and
+    /// everything the backend sends up to its ReadyForQuery is dropped.
+    refusing: bool,
+}
+
+/// Whether an error is a refusal the client can be told about, rather than a
+/// failure of the session itself. Both variants mean "these bytes may be a
+/// protected column's stored form and the proxy will not relay them" — a
+/// policy decision about one result set, which is exactly what an
+/// ErrorResponse expresses. Anything else (a decrypt failure, a malformed
+/// frame) says the stream is not what it claims to be, and the session ends.
+fn is_refusal(error: &Error) -> bool {
+    matches!(error, Error::UndescribedRow | Error::StaleColumnMap { .. })
 }
 
 impl RowDecryptor {
-    /// Inspects one upstream→client frame. Returns a replacement body when
-    /// the message must be rewritten, `None` to relay it untouched.
-    pub fn on_frame(&mut self, msg_type: u8, body: &[u8]) -> Result<Option<Vec<u8>>, Error> {
+    /// Inspects one upstream→client frame and says what the relay does with
+    /// it.
+    ///
+    /// A *refusal* — a DataRow no described statement covers, or a result
+    /// column a stale mapping would under-match under
+    /// `on_unprotected = "reject"` — is answered the way the write path
+    /// answers one: the client gets a PostgreSQL ErrorResponse in place of the
+    /// frame, the rest of the result set is discarded, and the backend's own
+    /// ReadyForQuery resynchronises the session. Dropping the connection
+    /// instead (the previous behaviour) gave the client `Closed` rather than a
+    /// `DbError`, so a policy refusal read as a network fault and the proxy's
+    /// reason stayed in its log.
+    ///
+    /// Every *other* error is still fatal to the session: a decrypt failure
+    /// means the bytes in flight are not what they claim to be, and there is
+    /// no state to resynchronise to.
+    pub fn on_frame(&mut self, msg_type: u8, body: &[u8]) -> Result<FrameAction, Error> {
+        if self.refusing {
+            return Ok(self.discard_until_ready(msg_type));
+        }
+        match self.inspect(msg_type, body) {
+            Ok(None) => Ok(FrameAction::Relay),
+            Ok(Some(body)) => Ok(FrameAction::Replace(body)),
+            Err(error) if is_refusal(&error) => Ok(self.refuse(&error)),
+            Err(error) => Err(error),
+        }
+    }
+
+    /// Answers the client with an ErrorResponse and takes ownership of the
+    /// rest of the batch, which the backend is still sending.
+    fn refuse(&mut self, error: &Error) -> FrameAction {
+        self.refusing = true;
+        tracing::error!(
+            error = %error,
+            "refusing this result set; answering the client with an ErrorResponse"
+        );
+        FrameAction::Substitute(crate::encrypt::error_response(&format!(
+            "dbsec refused to relay this result: {error}"
+        )))
+    }
+
+    /// After a refusal the backend is still sending the result set the proxy
+    /// will not relay, so everything up to its ReadyForQuery is dropped — the
+    /// same thing the backend itself does to a batch it has errored on, and
+    /// the point [`crate::portal`] resynchronises on. The ReadyForQuery is
+    /// relayed rather than synthesized: it is the backend's, carrying the
+    /// backend's real transaction status.
+    fn discard_until_ready(&mut self, msg_type: u8) -> FrameAction {
+        if msg_type != b'Z' {
+            return FrameAction::Substitute(Vec::new());
+        }
+        self.refusing = false;
+        self.portals.batch_answered();
+        self.described = None;
+        FrameAction::Relay
+    }
+
+    /// One frame's decryption: a replacement body, or `None` to relay it
+    /// untouched.
+    fn inspect(&mut self, msg_type: u8, body: &[u8]) -> Result<Option<Vec<u8>>, Error> {
         match msg_type {
             b'T' => {
                 let fields = pgwire::parse_row_description(body)?;
@@ -383,6 +484,23 @@ pub mod tests {
         body
     }
 
+    /// The replacement body of a frame the decryptor rewrote, or `None` when
+    /// it was relayed untouched. Tests that expect a refusal match on
+    /// [`FrameAction::Substitute`] themselves.
+    trait Rewritten {
+        fn body(self) -> Option<Vec<u8>>;
+    }
+
+    impl Rewritten for FrameAction {
+        fn body(self) -> Option<Vec<u8>> {
+            match self {
+                FrameAction::Relay => None,
+                FrameAction::Replace(body) => Some(body),
+                other => panic!("expected a relayed or rewritten frame, got {other:?}"),
+            }
+        }
+    }
+
     fn data_row(values: &[Option<&[u8]>]) -> Vec<u8> {
         let cows: Vec<_> = values.iter().map(|v| v.map(Cow::Borrowed)).collect();
         pgwire::encode_data_row(&cows).unwrap()
@@ -452,11 +570,11 @@ pub mod tests {
         let mut decryptor = ctx.decryptor(SessionPortals::new());
 
         let desc = row_description(&[(1234, 1), (1234, 2)]);
-        assert!(decryptor.on_frame(b'T', &desc).unwrap().is_none());
+        assert!(decryptor.on_frame(b'T', &desc).unwrap().body().is_none());
 
         let ct = envelope::encrypt(&KEY, &KEY_ID, b"alice@example.com").unwrap();
         let row = data_row(&[Some(b"42"), Some(&ct)]);
-        let rewritten = decryptor.on_frame(b'D', &row).unwrap().unwrap();
+        let rewritten = decryptor.on_frame(b'D', &row).unwrap().body().unwrap();
         assert_eq!(
             pgwire::parse_data_row(&rewritten).unwrap(),
             vec![Some(b"42".as_slice()), Some(b"alice@example.com".as_slice())]
@@ -465,7 +583,7 @@ pub mod tests {
         // Text-format (hex) representation decrypts too, and goes back in the
         // same shape — a client decoding BYTEA text expects `\x` hex.
         let hex_row = data_row(&[Some(b"42"), Some(format!("\\x{}", hex::encode(&ct)).as_bytes())]);
-        let rewritten = decryptor.on_frame(b'D', &hex_row).unwrap().unwrap();
+        let rewritten = decryptor.on_frame(b'D', &hex_row).unwrap().body().unwrap();
         assert_eq!(
             pgwire::parse_data_row(&rewritten).unwrap()[1],
             Some(format!("\\x{}", hex::encode("alice@example.com")).as_bytes())
@@ -473,9 +591,9 @@ pub mod tests {
 
         // Plaintext (pre-migration) and NULL pass through untouched.
         let plain_row = data_row(&[Some(b"42"), Some(b"not encrypted")]);
-        assert!(decryptor.on_frame(b'D', &plain_row).unwrap().is_none());
+        assert!(decryptor.on_frame(b'D', &plain_row).unwrap().body().is_none());
         let null_row = data_row(&[Some(b"42"), None]);
-        assert!(decryptor.on_frame(b'D', &null_row).unwrap().is_none());
+        assert!(decryptor.on_frame(b'D', &null_row).unwrap().body().is_none());
     }
 
     #[test]
@@ -488,7 +606,7 @@ pub mod tests {
         let index = blind_index::compute(&INDEX_KEY, b"alice");
         let stored = blind_index::prepend(&index, &ct);
         let row = data_row(&[Some(b"42"), Some(&stored)]);
-        let rewritten = decryptor.on_frame(b'D', &row).unwrap().unwrap();
+        let rewritten = decryptor.on_frame(b'D', &row).unwrap().body().unwrap();
         assert_eq!(pgwire::parse_data_row(&rewritten).unwrap()[1], Some(b"alice".as_slice()));
     }
 
@@ -500,7 +618,7 @@ pub mod tests {
 
         let ct = envelope::encrypt(&KEY, &KEY_ID, b"secret").unwrap();
         let row = data_row(&[Some(&ct)]);
-        assert!(decryptor.on_frame(b'D', &row).unwrap().is_none());
+        assert!(decryptor.on_frame(b'D', &row).unwrap().body().is_none());
     }
 
     #[test]
@@ -524,7 +642,7 @@ pub mod tests {
         // Decrypted value is masked before it reaches the client.
         let ct = envelope::encrypt(&KEY, &KEY_ID, b"4111111111111111").unwrap();
         let row = data_row(&[Some(b"42"), Some(&ct)]);
-        let rewritten = decryptor.on_frame(b'D', &row).unwrap().unwrap();
+        let rewritten = decryptor.on_frame(b'D', &row).unwrap().body().unwrap();
         assert_eq!(
             pgwire::parse_data_row(&rewritten).unwrap()[1],
             Some(b"************1111".as_slice())
@@ -532,7 +650,7 @@ pub mod tests {
 
         // Pre-migration plaintext is masked too — the mask is a read policy.
         let plain_row = data_row(&[Some(b"42"), Some(b"4111111111111111")]);
-        let rewritten = decryptor.on_frame(b'D', &plain_row).unwrap().unwrap();
+        let rewritten = decryptor.on_frame(b'D', &plain_row).unwrap().body().unwrap();
         assert_eq!(
             pgwire::parse_data_row(&rewritten).unwrap()[1],
             Some(b"************1111".as_slice())
@@ -548,7 +666,7 @@ pub mod tests {
 
         let ct = envelope::encrypt(&KEY, &KEY_ID, b"4111111111111111").unwrap();
         let row = data_row(&[Some(format!("\\x{}", hex::encode(&ct)).as_bytes())]);
-        let rewritten = decryptor.on_frame(b'D', &row).unwrap().unwrap();
+        let rewritten = decryptor.on_frame(b'D', &row).unwrap().body().unwrap();
         assert_eq!(
             pgwire::parse_data_row(&rewritten).unwrap()[0],
             Some(format!("\\x{}", hex::encode("************1111")).as_bytes())
@@ -563,7 +681,7 @@ pub mod tests {
         decryptor.on_frame(b'T', &row_description(&[(1234, 2)])).unwrap();
 
         let row = data_row(&[Some(b"secret")]);
-        let rewritten = decryptor.on_frame(b'D', &row).unwrap().unwrap();
+        let rewritten = decryptor.on_frame(b'D', &row).unwrap().body().unwrap();
         assert_eq!(pgwire::parse_data_row(&rewritten).unwrap()[0], Some(b"se####".as_slice()));
     }
 
@@ -594,6 +712,7 @@ pub mod tests {
         let rewritten = decryptor
             .on_frame(b'D', &data_row(&[Some(b"42"), Some(&ct)]))
             .unwrap()
+            .body()
             .expect("A's own positions must decrypt A's rows");
         assert_eq!(
             pgwire::parse_data_row(&rewritten).unwrap()[1],
@@ -607,11 +726,21 @@ pub mod tests {
         assert!(decryptor
             .on_frame(b'D', &data_row(&[Some(b"42"), Some(b"2026-01-01")]))
             .unwrap()
+            .body()
             .is_none());
     }
 
+    /// The frames a refusal put on the wire, as one buffer.
+    fn refused(action: FrameAction) -> Vec<u8> {
+        let FrameAction::Substitute(frames) = action else {
+            panic!("expected a refusal, got {action:?}")
+        };
+        assert_eq!(frames[0], b'E', "a refusal is an ErrorResponse");
+        frames
+    }
+
     #[test]
-    fn a_data_row_no_description_covers_fails_instead_of_relaying_stored_values() {
+    fn a_data_row_no_description_covers_is_refused_not_relayed() {
         let ctx = context(false);
         let (mut rewriter, mut decryptor) = session(&ctx);
 
@@ -626,11 +755,65 @@ pub mod tests {
         execute(&mut rewriter, b"a");
         let ct = envelope::encrypt(&KEY, &KEY_ID, b"alice@example.com").unwrap();
         let row = data_row(&[Some(&ct)]);
-        assert!(matches!(decryptor.on_frame(b'D', &row), Err(Error::UndescribedRow)));
+        let error = refused(decryptor.on_frame(b'D', &row).unwrap());
+        let text = String::from_utf8_lossy(&error);
+        assert!(text.contains("42501"), "the client gets a SQLSTATE: {text}");
+        assert!(text.contains("never described"), "and a reason: {text}");
 
         // Nor does a DataRow that follows no RowDescription at all pass.
         let mut untracked = context(false).decryptor(SessionPortals::new());
-        assert!(matches!(untracked.on_frame(b'D', &row), Err(Error::UndescribedRow)));
+        refused(untracked.on_frame(b'D', &row).unwrap());
+    }
+
+    /// A refusal is statement-level, exactly as it is on the write path: the
+    /// rest of the result set is withheld, the backend's own ReadyForQuery
+    /// closes the batch, and the session goes on to serve the next statement.
+    /// Dropping the socket instead handed the client a network fault where the
+    /// write path would have handed it an error it can act on.
+    #[test]
+    fn the_session_survives_a_read_path_refusal_and_resynchronises() {
+        let ctx = context(false);
+        let (mut rewriter, mut decryptor) = session(&ctx);
+        rewriter
+            .on_frame(
+                b'P',
+                &pgwire::encode_parse(b"a", b"SELECT email FROM users", &0i16.to_be_bytes()),
+            )
+            .unwrap();
+        execute(&mut rewriter, b"a");
+
+        let ct = envelope::encrypt(&KEY, &KEY_ID, b"alice@example.com").unwrap();
+        let row = data_row(&[Some(&ct)]);
+        refused(decryptor.on_frame(b'D', &row).unwrap());
+
+        // Everything the backend is still sending for this batch is withheld:
+        // the client has already been told the statement failed.
+        for (msg_type, body) in [(b'D', row.as_slice()), (b'C', b"SELECT 1\0".as_slice())] {
+            assert_eq!(
+                decryptor.on_frame(msg_type, body).unwrap(),
+                FrameAction::Substitute(Vec::new()),
+                "{} must not reach the client",
+                msg_type as char
+            );
+        }
+        // The backend's own ReadyForQuery is relayed — it carries the real
+        // transaction status — and ends the refusal.
+        assert_eq!(decryptor.on_frame(b'Z', b"E").unwrap(), FrameAction::Relay);
+
+        // The next statement is served normally.
+        prepare(&mut rewriter, b"b", b"SELECT id, email FROM users");
+        decryptor.on_frame(b'T', &row_description(&[(1234, 1), (1234, 2)])).unwrap();
+        decryptor.on_frame(b'Z', b"I").unwrap();
+        execute(&mut rewriter, b"b");
+        let rewritten = decryptor
+            .on_frame(b'D', &data_row(&[Some(b"42"), Some(&ct)]))
+            .unwrap()
+            .body()
+            .expect("the session decrypts again after the refusal");
+        assert_eq!(
+            pgwire::parse_data_row(&rewritten).unwrap()[1],
+            Some(b"alice@example.com".as_slice())
+        );
     }
 
     /// A migration that recreates the table or the column gives the protected
@@ -661,10 +844,12 @@ pub mod tests {
         assert!(!fine.warned_stale);
     }
 
-    /// Under `on_unprotected = "reject"` the same detection fails the session
-    /// rather than handing the client something that may be ciphertext.
+    /// Under `on_unprotected = "reject"` the same detection refuses the result
+    /// set rather than handing the client something that may be ciphertext —
+    /// with the same ErrorResponse the write path answers a refused statement
+    /// with, so the two halves of the setting behave alike.
     #[test]
-    fn a_moved_protected_column_fails_the_session_in_strict_mode() {
+    fn a_moved_protected_column_refuses_the_result_set_in_strict_mode() {
         let mut columns = ColumnMap::new();
         columns.insert((1234, 2), ReadColumn { transform: Some(transform(false)), mask: None });
         let ctx = Arc::new(RowContext::new(
@@ -672,10 +857,18 @@ pub mod tests {
             OnUnprotected::Reject,
         ));
         let mut decryptor = ctx.decryptor(SessionPortals::new());
-        assert!(matches!(
-            decryptor.on_frame(b'T', &named_row_description(&[("email", 5678, 2)])),
-            Err(Error::StaleColumnMap { table_oid: 5678, .. })
-        ));
+        let error = refused(
+            decryptor.on_frame(b'T', &named_row_description(&[("email", 5678, 2)])).unwrap(),
+        );
+        let text = String::from_utf8_lossy(&error);
+        assert!(text.contains("42501") && text.contains("email"), "{text}");
+        // The DataRows behind the refused RowDescription are withheld, and the
+        // batch ends at the backend's ReadyForQuery.
+        assert_eq!(
+            decryptor.on_frame(b'D', &data_row(&[Some(b"whatever")])).unwrap(),
+            FrameAction::Substitute(Vec::new())
+        );
+        assert_eq!(decryptor.on_frame(b'Z', b"I").unwrap(), FrameAction::Relay);
     }
 
     /// A re-resolution reaches sessions that are already open: the mapping is
@@ -688,7 +881,7 @@ pub mod tests {
         // Before: nothing is protected at the new position.
         decryptor.on_frame(b'T', &row_description(&[(5678, 2)])).unwrap();
         let ct = envelope::encrypt(&KEY, &KEY_ID, b"alice").unwrap();
-        assert!(decryptor.on_frame(b'D', &data_row(&[Some(&ct)])).unwrap().is_none());
+        assert!(decryptor.on_frame(b'D', &data_row(&[Some(&ct)])).unwrap().body().is_none());
 
         // The refresher re-resolves the column to where it moved to.
         let mut columns = ColumnMap::new();
@@ -703,6 +896,7 @@ pub mod tests {
         let rewritten = decryptor
             .on_frame(b'D', &data_row(&[Some(&ct)]))
             .unwrap()
+            .body()
             .expect("the new mapping decrypts");
         assert_eq!(pgwire::parse_data_row(&rewritten).unwrap()[0], Some(b"alice".as_slice()));
     }
