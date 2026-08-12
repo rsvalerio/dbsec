@@ -107,7 +107,7 @@ proptest! {
     ) {
         let cows: Vec<_> =
             values.iter().map(|v| v.as_deref().map(std::borrow::Cow::Borrowed)).collect();
-        let body = pgwire::encode_data_row(&cows);
+        let body = pgwire::encode_data_row(&cows).unwrap();
         let parsed = pgwire::parse_data_row(&body).unwrap();
         prop_assert_eq!(parsed, values.iter().map(|v| v.as_deref()).collect::<Vec<_>>());
     }

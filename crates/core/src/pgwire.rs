@@ -99,12 +99,7 @@ pub fn parse_data_row(mut body: &[u8]) -> Result<Vec<Option<&[u8]>>, Error> {
     let count = take_i16(&mut body)?;
     let mut values = Vec::with_capacity(count.max(0) as usize);
     for _ in 0..count {
-        let len = i32::from_be_bytes(take(&mut body, 4)?.try_into().expect("4 bytes"));
-        match len {
-            -1 => values.push(None),
-            0.. => values.push(Some(take(&mut body, len as usize)?)),
-            _ => return Err(Error::MalformedBackend),
-        }
+        values.push(take_nullable(&mut body)?);
     }
     if !body.is_empty() {
         return Err(Error::MalformedBackend);
@@ -113,20 +108,22 @@ pub fn parse_data_row(mut body: &[u8]) -> Result<Vec<Option<&[u8]>>, Error> {
 }
 
 /// Encodes a DataRow ('D') body from per-column values.
-pub fn encode_data_row(values: &[Option<std::borrow::Cow<'_, [u8]>>]) -> Vec<u8> {
+///
+/// # Errors
+///
+/// [`Error::WireFieldOverflow`] when the row has more than [`i16::MAX`] columns
+/// or a value is longer than [`i32::MAX`] bytes: neither fits the wire's
+/// fixed-width fields, and truncating them would emit a frame the peer decodes
+/// as something else (a negative count, or `-1` — SQL NULL — for a length).
+pub fn encode_data_row(values: &[Option<std::borrow::Cow<'_, [u8]>>]) -> Result<Vec<u8>, Error> {
+    let count = wire_count(values.len())?;
     let payload: usize = values.iter().map(|v| v.as_ref().map_or(0, |v| v.len())).sum();
     let mut out = Vec::with_capacity(2 + values.len() * 4 + payload);
-    out.extend_from_slice(&(values.len() as i16).to_be_bytes());
+    out.extend_from_slice(&count.to_be_bytes());
     for value in values {
-        match value {
-            None => out.extend_from_slice(&(-1i32).to_be_bytes()),
-            Some(v) => {
-                out.extend_from_slice(&(v.len() as i32).to_be_bytes());
-                out.extend_from_slice(v);
-            }
-        }
+        push_nullable(&mut out, value.as_deref())?;
     }
-    out
+    Ok(out)
 }
 
 /// A parsed Parse ('P') message: statement name, query text, and the raw
@@ -186,23 +183,27 @@ pub fn parse_bind(mut body: &[u8]) -> Result<BindMessage<'_>, Error> {
     let param_count = take_i16(&mut body)?;
     let mut params = Vec::with_capacity(param_count.max(0) as usize);
     for _ in 0..param_count {
-        let len = i32::from_be_bytes(take(&mut body, 4)?.try_into().expect("4 bytes"));
-        match len {
-            -1 => params.push(None),
-            0.. => params.push(Some(take(&mut body, len as usize)?)),
-            _ => return Err(Error::MalformedBackend),
-        }
+        params.push(take_nullable(&mut body)?);
     }
     Ok(BindMessage { portal, statement, param_formats, params, result_formats: body })
 }
 
+/// Encodes a Bind ('B') body.
+///
+/// # Errors
+///
+/// [`Error::WireFieldOverflow`] when there are more than [`i16::MAX`] parameter
+/// formats or parameters, or a parameter is longer than [`i32::MAX`] bytes —
+/// see [`encode_data_row`].
 pub fn encode_bind(
     portal: &[u8],
     statement: &[u8],
     param_formats: &[i16],
     params: &[Option<std::borrow::Cow<'_, [u8]>>],
     result_formats: &[u8],
-) -> Vec<u8> {
+) -> Result<Vec<u8>, Error> {
+    let format_count = wire_count(param_formats.len())?;
+    let param_count = wire_count(params.len())?;
     let payload: usize = params.iter().map(|p| p.as_ref().map_or(0, |p| p.len())).sum();
     let mut out = Vec::with_capacity(
         portal.len()
@@ -218,22 +219,16 @@ pub fn encode_bind(
     out.push(0);
     out.extend_from_slice(statement);
     out.push(0);
-    out.extend_from_slice(&(param_formats.len() as i16).to_be_bytes());
+    out.extend_from_slice(&format_count.to_be_bytes());
     for format in param_formats {
         out.extend_from_slice(&format.to_be_bytes());
     }
-    out.extend_from_slice(&(params.len() as i16).to_be_bytes());
+    out.extend_from_slice(&param_count.to_be_bytes());
     for param in params {
-        match param {
-            None => out.extend_from_slice(&(-1i32).to_be_bytes()),
-            Some(p) => {
-                out.extend_from_slice(&(p.len() as i32).to_be_bytes());
-                out.extend_from_slice(p);
-            }
-        }
+        push_nullable(&mut out, param.as_deref())?;
     }
     out.extend_from_slice(result_formats);
-    out
+    Ok(out)
 }
 
 /// Takes a NUL-terminated string, returning it without the terminator.
@@ -248,6 +243,37 @@ fn take<'a>(buf: &mut &'a [u8], n: usize) -> Result<&'a [u8], Error> {
     let (head, rest) = buf.split_at_checked(n).ok_or(Error::MalformedBackend)?;
     *buf = rest;
     Ok(head)
+}
+
+/// Takes one nullable length-prefixed value — the construct DataRow columns and
+/// Bind parameters share: an `i32` length, `-1` for SQL NULL, then that many
+/// bytes.
+fn take_nullable<'a>(buf: &mut &'a [u8]) -> Result<Option<&'a [u8]>, Error> {
+    let len = i32::from_be_bytes(take(buf, 4)?.try_into().expect("4 bytes"));
+    match len {
+        -1 => Ok(None),
+        0.. => Ok(Some(take(buf, len as usize)?)),
+        _ => Err(Error::MalformedBackend),
+    }
+}
+
+/// Appends one nullable length-prefixed value; the inverse of [`take_nullable`].
+fn push_nullable(out: &mut Vec<u8>, value: Option<&[u8]>) -> Result<(), Error> {
+    match value {
+        None => out.extend_from_slice(&(-1i32).to_be_bytes()),
+        Some(v) => {
+            let len = i32::try_from(v.len()).map_err(|_| Error::WireFieldOverflow)?;
+            out.extend_from_slice(&len.to_be_bytes());
+            out.extend_from_slice(v);
+        }
+    }
+    Ok(())
+}
+
+/// Narrows a collection length into the `i16` count the wire uses for column,
+/// parameter and format counts.
+fn wire_count(len: usize) -> Result<i16, Error> {
+    i16::try_from(len).map_err(|_| Error::WireFieldOverflow)
 }
 
 fn take_i16(buf: &mut &[u8]) -> Result<i16, Error> {
@@ -332,7 +358,8 @@ mod tests {
             &[0, 1],
             &[Some(Cow::Borrowed(b"abc".as_slice())), None],
             &result_formats,
-        );
+        )
+        .unwrap();
         let parsed = parse_bind(&body).unwrap();
         assert_eq!(parsed.portal, b"portal");
         assert_eq!(parsed.statement, b"stmt");
@@ -357,13 +384,27 @@ mod tests {
         use std::borrow::Cow;
         let values =
             [Some(Cow::Borrowed(b"abc".as_slice())), None, Some(Cow::Borrowed(b"".as_slice()))];
-        let body = encode_data_row(&values);
+        let body = encode_data_row(&values).unwrap();
         assert_eq!(
             parse_data_row(&body).unwrap(),
             vec![Some(b"abc".as_slice()), None, Some(b"".as_slice())]
         );
 
         assert!(parse_data_row(&body[..body.len() - 1]).is_err());
+    }
+
+    #[test]
+    fn encoding_more_columns_than_the_count_field_holds_errors() {
+        use std::borrow::Cow;
+        let values: Vec<Option<Cow<'_, [u8]>>> = vec![None; i16::MAX as usize];
+        assert!(encode_data_row(&values).is_ok());
+
+        let too_many: Vec<Option<Cow<'_, [u8]>>> = vec![None; i16::MAX as usize + 1];
+        assert!(matches!(encode_data_row(&too_many), Err(Error::WireFieldOverflow)));
+        assert!(matches!(
+            encode_bind(b"", b"", &[], &too_many, &[]),
+            Err(Error::WireFieldOverflow)
+        ));
     }
 
     #[test]

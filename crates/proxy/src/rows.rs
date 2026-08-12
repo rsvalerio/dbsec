@@ -97,7 +97,10 @@ impl RowDecryptor {
                         changed = true;
                     }
                 }
-                Ok(changed.then(|| pgwire::encode_data_row(&values)))
+                if !changed {
+                    return Ok(None);
+                }
+                Ok(Some(pgwire::encode_data_row(&values)?))
             }
             _ => Ok(None),
         }
@@ -177,7 +180,7 @@ pub mod tests {
 
     fn data_row(values: &[Option<&[u8]>]) -> Vec<u8> {
         let cows: Vec<_> = values.iter().map(|v| v.map(Cow::Borrowed)).collect();
-        pgwire::encode_data_row(&cows)
+        pgwire::encode_data_row(&cows).unwrap()
     }
 
     #[test]

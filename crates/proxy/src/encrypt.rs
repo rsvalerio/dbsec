@@ -152,7 +152,7 @@ impl QueryRewriter {
                     &bind.param_formats,
                     &values,
                     bind.result_formats,
-                )))
+                )?))
             }
             b'C' => {
                 // Close: 'S' = statement, 'P' = portal.
@@ -655,7 +655,8 @@ mod tests {
                 Some(Cow::Borrowed(b"carol@example.com".as_slice())),
             ],
             &0i16.to_be_bytes(),
-        );
+        )
+        .unwrap();
         let rewritten = rewriter.on_frame(b'B', &bind).unwrap().unwrap();
         let bound = pgwire::parse_bind(&rewritten).unwrap();
         assert_eq!(bound.params[0], Some(b"1".as_slice()));
@@ -673,7 +674,8 @@ mod tests {
                 Some(Cow::Borrowed(b"dave@example.com".as_slice())),
             ],
             &0i16.to_be_bytes(),
-        );
+        )
+        .unwrap();
         let rewritten = rewriter.on_frame(b'B', &bind).unwrap().unwrap();
         let bound = pgwire::parse_bind(&rewritten).unwrap();
         assert_eq!(
@@ -748,7 +750,8 @@ mod tests {
                 Some(Cow::Borrowed(b"7".as_slice())),
             ],
             &0i16.to_be_bytes(),
-        );
+        )
+        .unwrap();
         let rewritten = rewriter.on_frame(b'B', &bind).unwrap().unwrap();
         let bound = pgwire::parse_bind(&rewritten).unwrap();
         let sealed = bound.params[0].unwrap();
@@ -817,7 +820,8 @@ mod tests {
             &[],
             &[Some(Cow::Borrowed(b"alice@example.com".as_slice()))],
             &0i16.to_be_bytes(),
-        );
+        )
+        .unwrap();
         let rewritten = rewriter.on_frame(b'B', &bind).unwrap().unwrap();
         let bound = pgwire::parse_bind(&rewritten).unwrap();
         let expected = blind_index::compute(&INDEX_KEY, b"alice@example.com");

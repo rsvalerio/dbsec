@@ -16,6 +16,8 @@ pub enum Error {
     Decrypt,
     #[error("invalid wire message length {0}")]
     BadMessageLength(i32),
+    #[error("message field does not fit the wire protocol's fixed-width encoding")]
+    WireFieldOverflow,
     #[error("malformed backend message")]
     MalformedBackend,
     #[error("unknown key: {0}")]

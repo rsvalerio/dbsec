@@ -16,7 +16,8 @@ fuzz_target!(|data: &[u8]| {
     if let Ok(values) = dbsec_core::pgwire::parse_data_row(data) {
         let cows: Vec<_> =
             values.iter().map(|v| v.map(std::borrow::Cow::Borrowed)).collect();
-        let reencoded = dbsec_core::pgwire::encode_data_row(&cows);
+        // A parsed row has at most i16::MAX columns, so re-encoding it fits.
+        let reencoded = dbsec_core::pgwire::encode_data_row(&cows).expect("row fits the wire");
         assert_eq!(dbsec_core::pgwire::parse_data_row(&reencoded).unwrap(), values);
     }
     let _ = dbsec_core::pgwire::parse_parse(data);
@@ -29,7 +30,8 @@ fuzz_target!(|data: &[u8]| {
             &bind.param_formats,
             &cows,
             bind.result_formats,
-        );
+        )
+        .expect("bind fits the wire");
         let reparsed = dbsec_core::pgwire::parse_bind(&reencoded).unwrap();
         assert_eq!(reparsed.params, bind.params);
         assert_eq!(reparsed.param_formats, bind.param_formats);
