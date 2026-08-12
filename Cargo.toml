@@ -48,6 +48,8 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 # test-only
 proptest = "1"
 tempfile = "3"
+# The e2e COPY case drives tokio-postgres' Sink/Stream copy API by hand.
+futures-util = { version = "0.3", default-features = false }
 
 # Lint policy lives here rather than in the flags CI happens to pass, so a local
 # `cargo clippy` enables exactly the set CI enables and both member crates — and
