@@ -55,11 +55,24 @@ pub enum Error {
         #[source]
         source: toml::de::Error,
     },
-    /// A key backend failure with no typed cause to keep: malformed key
-    /// material, or an external KMS whose errors do not cross the crate
-    /// boundary. File I/O and parse failures use the `KeyFile*` variants.
+    /// A key backend failure with no typed cause to keep: key material that is
+    /// the wrong length, a lookup that timed out, a backend misconfiguration.
+    /// File I/O and parse failures use the `KeyFile*` variants; a failure that
+    /// *does* carry a cause uses [`Error::KeyBackend`].
     #[error("key source: {0}")]
     KeySource(String),
+    /// A key backend failure that carries its cause: a Vault/OpenBao client
+    /// error, or a decode failure on stored key material. The cause is boxed
+    /// rather than typed so this crate keeps no dependency on any one backend
+    /// (`vaultrs` lives in the proxy), and it is a `#[source]` so
+    /// `std::error::Error::source()` reaches the original — an operator can
+    /// tell a 403 from a connection refused from a missing KV path (ERR-9).
+    #[error("key source: {context}")]
+    KeyBackend {
+        context: String,
+        #[source]
+        source: Box<dyn std::error::Error + Send + Sync + 'static>,
+    },
     /// The OS entropy source refused to produce key material (SEC-10). Rare —
     /// a seccomp filter that blocks `getrandom`, or a sandbox with no
     /// `/dev/urandom` — but the alternative to reporting it is `OsRng`'s own
