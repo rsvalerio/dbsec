@@ -3,11 +3,11 @@ id: TASK-0058
 title: >-
   CONTRIBUTING.md is still the unfilled forge template ({{REPO}} placeholders,
   empty sections)
-status: To Do
+status: Done
 assignee:
   - TASK-0068
 created_date: '2026-08-12 10:40'
-updated_date: '2026-08-12 18:42'
+updated_date: '2026-08-12 19:10'
 labels:
   - code-review-rust
   - docs
@@ -34,7 +34,13 @@ Note the interaction with the new drift check: `CONTRIBUTING.md` is listed in `.
 
 ## Acceptance Criteria
 <!-- AC:BEGIN -->
-- [ ] #1 CONTRIBUTING.md names dbsec instead of {{REPO}} and the template's copy-me comment is gone
-- [ ] #2 Development setup and Project layout are filled in for this repo (toolchain, make targets, crates/core vs crates/proxy)
-- [ ] #3 scripts/forge-sync-check.sh still passes, either via a recorded waiver or by narrowing what the manifest checks for this file
+- [x] #1 CONTRIBUTING.md names dbsec instead of {{REPO}} and the template's copy-me comment is gone
+- [x] #2 Development setup and Project layout are filled in for this repo (toolchain, make targets, crates/core vs crates/proxy)
+- [x] #3 scripts/forge-sync-check.sh still passes, either via a recorded waiver or by narrowing what the manifest checks for this file
 <!-- AC:END -->
+
+## Implementation Notes
+
+<!-- SECTION:NOTES:BEGIN -->
+Filled in CONTRIBUTING.md for dbsec (title, development setup with make check / make e2e / forge-sync, project layout table for crates/core vs crates/proxy). Kept CONTRIBUTING.md in .forge-sync/manifest rather than dropping it: the divergence is recorded as .forge-sync/waivers/CONTRIBUTING.md.patch, so a forge-side edit to the shared sections still fails the check, and the manifest now documents that choice and its cost (re-record the waiver when this copy is edited). scripts/forge-sync-check.sh passes.
+<!-- SECTION:NOTES:END -->
