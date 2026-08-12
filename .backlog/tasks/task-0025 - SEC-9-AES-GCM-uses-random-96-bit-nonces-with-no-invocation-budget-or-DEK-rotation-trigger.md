@@ -3,11 +3,11 @@ id: TASK-0025
 title: >-
   SEC-9: AES-GCM uses random 96-bit nonces with no invocation budget or DEK
   rotation trigger
-status: To Do
+status: Done
 assignee:
   - TASK-0054
 created_date: '2026-08-11 19:23'
-updated_date: '2026-08-11 22:42'
+updated_date: '2026-08-12 11:01'
 labels:
   - code-review-rust
   - security
@@ -48,8 +48,28 @@ Whichever is chosen, the limit and the reasoning belong in a comment at the encr
 
 ## Acceptance Criteria
 <!-- AC:BEGIN -->
-- [ ] #1 A documented nonce-safety strategy is in place: either a per-DEK invocation budget that retires the key before the random-nonce limit, a counter-based nonce, or a nonce-misuse-resistant AEAD
-- [ ] #2 The chosen limit and its basis (NIST SP 800-38D or equivalent) are recorded in a comment at the encrypt path and in plans/PLAN.md
-- [ ] #3 If a budget is used, exhausting it produces a clear error or an automatic key roll rather than continuing to encrypt
-- [ ] #4 A test covers the behaviour at the budget boundary
+- [x] #1 A documented nonce-safety strategy is in place: either a per-DEK invocation budget that retires the key before the random-nonce limit, a counter-based nonce, or a nonce-misuse-resistant AEAD
+- [x] #2 The chosen limit and its basis (NIST SP 800-38D or equivalent) are recorded in a comment at the encrypt path and in plans/PLAN.md
+- [x] #3 If a budget is used, exhausting it produces a clear error or an automatic key roll rather than continuing to encrypt
+- [x] #4 A test covers the behaviour at the budget boundary
 <!-- AC:END -->
+
+## Implementation Notes
+
+<!-- SECTION:NOTES:BEGIN -->
+Per-DEK invocation budget, enforced on the write path.
+
+- `envelope::MAX_ENCRYPTIONS_PER_KEY = 2^32` with the SP 800-38D §8.3 reasoning
+  at the constant and at `Cipher::encrypt`; also recorded in plans/PLAN.md
+  caveats.
+- `envelope::Cipher` owns one AES-GCM key schedule plus an atomic invocation
+  counter; `envelope::Ciphers` is the per-process cache the write path goes
+  through, so all encrypted columns share one budget for the active DEK (a
+  per-column counter would let N columns spend N x the limit).
+- On exhaustion `Ciphers::seal` asks the key source for a fresh DEK and rolls to
+  it (Vault mints one per start); if the source offers the same key id it fails
+  closed with `Error::KeyExhausted` instead of reusing a spent key.
+- Boundary tests: `invocation_budget_is_spent_exactly_once_per_encryption`,
+  `spent_budget_rolls_to_a_fresh_dek`,
+  `spent_budget_fails_closed_when_the_key_source_cannot_roll`.
+<!-- SECTION:NOTES:END -->

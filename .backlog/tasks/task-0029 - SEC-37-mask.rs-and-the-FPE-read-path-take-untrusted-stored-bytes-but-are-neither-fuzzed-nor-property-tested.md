@@ -3,11 +3,11 @@ id: TASK-0029
 title: >-
   SEC-37: mask.rs and the FPE read path take untrusted stored bytes but are
   neither fuzzed nor property-tested
-status: To Do
+status: Done
 assignee:
   - TASK-0054
 created_date: '2026-08-11 19:24'
-updated_date: '2026-08-11 22:42'
+updated_date: '2026-08-12 11:02'
 labels:
   - code-review-rust
   - security
@@ -40,8 +40,31 @@ The existing targets are a good template — extending them is mostly mechanical
 
 ## Acceptance Criteria
 <!-- AC:BEGIN -->
-- [ ] #1 A fuzz target exercises MaskSpec::apply, FpeTransform::open and EncryptTransform::open on arbitrary bytes under a fixed test key
-- [ ] #2 props.rs gains a property test asserting the masking invariant, not only absence of panic: masked positions never equal the input, and char-length is preserved for UTF-8 input
-- [ ] #3 props.rs gains a never-panics property for the transform open path on arbitrary stored bytes
-- [ ] #4 The new fuzz targets are wired into whatever CI or Makefile target runs the existing ones
+- [x] #1 A fuzz target exercises MaskSpec::apply, FpeTransform::open and EncryptTransform::open on arbitrary bytes under a fixed test key
+- [x] #2 props.rs gains a property test asserting the masking invariant, not only absence of panic: masked positions never equal the input, and char-length is preserved for UTF-8 input
+- [x] #3 props.rs gains a never-panics property for the transform open path on arbitrary stored bytes
+- [x] #4 The new fuzz targets are wired into whatever CI or Makefile target runs the existing ones
 <!-- AC:END -->
+
+## Implementation Notes
+
+<!-- SECTION:NOTES:BEGIN -->
+- New `fuzz/fuzz_targets/transform.rs` under a fixed test key: drives
+  `MaskSpec::apply`, `EncryptTransform::open` (searchable and not),
+  `FpeTransform::open` and `TokenTransform::open` over arbitrary stored bytes,
+  with the first two bytes steering the mask spec. Asserts the masking
+  invariant, that no `EncryptTransform::open` ever returns a value the fuzzer's
+  bytes could not have authenticated, and that FPE is shape-preserving.
+- Wired into `fuzz/Cargo.toml` and the `fuzz` Makefile target next to the
+  existing `pgwire`/`envelope` targets, and noted in plans/PLAN.md milestone 10.
+- props.rs gains `mask_hides_every_unkept_character` (masked positions come back
+  as the mask character and never as the input; char length preserved),
+  `mask_covers_every_byte_of_non_utf8_values`,
+  `transform_open_never_panics_on_arbitrary_stored_bytes` (all four transforms
+  plus mask) and `stored_values_survive_a_searchable_config_change`.
+
+Note: `cargo-fuzz` and a nightly toolchain are not installed in this
+environment, so the new target was type-checked (`cargo check --manifest-path
+fuzz/Cargo.toml`) rather than smoke-run; the same invariants run on every
+`cargo test` through the proptest equivalents above.
+<!-- SECTION:NOTES:END -->

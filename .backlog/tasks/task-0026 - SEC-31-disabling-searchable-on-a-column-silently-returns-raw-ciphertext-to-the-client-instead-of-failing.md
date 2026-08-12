@@ -3,11 +3,11 @@ id: TASK-0026
 title: >-
   SEC-31: disabling searchable on a column silently returns raw ciphertext to
   the client instead of failing
-status: To Do
+status: Done
 assignee:
   - TASK-0054
 created_date: '2026-08-11 19:23'
-updated_date: '2026-08-11 22:42'
+updated_date: '2026-08-12 11:01'
 labels:
   - code-review-rust
   - security
@@ -46,7 +46,27 @@ The distinguishing information exists — `split` already told us the value carr
 
 ## Acceptance Criteria
 <!-- AC:BEGIN -->
-- [ ] #1 A value stored with a blind-index prefix is read correctly (or rejected with a specific error) when index_key is None, rather than passed through as raw bytes
-- [ ] #2 A unit test seals with a searchable EncryptTransform and opens with a non-searchable one, asserting the chosen behaviour
-- [ ] #3 The passthrough contract on FieldTransform::open documents that it means pre-migration plaintext only, not an unrecognised stored form
+- [x] #1 A value stored with a blind-index prefix is read correctly (or rejected with a specific error) when index_key is None, rather than passed through as raw bytes
+- [x] #2 A unit test seals with a searchable EncryptTransform and opens with a non-searchable one, asserting the chosen behaviour
+- [x] #3 The passthrough contract on FieldTransform::open documents that it means pre-migration plaintext only, not an unrecognised stored form
 <!-- AC:END -->
+
+## Implementation Notes
+
+<!-- SECTION:NOTES:BEGIN -->
+`EncryptTransform::open` now branches on the shape of the stored bytes, not on
+the current `searchable` setting: a blind-index prefix is stripped and the
+envelope behind it decrypted whether or not `index_key` is set, so disabling
+`searchable` stays a reversible edit. `Ok(None)` is reached only when the value
+carries neither stored form (pre-migration plaintext); an index-prefixed value
+whose key is unknown now fails closed through the read path instead of being
+relayed as raw bytes.
+
+The passthrough contract on `FieldTransform::open` documents that `Ok(None)`
+means pre-migration plaintext only and must never stand in for an unrecognised
+stored form.
+
+Tests: `transform::tests::disabling_searchable_still_opens_index_prefixed_rows`
+(both directions) and the property
+`stored_values_survive_a_searchable_config_change` in crates/core/tests/props.rs.
+<!-- SECTION:NOTES:END -->

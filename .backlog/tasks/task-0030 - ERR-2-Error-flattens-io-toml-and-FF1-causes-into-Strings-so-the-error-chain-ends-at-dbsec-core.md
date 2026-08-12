@@ -3,11 +3,11 @@ id: TASK-0030
 title: >-
   ERR-2: Error flattens io, toml and FF1 causes into Strings, so the error chain
   ends at dbsec-core
-status: To Do
+status: Done
 assignee:
   - TASK-0054
 created_date: '2026-08-11 19:25'
-updated_date: '2026-08-11 22:42'
+updated_date: '2026-08-12 11:02'
 labels:
   - code-review-rust
   - errors
@@ -49,8 +49,32 @@ The fix is structural rather than cosmetic: split into variants that keep their 
 
 ## Acceptance Criteria
 <!-- AC:BEGIN -->
-- [ ] #1 Error::KeySource is replaced by variants that retain the underlying io::Error and toml::de::Error via #[source], with the path as a typed field
-- [ ] #2 Error::Fpe retains the FF1 error as a source rather than a formatted String
-- [ ] #3 source() returns the underlying cause for every error originating from a fallible dependency call
-- [ ] #4 Error is marked #[non_exhaustive], or a comment records why it is not
+- [x] #1 Error::KeySource is replaced by variants that retain the underlying io::Error and toml::de::Error via #[source], with the path as a typed field
+- [x] #2 Error::Fpe retains the FF1 error as a source rather than a formatted String
+- [x] #3 source() returns the underlying cause for every error originating from a fallible dependency call
+- [x] #4 Error is marked #[non_exhaustive], or a comment records why it is not
 <!-- AC:END -->
+
+## Implementation Notes
+
+<!-- SECTION:NOTES:BEGIN -->
+`Error` is now `#[non_exhaustive]` and the file key source's failures keep their
+causes:
+
+- `KeyFileRead { path, #[source] io::Error }`, `KeyFileWrite { path, #[source]
+  io::Error }` and `KeyFileParse { path, #[source] toml::de::Error }` replace the
+  formatted strings in `FileKeySource::load`/`generate`, so "missing" /
+  "unreadable" / "malformed" are matchable and the toml span survives.
+- `Error::Fpe` carries `fpe::ff1::NumeralStringError` as a `#[from]` source. The
+  old `Error::Fpe("invalid FF1 key")` construction is gone: `FF1::new` only
+  rejects a radix outside 2..=2^16 and 10 is a constant, so that path is an
+  internal invariant (`expect`) rather than an error.
+- Tests `missing_keyfile_keeps_the_io_error_as_a_cause` and
+  `malformed_keyfile_keeps_the_toml_error_as_a_cause` assert `source()` chains.
+
+`Error::KeySource(String)` is deliberately retained, with a doc comment saying
+so: it now covers only backends with no typed cause to keep (malformed key
+material in the keyfile, and the Vault/OpenBao source in crates/proxy). Filing
+that remaining flattening as its own finding — it lives outside this wave's file
+scope and needs a cross-crate decision.
+<!-- SECTION:NOTES:END -->

@@ -1,11 +1,11 @@
 ---
 id: TASK-0031
 title: 'ERR-2: envelope::encrypt reports an encryption failure as Error::Decrypt'
-status: To Do
+status: Done
 assignee:
   - TASK-0054
 created_date: '2026-08-11 19:25'
-updated_date: '2026-08-11 22:42'
+updated_date: '2026-08-12 11:02'
 labels:
   - code-review-rust
   - errors
@@ -37,6 +37,21 @@ Two options, either acceptable: add a distinct `Error::Encrypt` variant, or — 
 
 ## Acceptance Criteria
 <!-- AC:BEGIN -->
-- [ ] #1 The encrypt path no longer returns Error::Decrypt; it either has its own variant or documents the invariant that makes the branch unreachable
-- [ ] #2 The reasoning about the GCM plaintext length limit versus MAX_MESSAGE_LEN is recorded at the callsite
+- [x] #1 The encrypt path no longer returns Error::Decrypt; it either has its own variant or documents the invariant that makes the branch unreachable
+- [x] #2 The reasoning about the GCM plaintext length limit versus MAX_MESSAGE_LEN is recorded at the callsite
 <!-- AC:END -->
+
+## Implementation Notes
+
+<!-- SECTION:NOTES:BEGIN -->
+The encrypt path now maps its AEAD failure to a new `Error::Encrypt` variant
+instead of `Error::Decrypt`. A distinct variant was chosen over `.expect()`
+because the plaintext arrives from a client: a panic on a reachable-looking
+write path would be a DoS if the invariant were ever wrong, while an error keeps
+the fail-closed posture.
+
+The reasoning is recorded at the callsite in `Cipher::encrypt`: AES-GCM
+encryption fails only past the ~64 GiB plaintext limit, which
+`pgwire::MAX_MESSAGE_LEN` (1 GiB) already precludes, so the branch is a violated
+internal invariant rather than a wrong key or tampering.
+<!-- SECTION:NOTES:END -->
