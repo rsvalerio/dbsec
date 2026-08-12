@@ -81,6 +81,16 @@ impl Cipher {
         if self.used.fetch_add(1, Ordering::Relaxed) >= self.budget {
             return Err(Error::KeyExhausted(hex::encode(key_id)));
         }
+        // The one deliberate exception to "cryptographic randomness comes from
+        // the OS entropy source" (SEC-10), which `keys::FileKeySource` and the
+        // proxy's Vault key source both follow. A GCM nonce is not key
+        // material: it is public, it is stored in the clear in the header
+        // above, and what it needs is unpredictability and non-repetition, not
+        // long-term secrecy. `ThreadRng` gives that — ChaCha12 seeded from the
+        // OS and periodically reseeded from it — and it is drawn once per
+        // protected value on the data path, where `OsRng`'s `getrandom`
+        // syscall would cost several times the AES work it accompanies.
+        // Repetition is bounded separately, by MAX_ENCRYPTIONS_PER_KEY.
         let mut nonce = [0u8; NONCE_LEN];
         rand::thread_rng().fill_bytes(&mut nonce);
 
