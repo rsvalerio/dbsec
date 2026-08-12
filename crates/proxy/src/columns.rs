@@ -4,6 +4,7 @@
 
 use std::sync::Arc;
 
+use dbsec_core::envelope::Ciphers;
 use dbsec_core::keys::KeySource;
 use dbsec_core::mask::MaskSpec;
 use dbsec_core::transform::{EncryptTransform, FieldTransform, FpeTransform, TokenTransform};
@@ -35,6 +36,11 @@ impl ProtectedColumn {
 /// token HMAC) are named `schema.table.column` — the keyfile's `[index_keys]`
 /// table (or the KMS) must carry that name.
 pub fn build(config: &Config, keys: &Arc<dyn KeySource>) -> Vec<ProtectedColumn> {
+    // One DEK cipher cache for the whole process: every encrypted column shares
+    // the active key's schedule and, more importantly, its single AES-GCM
+    // invocation budget (a per-column budget would let N columns spend N times
+    // the random-nonce limit).
+    let ciphers = Arc::new(Ciphers::new(keys.clone()));
     config
         .columns
         .iter()
@@ -46,7 +52,7 @@ pub fn build(config: &Config, keys: &Arc<dyn KeySource>) -> Vec<ProtectedColumn>
             {
                 TransformKind::Encrypt => {
                     let index_key = column.searchable.then(|| key_name.clone());
-                    (Some(Arc::new(EncryptTransform::new(keys.clone(), index_key))), true)
+                    (Some(Arc::new(EncryptTransform::new(ciphers.clone(), index_key))), true)
                 }
                 TransformKind::Fpe => (
                     Some(Arc::new(FpeTransform::new(keys.clone(), key_name, column.detokenize))),

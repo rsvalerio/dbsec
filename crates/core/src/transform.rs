@@ -3,12 +3,13 @@
 //! decorator inside `EncryptTransform` (searchable columns), masking arrives
 //! later as a read-path decorator.
 
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use aes::Aes256;
 use fpe::ff1::{FlexibleNumeralString, FF1};
 
-use crate::keys::KeySource;
+use crate::envelope::Ciphers;
+use crate::keys::{Key, KeySource};
 use crate::{blind_index, envelope, Error};
 
 /// How a transform's stored form travels on the PostgreSQL wire.
@@ -25,9 +26,15 @@ pub trait FieldTransform: Send + Sync {
     /// Transforms a plaintext value into its stored form (write path).
     fn seal(&self, plaintext: &[u8]) -> Result<Vec<u8>, Error>;
 
-    /// Reverses `seal` (read path). `Ok(None)` means the value is not in this
-    /// transform's stored form (or the transform is irreversible) — the value
-    /// passes through untouched.
+    /// Reverses `seal` (read path). `Ok(None)` is the passthrough contract: the
+    /// value carries none of this transform's stored forms, so it is
+    /// pre-migration plaintext (or the transform is irreversible) and travels
+    /// to the client untouched.
+    ///
+    /// It must never stand in for "this looks like one of my stored forms but I
+    /// cannot read it under the current config" — handing those bytes to the
+    /// client would leak a stored form as if it were a value. Such a case is an
+    /// error, or is opened anyway (see `EncryptTransform::open`).
     fn open(&self, stored: &[u8]) -> Result<Option<Vec<u8>>, Error>;
 
     fn wire(&self) -> WireForm {
@@ -51,38 +58,48 @@ pub trait FieldTransform: Send + Sync {
 
 /// AES-256-GCM envelope encryption under the key source's active DEK, with an
 /// optional blind index prepended for searchable columns.
+///
+/// The DEK ciphers come from a shared [`Ciphers`] cache, so every column
+/// encrypting under the active key shares one key schedule and one invocation
+/// budget for it.
 pub struct EncryptTransform {
-    keys: Arc<dyn KeySource>,
+    ciphers: Arc<Ciphers>,
     /// Name of the deterministic index key; `Some` makes the column searchable.
-    index_key: Option<String>,
+    index_key_name: Option<String>,
+    /// The index key itself, resolved on first use and reused per value.
+    index_key: OnceLock<Key>,
 }
 
 impl EncryptTransform {
-    pub fn new(keys: Arc<dyn KeySource>, index_key: Option<String>) -> Self {
-        Self { keys, index_key }
+    pub fn new(ciphers: Arc<Ciphers>, index_key: Option<String>) -> Self {
+        Self { ciphers, index_key_name: index_key, index_key: OnceLock::new() }
     }
 
     pub fn searchable(&self) -> bool {
-        self.index_key.is_some()
+        self.index_key_name.is_some()
+    }
+
+    /// The deterministic index key, fetched from the key source once. Failures
+    /// are not cached — only a successful lookup fills the cell.
+    fn index_key(&self) -> Result<Option<&Key>, Error> {
+        let Some(name) = &self.index_key_name else { return Ok(None) };
+        if let Some(key) = self.index_key.get() {
+            return Ok(Some(key));
+        }
+        let key = self.ciphers.keys().index_key(name)?;
+        Ok(Some(self.index_key.get_or_init(|| key)))
     }
 
     /// The blind index a plaintext would be stored under; the equality WHERE
     /// rewrite (searchable milestone) matches against this.
     pub fn blind_index(&self, plaintext: &[u8]) -> Result<Option<[u8; 32]>, Error> {
-        match &self.index_key {
-            Some(name) => {
-                let index_key = self.keys.index_key(name)?;
-                Ok(Some(blind_index::compute(&index_key, plaintext)))
-            }
-            None => Ok(None),
-        }
+        Ok(self.index_key()?.map(|key| blind_index::compute(key, plaintext)))
     }
 }
 
 impl FieldTransform for EncryptTransform {
     fn seal(&self, plaintext: &[u8]) -> Result<Vec<u8>, Error> {
-        let (key_id, key) = self.keys.active_key()?;
-        let sealed = envelope::encrypt(&key, &key_id, plaintext)?;
+        let sealed = self.ciphers.seal(plaintext)?;
         match self.blind_index(plaintext)? {
             Some(index) => Ok(blind_index::prepend(&index, &sealed)),
             None => Ok(sealed),
@@ -91,13 +108,17 @@ impl FieldTransform for EncryptTransform {
 
     fn open(&self, stored: &[u8]) -> Result<Option<Vec<u8>>, Error> {
         let enveloped = match blind_index::split(stored) {
-            Some((_index, enveloped)) if self.index_key.is_some() => enveloped,
-            _ if envelope::is_enveloped(stored) => stored,
-            _ => return Ok(None),
+            // An index prefix means the value was written while the column was
+            // searchable. Open it whether or not the column is searchable now:
+            // the index is only a search token and the envelope behind it is
+            // self-describing, so turning `searchable` off stays reversible
+            // instead of returning index-prefixed ciphertext to the client.
+            Some((_index, enveloped)) => enveloped,
+            None if envelope::is_enveloped(stored) => stored,
+            // Neither stored form: pre-migration plaintext, passed through.
+            None => return Ok(None),
         };
-        let id = envelope::key_id(enveloped)?;
-        let key = self.keys.key(&id)?;
-        envelope::decrypt(&key, enveloped).map(Some)
+        self.ciphers.open(enveloped).map(Some)
     }
 
     fn search_index(&self, plaintext: &[u8]) -> Result<Option<Vec<u8>>, Error> {
@@ -105,7 +126,7 @@ impl FieldTransform for EncryptTransform {
     }
 
     fn supports_search(&self) -> bool {
-        self.index_key.is_some()
+        self.index_key_name.is_some()
     }
 }
 
@@ -125,11 +146,27 @@ pub struct FpeTransform {
     keys: Arc<dyn KeySource>,
     key_name: String,
     detokenize: bool,
+    /// FF1 under `key_name`: one AES-256 key schedule for the life of the
+    /// transform rather than one per value.
+    ff1: OnceLock<FF1<Aes256>>,
 }
 
 impl FpeTransform {
     pub fn new(keys: Arc<dyn KeySource>, key_name: String, detokenize: bool) -> Self {
-        Self { keys, key_name, detokenize }
+        Self { keys, key_name, detokenize, ff1: OnceLock::new() }
+    }
+
+    /// The FF1 instance for this column's key, built on first use. Failures are
+    /// not cached — only a successful lookup fills the cell.
+    fn ff1(&self) -> Result<&FF1<Aes256>, Error> {
+        if let Some(ff1) = self.ff1.get() {
+            return Ok(ff1);
+        }
+        let key = self.keys.index_key(&self.key_name)?;
+        // FF1::new rejects only a radix outside 2..=2^16, and 10 is a constant
+        // here; the key is a fixed 32 bytes. Construction cannot fail.
+        let ff1 = FF1::<Aes256>::new(key.as_ref(), 10).expect("radix 10 is a valid FF1 radix");
+        Ok(self.ff1.get_or_init(|| ff1))
     }
 
     /// Runs FF1 over the digit positions of `data`, leaving other bytes in
@@ -142,12 +179,10 @@ impl FpeTransform {
         }
         let digits: Vec<u16> = positions.iter().map(|&i| u16::from(data[i] - b'0')).collect();
 
-        let key = self.keys.index_key(&self.key_name)?;
-        let ff1 = FF1::<Aes256>::new(key.as_ref(), 10)
-            .map_err(|_| Error::Fpe("invalid FF1 key".into()))?;
+        let ff1 = self.ff1()?;
         let numeral = FlexibleNumeralString::from(digits);
         let out = if decrypt { ff1.decrypt(&[], &numeral) } else { ff1.encrypt(&[], &numeral) }
-            .map_err(|e| Error::Fpe(e.to_string()))?;
+            .map_err(Error::Fpe)?;
 
         let mut result = data.to_vec();
         for (&position, digit) in positions.iter().zip(Vec::<u16>::from(out)) {
@@ -182,18 +217,28 @@ impl FieldTransform for FpeTransform {
 pub struct TokenTransform {
     keys: Arc<dyn KeySource>,
     key_name: String,
+    /// The HMAC key, resolved on first use and reused per value.
+    key: OnceLock<Key>,
 }
 
 impl TokenTransform {
     pub fn new(keys: Arc<dyn KeySource>, key_name: String) -> Self {
-        Self { keys, key_name }
+        Self { keys, key_name, key: OnceLock::new() }
+    }
+
+    /// Failures are not cached — only a successful lookup fills the cell.
+    fn key(&self) -> Result<&Key, Error> {
+        if let Some(key) = self.key.get() {
+            return Ok(key);
+        }
+        let key = self.keys.index_key(&self.key_name)?;
+        Ok(self.key.get_or_init(|| key))
     }
 }
 
 impl FieldTransform for TokenTransform {
     fn seal(&self, plaintext: &[u8]) -> Result<Vec<u8>, Error> {
-        let key = self.keys.index_key(&self.key_name)?;
-        Ok(hex::encode(blind_index::compute(&key, plaintext)).into_bytes())
+        Ok(hex::encode(blind_index::compute(self.key()?, plaintext)).into_bytes())
     }
 
     fn open(&self, _stored: &[u8]) -> Result<Option<Vec<u8>>, Error> {
@@ -234,9 +279,13 @@ mod tests {
         }
     }
 
+    fn ciphers() -> Arc<Ciphers> {
+        Arc::new(Ciphers::new(Arc::new(TestKeys)))
+    }
+
     #[test]
     fn seal_open_roundtrip() {
-        let t = EncryptTransform::new(Arc::new(TestKeys), None);
+        let t = EncryptTransform::new(ciphers(), None);
         let stored = t.seal(b"alice@example.com").unwrap();
         assert!(envelope::is_enveloped(&stored));
         assert_eq!(t.open(&stored).unwrap().unwrap(), b"alice@example.com");
@@ -245,11 +294,26 @@ mod tests {
 
     #[test]
     fn searchable_seal_carries_blind_index() {
-        let t = EncryptTransform::new(Arc::new(TestKeys), Some("users.email".into()));
+        let t = EncryptTransform::new(ciphers(), Some("users.email".into()));
         let stored = t.seal(b"alice").unwrap();
         let (index, _) = blind_index::split(&stored).unwrap();
         assert_eq!(index, blind_index::compute(&INDEX_KEY, b"alice"));
         assert_eq!(t.open(&stored).unwrap().unwrap(), b"alice");
+    }
+
+    #[test]
+    fn disabling_searchable_still_opens_index_prefixed_rows() {
+        let shared = ciphers();
+        let searchable = EncryptTransform::new(shared.clone(), Some("users.email".into()));
+        let stored = searchable.seal(b"alice@example.com").unwrap();
+
+        // The same column after `searchable = false`: rows written under the
+        // old config must still decrypt, never pass through as raw bytes.
+        let plain = EncryptTransform::new(shared, None);
+        assert_eq!(plain.open(&stored).unwrap().unwrap(), b"alice@example.com");
+        // The reverse direction (searchable turned on) keeps working too.
+        let bare = searchable.open(&plain.seal(b"bob@example.com").unwrap()).unwrap();
+        assert_eq!(bare.unwrap(), b"bob@example.com");
     }
 
     #[test]

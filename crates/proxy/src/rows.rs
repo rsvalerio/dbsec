@@ -154,7 +154,8 @@ pub mod tests {
 
     pub fn transform(searchable: bool) -> Arc<dyn FieldTransform> {
         let index_key = searchable.then(|| "public.users.email".to_owned());
-        Arc::new(dbsec_core::transform::EncryptTransform::new(Arc::new(OneKey), index_key))
+        let ciphers = Arc::new(dbsec_core::envelope::Ciphers::new(Arc::new(OneKey)));
+        Arc::new(dbsec_core::transform::EncryptTransform::new(ciphers, index_key))
     }
 
     fn context_with(column: ReadColumn) -> Arc<RowContext> {
