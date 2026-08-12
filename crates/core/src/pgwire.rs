@@ -68,8 +68,12 @@ pub fn frame_body_len(header: &[u8; FRAME_HEADER_LEN]) -> Result<(u8, usize), Er
 
 /// One field of a RowDescription ('T') message; only what the decrypt path
 /// needs to match configured columns.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct RowField {
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RowField<'a> {
+    /// The field's label — the output column name, which for a plain column
+    /// reference is the column's own name. It is the only name a
+    /// RowDescription carries: the table appears as an OID, never as a name.
+    pub name: &'a [u8],
     /// OID of the table the column comes from; 0 for computed columns.
     pub table_oid: u32,
     /// Attribute number within the table; 0 for computed columns.
@@ -77,16 +81,17 @@ pub struct RowField {
 }
 
 /// Parses a RowDescription ('T') body.
-pub fn parse_row_description(mut body: &[u8]) -> Result<Vec<RowField>, Error> {
+pub fn parse_row_description(body: &[u8]) -> Result<Vec<RowField<'_>>, Error> {
+    let mut body = body;
     let count = take_i16(&mut body)?;
     let mut fields = Vec::with_capacity(count.max(0) as usize);
     for _ in 0..count {
-        skip_cstr(&mut body)?;
+        let name = take_cstr(&mut body)?;
         let table_oid = u32::from_be_bytes(take(&mut body, 4)?.try_into().expect("4 bytes"));
         let attnum = take_i16(&mut body)?;
         // Type OID (4), type length (2), type modifier (4), format code (2).
         take(&mut body, 12)?;
-        fields.push(RowField { table_oid, attnum });
+        fields.push(RowField { name, table_oid, attnum });
     }
     if !body.is_empty() {
         return Err(Error::MalformedBackend);
@@ -280,10 +285,6 @@ fn take_i16(buf: &mut &[u8]) -> Result<i16, Error> {
     Ok(i16::from_be_bytes(take(buf, 2)?.try_into().expect("2 bytes")))
 }
 
-fn skip_cstr(buf: &mut &[u8]) -> Result<(), Error> {
-    take_cstr(buf).map(|_| ())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -325,7 +326,10 @@ mod tests {
         body.extend_from_slice(&row_field(b"email", 1234, 2));
         assert_eq!(
             parse_row_description(&body).unwrap(),
-            vec![RowField { table_oid: 1234, attnum: 1 }, RowField { table_oid: 1234, attnum: 2 }]
+            vec![
+                RowField { name: b"id", table_oid: 1234, attnum: 1 },
+                RowField { name: b"email", table_oid: 1234, attnum: 2 }
+            ]
         );
 
         assert!(parse_row_description(&body[..body.len() - 1]).is_err());
