@@ -63,6 +63,18 @@ pub fn port_copy() -> u16 {
     port_at(4)
 }
 
+/// The prepared-statement-cache case, which needs a table nothing else is
+/// dropping under it.
+pub fn port_prepared() -> u16 {
+    port_at(5)
+}
+
+/// The schema-drift case: it recreates its table mid-test, so it cannot share
+/// one with any other suite.
+pub fn port_recreate() -> u16 {
+    port_at(6)
+}
+
 pub fn dsn() -> String {
     std::env::var("DBSEC_E2E_DSN").unwrap_or_else(|_| DEFAULT_DSN.to_owned())
 }

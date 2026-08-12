@@ -16,6 +16,11 @@ const TABLE: &str = "users";
 /// first, and the two tests in this binary run concurrently.
 const COPY_TABLE: &str = "users_copy";
 
+/// The prepared-statement-cache case and the schema-drift case each recreate
+/// their own table, so neither can share one with another test in this binary.
+const PREPARED_TABLE: &str = "users_prepared";
+const RECREATE_TABLE: &str = "users_recreate";
+
 #[tokio::test]
 #[ignore = "needs the Postgres from `make e2e`"]
 async fn transparent_encryption_end_to_end() {
@@ -201,4 +206,143 @@ async fn copy_bypasses_the_rewrite_and_is_refused_in_strict_mode() {
     // The refusal is statement-level: the session is still usable.
     let rows = client.query("SELECT id FROM users_copy ORDER BY id", &[]).await.unwrap();
     assert_eq!(rows.len(), 2);
+}
+
+/// The steady state of every driver with a prepared-statement cache, against
+/// the real binary: two statements are prepared once and then re-executed with
+/// Bind/Execute only. The server sends RowDescription in reply to *Describe*,
+/// so those later executions carry no `'T'` frame — and a proxy that keyed
+/// protected positions to "the last RowDescription on the connection" decrypted
+/// one statement's rows with the other's positions, or relayed a protected
+/// column as raw ciphertext with no error at all (CL-3, [[task-0044]]).
+///
+/// The interleaving is the point: `by_id` selects a protected column, `ids`
+/// selects none, and they are executed alternately over one connection.
+#[tokio::test]
+#[ignore = "needs the Postgres from `make e2e`"]
+async fn a_cached_prepared_statement_decrypts_with_its_own_columns() {
+    let direct = common::connect_direct().await;
+    common::create_table(&direct, PREPARED_TABLE).await;
+
+    let dir = tempfile::tempdir().unwrap();
+    let opts = common::ProxyOpts::file_keys(common::port_prepared(), PREPARED_TABLE);
+    let _proxy = common::spawn_proxy(dir.path(), &opts).await;
+    let client = common::connect_via_proxy(dir.path(), common::port_prepared()).await;
+
+    for (email, note) in [(&b"alice@example.com"[..], "topsecret"), (&b"bob@example.com"[..], "s2")]
+    {
+        client
+            .execute(
+                &format!("INSERT INTO {PREPARED_TABLE} (email, note) VALUES ($1, $2)"),
+                &[&email, &note],
+            )
+            .await
+            .unwrap();
+    }
+
+    // Prepared once each; every `query` below reuses them, so the proxy sees
+    // Bind/Execute with no Describe in front of it.
+    let with_protected = client
+        .prepare(&format!("SELECT id, email FROM {PREPARED_TABLE} WHERE id = $1"))
+        .await
+        .unwrap();
+    let without_protected = client
+        .prepare(&format!("SELECT id, note FROM {PREPARED_TABLE} ORDER BY id"))
+        .await
+        .unwrap();
+
+    // Alternate them. Before the fix, the second round of `with_protected`
+    // used `without_protected`'s positions, where nothing is protected.
+    for _ in 0..3 {
+        let rows = client.query(&with_protected, &[&1i32]).await.unwrap();
+        assert_eq!(
+            rows[0].get::<_, Vec<u8>>(1),
+            b"alice@example.com",
+            "a cached statement must decrypt with its own column positions"
+        );
+
+        let rows = client.query(&without_protected, &[]).await.unwrap();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(
+            rows[0].get::<_, &str>(1),
+            "to*******",
+            "the other statement's own positions still apply"
+        );
+    }
+
+    // The two statements interleaved inside one pipeline batch, which is where
+    // "the last 'T' frame wins" is least defensible.
+    let (a, b) = tokio::join!(
+        client.query(&with_protected, &[&2i32]),
+        client.query(&without_protected, &[])
+    );
+    assert_eq!(a.unwrap()[0].get::<_, Vec<u8>>(1), b"bob@example.com");
+    assert_eq!(b.unwrap().len(), 2);
+}
+
+/// A migration that recreates a protected table under a running proxy. The
+/// write path matches columns by name and keeps encrypting; the read path
+/// matches by `(table oid, attnum)`, which the new table invalidates. Without
+/// re-resolution the proxy hands the client `blind_index || envelope` bytes
+/// forever, with no error (CL-3, [[task-0039]]).
+///
+/// Both halves of the chosen behaviour are pinned here: the session that first
+/// sees the moved column triggers a re-resolution and the proxy heals itself
+/// well inside the (300 s) refresh interval, and under `on_unprotected =
+/// "reject"` that same session fails instead of relaying the stored form.
+#[tokio::test]
+#[ignore = "needs the Postgres from `make e2e`"]
+async fn a_recreated_table_is_re_resolved_and_refused_in_strict_mode() {
+    let direct = common::connect_direct().await;
+    common::create_table(&direct, RECREATE_TABLE).await;
+
+    let dir = tempfile::tempdir().unwrap();
+    let opts = common::ProxyOpts::file_keys(common::port_recreate(), RECREATE_TABLE);
+    let proxy = common::spawn_proxy(dir.path(), &opts).await;
+    let client = common::connect_via_proxy(dir.path(), common::port_recreate()).await;
+
+    let insert = format!("INSERT INTO {RECREATE_TABLE} (email) VALUES ($1)");
+    let select = format!("SELECT email FROM {RECREATE_TABLE} ORDER BY id");
+    client.execute(&insert, &[&&b"alice@example.com"[..]]).await.unwrap();
+    let rows = client.query(&select, &[]).await.unwrap();
+    assert_eq!(rows[0].get::<_, Vec<u8>>(0), b"alice@example.com");
+
+    // The migration: same names, new OID.
+    common::create_table(&direct, RECREATE_TABLE).await;
+
+    // The write path is name-keyed, so it never stopped encrypting.
+    client.execute(&insert, &[&&b"carol@example.com"[..]]).await.unwrap();
+    let stored: Vec<u8> =
+        direct.query_one(&select, &[]).await.unwrap().get::<_, Option<Vec<u8>>>(0).unwrap();
+    assert_eq!(&stored[32..36], b"DBS1", "writes are still sealed after the migration");
+
+    // The read path heals: the first read that cannot explain the column asks
+    // for a re-resolution, and the next one decrypts again. Polled rather than
+    // slept on — the round trip is the proxy's, not the test's.
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(30);
+    loop {
+        let rows = client.query(&select, &[]).await.unwrap();
+        if rows[0].get::<_, Vec<u8>>(0) == b"carol@example.com" {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the proxy never re-resolved the recreated table; reads are still relaying the \
+             stored form"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+
+    // Strict mode: the session that notices refuses rather than relaying.
+    proxy.shutdown().await;
+    let _strict = common::spawn_proxy(dir.path(), &opts.strict()).await;
+    let client = common::connect_via_proxy(dir.path(), common::port_recreate()).await;
+    client.query(&select, &[]).await.expect("resolved at startup, so this one is fine");
+
+    common::create_table(&direct, RECREATE_TABLE).await;
+    client.execute(&insert, &[&&b"dave@example.com"[..]]).await.unwrap();
+    assert!(
+        client.query(&select, &[]).await.is_err(),
+        "strict mode must refuse a result column it cannot prove is unprotected"
+    );
 }
