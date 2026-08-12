@@ -15,7 +15,7 @@
 
 mod common;
 
-use common::PORT_VAULT as PORT;
+use common::port_vault as port;
 
 const TABLE: &str = "users_vault";
 
@@ -62,12 +62,15 @@ async fn vault_key_source_survives_restarts() {
     common::create_table(&direct, TABLE).await;
 
     let dir = tempfile::tempdir().unwrap();
-    let opts =
-        common::ProxyOpts { port: PORT, table: TABLE, keys: common::Keys::Vault(vault_section()) };
+    let opts = common::ProxyOpts {
+        port: port(),
+        table: TABLE,
+        keys: common::Keys::Vault(vault_section()),
+    };
 
     // ---- First run: keys minted, rows sealed with this run's DEK. ----
     let proxy = common::spawn_proxy(dir.path(), &opts).await;
-    let client = common::connect_via_proxy(dir.path(), PORT).await;
+    let client = common::connect_via_proxy(dir.path(), port()).await;
     client
         .execute(
             &format!("INSERT INTO {TABLE} (email, phone, ssn, note) VALUES ($1, $2, $3, $4)"),
@@ -96,7 +99,7 @@ async fn vault_key_source_survives_restarts() {
 
     // ---- Second run: a new DEK, but the old rows must still open. ----
     let _proxy = common::spawn_proxy(dir.path(), &opts).await;
-    let client = common::connect_via_proxy(dir.path(), PORT).await;
+    let client = common::connect_via_proxy(dir.path(), port()).await;
 
     let row = client
         .query_one(&format!("SELECT email, phone FROM {TABLE} WHERE id = 1"), &[])

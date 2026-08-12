@@ -15,7 +15,7 @@ mod common;
 use std::path::PathBuf;
 use std::process::Command;
 
-use common::PORT_PSYCOPG as PORT;
+use common::port_psycopg;
 
 const TABLE: &str = "users_psycopg";
 
@@ -50,14 +50,15 @@ async fn psycopg_driver_matrix() {
     common::create_table(&direct, TABLE).await;
 
     let dir = tempfile::tempdir().unwrap();
-    let _proxy = common::spawn_proxy(dir.path(), &common::ProxyOpts::file_keys(PORT, TABLE)).await;
+    let port = port_psycopg();
+    let _proxy = common::spawn_proxy(dir.path(), &common::ProxyOpts::file_keys(port, TABLE)).await;
 
     // libpq conninfo rather than a URL: verify-full needs the proxy's
     // self-signed certificate as the only trusted root.
     let credentials = common::credentials();
     let (user, password) = credentials.split_once(':').expect("dsn has user:password");
     let conninfo = format!(
-        "host=localhost port={PORT} user={user} password={password} dbname={} \
+        "host=localhost port={port} user={user} password={password} dbname={} \
          sslmode=verify-full sslrootcert={}",
         common::database(),
         common::cert_path(dir.path()).display(),

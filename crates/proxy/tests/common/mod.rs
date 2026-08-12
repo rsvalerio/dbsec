@@ -7,21 +7,55 @@
 //! never collide when run together.
 //!
 //! `DBSEC_E2E_DSN` points at a superuser DSN, default
-//! `postgres://dbsec:dbsec@127.0.0.1:5433/dbsec`.
+//! `postgres://dbsec:dbsec@127.0.0.1:5433/dbsec`. `DBSEC_E2E_PORT_BASE` moves
+//! the block of listen ports the suites use.
 
 // Each test binary uses a subset of these helpers.
 #![allow(dead_code)]
 
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 pub const DEFAULT_DSN: &str = "postgres://dbsec:dbsec@127.0.0.1:5433/dbsec";
 
-/// Listen ports, one per test binary — the suites must not fight over one.
-pub const PORT_TOKIO_POSTGRES: u16 = 16432;
-pub const PORT_SQLX: u16 = 16433;
-pub const PORT_PSYCOPG: u16 = 16434;
-pub const PORT_VAULT: u16 = 16435;
+/// First port of the block the suites listen on, one port per test binary.
+pub const DEFAULT_PORT_BASE: u16 = 16432;
+
+/// How long `Proxy::shutdown` waits for a killed proxy's listener to go away.
+const PORT_RELEASE_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Listen port for one test binary — the suites must not fight over one, and
+/// the whole block moves with `DBSEC_E2E_PORT_BASE`. Nothing stops another
+/// process on the machine (a second checkout, a parallel CI job, a developer's
+/// own service) from holding the default block, so it has to be movable
+/// without editing the source.
+fn port_at(offset: u16) -> u16 {
+    let base = match std::env::var("DBSEC_E2E_PORT_BASE") {
+        Ok(raw) => raw
+            .parse::<u16>()
+            .unwrap_or_else(|e| panic!("DBSEC_E2E_PORT_BASE={raw:?} is not a port number: {e}")),
+        Err(_) => DEFAULT_PORT_BASE,
+    };
+    base.checked_add(offset)
+        .unwrap_or_else(|| panic!("DBSEC_E2E_PORT_BASE={base} leaves no room for offset {offset}"))
+}
+
+pub fn port_tokio_postgres() -> u16 {
+    port_at(0)
+}
+
+pub fn port_sqlx() -> u16 {
+    port_at(1)
+}
+
+pub fn port_psycopg() -> u16 {
+    port_at(2)
+}
+
+pub fn port_vault() -> u16 {
+    port_at(3)
+}
 
 pub fn dsn() -> String {
     std::env::var("DBSEC_E2E_DSN").unwrap_or_else(|_| DEFAULT_DSN.to_owned())
@@ -93,22 +127,40 @@ impl<'a> ProxyOpts<'a> {
 }
 
 /// The proxy process, killed and reaped on drop.
-pub struct Proxy(std::process::Child);
+pub struct Proxy {
+    child: std::process::Child,
+    port: u16,
+}
 
 impl Drop for Proxy {
     fn drop(&mut self) {
-        let _ = self.0.kill();
-        let _ = self.0.wait();
+        let _ = self.child.kill();
+        let _ = self.child.wait();
     }
 }
 
 impl Proxy {
-    /// Stops the proxy and waits for the port to go away, so the next proxy
-    /// on the same port does not inherit this one's listener.
+    /// Stops the proxy and waits until its port actually refuses connections,
+    /// so the next proxy on the same port does not inherit this one's listener.
+    ///
+    /// The wait is a poll rather than a sleep: how fast the kernel tears the
+    /// listening socket down is not something the test can assume, and getting
+    /// it wrong surfaces as the *next* proxy's readiness loop connecting to
+    /// this one's dying socket, which reads as an unrelated failure.
     pub async fn shutdown(mut self) {
-        let _ = self.0.kill();
-        let _ = self.0.wait();
-        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        let port = self.port;
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+
+        let deadline = tokio::time::Instant::now() + PORT_RELEASE_TIMEOUT;
+        while tokio::net::TcpStream::connect(("127.0.0.1", port)).await.is_ok() {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "port {port} still accepted connections {PORT_RELEASE_TIMEOUT:?} after the proxy \
+                 was killed — something else is listening on it",
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
     }
 }
 
@@ -182,14 +234,28 @@ mask = {{ keep_first = 2 }}
 /// listener. Wrapped immediately so the child is killed and reaped even when
 /// the readiness loop panics.
 pub async fn spawn_with_config(config_path: &Path, port: u16) -> Proxy {
-    let proxy = Proxy(
-        std::process::Command::new(env!("CARGO_BIN_EXE_dbsec")).arg(config_path).spawn().unwrap(),
-    );
+    // Checked before spawning, because an occupied port otherwise makes the
+    // readiness loop below succeed against *someone else's* listener and the
+    // failure appears much later as an unrelated protocol error.
+    if let Err(err) = std::net::TcpListener::bind(("127.0.0.1", port)) {
+        panic!(
+            "e2e port {port} is already in use ({err}) — another checkout, a parallel CI job or a \
+             leftover proxy is holding it. Set DBSEC_E2E_PORT_BASE to move the suites' ports.",
+        );
+    }
+
+    let proxy = Proxy {
+        child: std::process::Command::new(env!("CARGO_BIN_EXE_dbsec"))
+            .arg(config_path)
+            .spawn()
+            .unwrap(),
+        port,
+    };
     for _ in 0..100 {
         if tokio::net::TcpStream::connect(("127.0.0.1", port)).await.is_ok() {
             return proxy;
         }
-        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        tokio::time::sleep(Duration::from_millis(100)).await;
     }
     panic!("proxy did not start listening on {port}");
 }

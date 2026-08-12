@@ -7,7 +7,7 @@
 
 mod common;
 
-use common::PORT_TOKIO_POSTGRES as PORT;
+use common::port_tokio_postgres as port;
 
 const TABLE: &str = "users";
 
@@ -18,8 +18,9 @@ async fn transparent_encryption_end_to_end() {
     common::create_table(&direct, TABLE).await;
 
     let dir = tempfile::tempdir().unwrap();
-    let _proxy = common::spawn_proxy(dir.path(), &common::ProxyOpts::file_keys(PORT, TABLE)).await;
-    let client = common::connect_via_proxy(dir.path(), PORT).await;
+    let _proxy =
+        common::spawn_proxy(dir.path(), &common::ProxyOpts::file_keys(port(), TABLE)).await;
+    let client = common::connect_via_proxy(dir.path(), port()).await;
 
     // Extended protocol: Parse/Bind with binary and text params.
     client

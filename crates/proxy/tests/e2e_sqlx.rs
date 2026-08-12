@@ -10,7 +10,7 @@
 
 mod common;
 
-use common::PORT_SQLX as PORT;
+use common::port_sqlx as port;
 use sqlx::{Connection as _, Row as _};
 
 /// The table name as a literal so SQL can be assembled with `concat!`: sqlx
@@ -29,7 +29,7 @@ async fn connect_sqlx(dir: &std::path::Path) -> sqlx::PgConnection {
     let (user, password) = credentials.split_once(':').expect("dsn has user:password");
     let options = sqlx::postgres::PgConnectOptions::new()
         .host("localhost")
-        .port(PORT)
+        .port(port())
         .username(user)
         .password(password)
         .database(&common::database())
@@ -45,7 +45,8 @@ async fn sqlx_driver_end_to_end() {
     common::create_table(&direct, TABLE).await;
 
     let dir = tempfile::tempdir().unwrap();
-    let _proxy = common::spawn_proxy(dir.path(), &common::ProxyOpts::file_keys(PORT, TABLE)).await;
+    let _proxy =
+        common::spawn_proxy(dir.path(), &common::ProxyOpts::file_keys(port(), TABLE)).await;
     let mut conn = connect_sqlx(dir.path()).await;
 
     // Extended protocol. The same SQL text runs twice: sqlx parses it once
