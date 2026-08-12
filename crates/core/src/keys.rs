@@ -40,19 +40,43 @@ pub struct FileKeySource {
     index_keys: HashMap<String, Key>,
 }
 
+/// The parsed keyfile. Every value in `keys` and `index_keys` is 64 hex
+/// characters of live key material in its own heap allocation, so the struct
+/// wipes them in [`Drop`] rather than letting them be freed intact — the
+/// `Zeroizing<[u8; 32]>` on the decoded copy buys little while two plaintext
+/// copies of every key outlive it.
+///
+/// Erasure is best-effort by construction: `toml` builds its own intermediate
+/// buffers while parsing, and this crate can neither name nor reach them. The
+/// goal is to remove the copies it does own.
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct KeyFile {
+    /// A key *id*, not key material — left in the clear so it can still be
+    /// named in an error message.
     active: String,
     keys: HashMap<String, String>,
     #[serde(default)]
     index_keys: HashMap<String, String>,
 }
 
+impl Drop for KeyFile {
+    fn drop(&mut self) {
+        for hex_key in self.keys.values_mut().chain(self.index_keys.values_mut()) {
+            hex_key.zeroize();
+        }
+    }
+}
+
 impl FileKeySource {
     pub fn load(path: &Path) -> Result<Self, Error> {
-        let raw = std::fs::read_to_string(path)
-            .map_err(|source| Error::KeyFileRead { path: path.to_path_buf(), source })?;
+        // The whole file is every DEK and every deterministic index key in
+        // plaintext hex, so it is held in a buffer that is wiped when it
+        // drops rather than in a bare `String`.
+        let raw = Zeroizing::new(
+            std::fs::read_to_string(path)
+                .map_err(|source| Error::KeyFileRead { path: path.to_path_buf(), source })?,
+        );
         let parsed: KeyFile = toml::from_str(&raw)
             .map_err(|source| Error::KeyFileParse { path: path.to_path_buf(), source })?;
 
@@ -78,16 +102,32 @@ impl FileKeySource {
     /// Fails if `path` already exists — never overwrites key material.
     pub fn generate(path: &Path) -> Result<(), Error> {
         use rand::RngCore;
+        // The OS entropy source rather than `thread_rng` (SEC-10): this is the
+        // master key for everything the product protects, and `ThreadRng`
+        // would interpose a userspace generator state — the state that
+        // survives `fork()` and that reseeding bugs live in — between the OS
+        // and a long-lived key. `try_fill_bytes` rather than `fill_bytes` so a
+        // refusing entropy source is an error, not a panic.
         let mut id = [0u8; KEY_ID_LEN];
-        rand::thread_rng().fill_bytes(&mut id);
+        rand::rngs::OsRng.try_fill_bytes(&mut id)?;
         let mut key = Zeroizing::new([0u8; 32]);
-        rand::thread_rng().fill_bytes(key.as_mut());
+        rand::rngs::OsRng.try_fill_bytes(key.as_mut())?;
 
-        let contents = Zeroizing::new(format!(
-            "active = \"{id}\"\n\n[keys]\n{id} = \"{key}\"\n",
-            id = hex::encode(id),
-            key = hex::encode(key.as_ref()),
-        ));
+        // Appended into one pre-sized zeroizing buffer. `hex::encode` would
+        // return the key as a plain `String` that nothing wipes, and a
+        // `format!` that outgrows its buffer leaves what it already wrote in a
+        // freed allocation. The capacity below is exact, so no reallocation
+        // happens mid-build either.
+        const TEMPLATE: &str = "active = \"\"\n\n[keys]\n = \"\"\n";
+        let mut contents =
+            Zeroizing::new(String::with_capacity(TEMPLATE.len() + KEY_ID_LEN * 4 + 64));
+        contents.push_str("active = \"");
+        push_hex(&mut contents, &id);
+        contents.push_str("\"\n\n[keys]\n");
+        push_hex(&mut contents, &id);
+        contents.push_str(" = \"");
+        push_hex(&mut contents, key.as_ref());
+        contents.push_str("\"\n");
         let mut options = std::fs::OpenOptions::new();
         options.write(true).create_new(true);
         #[cfg(unix)]
@@ -126,6 +166,17 @@ fn decode<const N: usize>(hex_str: &str, what: &str) -> Result<[u8; N], Error> {
 
 fn decode_key(hex_str: &str) -> Result<Key, Error> {
     decode::<32>(hex_str, "key").map(Zeroizing::new)
+}
+
+/// Appends `bytes` as lowercase hex straight into `out`. `hex::encode` would
+/// hand back key material in a fresh `String` that nothing wipes; this writes
+/// it into the caller's zeroizing buffer instead.
+fn push_hex(out: &mut String, bytes: &[u8]) {
+    const DIGITS: &[u8; 16] = b"0123456789abcdef";
+    for &byte in bytes {
+        out.push(char::from(DIGITS[usize::from(byte >> 4)]));
+        out.push(char::from(DIGITS[usize::from(byte & 0x0f)]));
+    }
 }
 
 #[cfg(test)]
@@ -210,6 +261,34 @@ email = \"0303030303030303030303030303030303030303030303030303030303030303\"
         // toml's span survives, so a caller can point at the offending line.
         assert!(source.span().is_some());
         assert!(std::error::Error::source(&err).is_some());
+    }
+
+    /// `generate` hand-rolls hex so key material never lands in an
+    /// intermediate `String`; this pins it against the crate everyone else
+    /// uses.
+    #[test]
+    fn push_hex_matches_hex_encode() {
+        let mut out = String::new();
+        push_hex(&mut out, &[0x00, 0x0f, 0xa5, 0xff]);
+        assert_eq!(out, hex::encode([0x00, 0x0f, 0xa5, 0xffu8]));
+
+        let mut empty = String::new();
+        push_hex(&mut empty, &[]);
+        assert!(empty.is_empty());
+    }
+
+    /// The buffer `generate` writes into is sized up front so it cannot
+    /// reallocate mid-build and strand a partial copy of the key in a freed
+    /// allocation.
+    #[test]
+    fn generated_keyfile_fits_the_buffer_it_was_written_into() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("keys.toml");
+        FileKeySource::generate(&path).unwrap();
+
+        let written = std::fs::read_to_string(&path).unwrap();
+        const TEMPLATE: &str = "active = \"\"\n\n[keys]\n = \"\"\n";
+        assert_eq!(written.len(), TEMPLATE.len() + KEY_ID_LEN * 4 + 64);
     }
 
     #[test]

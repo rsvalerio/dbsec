@@ -60,4 +60,11 @@ pub enum Error {
     /// boundary. File I/O and parse failures use the `KeyFile*` variants.
     #[error("key source: {0}")]
     KeySource(String),
+    /// The OS entropy source refused to produce key material (SEC-10). Rare —
+    /// a seccomp filter that blocks `getrandom`, or a sandbox with no
+    /// `/dev/urandom` — but the alternative to reporting it is `OsRng`'s own
+    /// panic, and a proxy on the data path should fail the operation, not the
+    /// process.
+    #[error("the OS entropy source failed")]
+    Entropy(#[from] rand::Error),
 }
