@@ -154,7 +154,7 @@ pub mod tests {
 
     pub fn transform(searchable: bool) -> Arc<dyn FieldTransform> {
         let index_key = searchable.then(|| "public.users.email".to_owned());
-        let ciphers = Arc::new(dbsec_core::envelope::Ciphers::new(Arc::new(OneKey)));
+        let ciphers = Arc::new(envelope::Ciphers::new(Arc::new(OneKey)));
         Arc::new(dbsec_core::transform::EncryptTransform::new(ciphers, index_key))
     }
 
