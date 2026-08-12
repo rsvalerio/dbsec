@@ -108,6 +108,12 @@ pub struct VaultConfig {
     /// Transit key name the DEK envelope is encrypted under.
     #[serde(default = "default_vault_path")]
     pub transit_key: String,
+    /// Timeout for each Vault request, and the budget for one key lookup made
+    /// from the relay path. Unset, `vaultrs` leaves the HTTP client with no
+    /// timeout at all, so a Vault that accepts the connection and then stops
+    /// answering would park a runtime worker for the life of the process.
+    #[serde(default = "default_vault_timeout_secs")]
+    pub timeout_secs: u64,
 }
 
 impl VaultConfig {
@@ -135,6 +141,10 @@ fn default_vault_path() -> String {
 
 fn default_transit_mount() -> String {
     "transit".to_owned()
+}
+
+fn default_vault_timeout_secs() -> u64 {
+    5
 }
 
 impl ColumnConfig {
@@ -245,6 +255,11 @@ impl Config {
         }
         if let Some(vault) = &self.vault {
             vault.token()?;
+            if vault.timeout_secs == 0 {
+                return Err(Error::InvalidConfig(
+                    "[vault] timeout_secs must be greater than 0".into(),
+                ));
+            }
         }
         let mut seen = std::collections::HashSet::new();
         for column in &self.columns {
@@ -367,6 +382,16 @@ mod tests {
         assert_eq!(vault.path, "dbsec");
         assert_eq!(vault.transit_mount, "transit");
         assert_eq!(vault.token().unwrap(), "root");
+        assert_eq!(vault.timeout_secs, 5, "every Vault call is bounded by default");
+
+        let zero_timeout: Config = toml::from_str(
+            "control_dsn = \"d\"\n\n[vault]\naddr = \"a\"\ntoken = \"t\"\ntimeout_secs = 0\n\n[[column]]\ntable = \"users\"\ncolumn = \"email\"\n",
+        )
+        .unwrap();
+        assert!(
+            matches!(zero_timeout.validate(), Err(Error::InvalidConfig(_))),
+            "a zero timeout would expire instantly, not disable the bound"
+        );
 
         let both: Config = toml::from_str(
             "keys_file = \"k\"\ncontrol_dsn = \"d\"\n\n[vault]\naddr = \"a\"\ntoken = \"t\"\n\n[[column]]\ntable = \"users\"\ncolumn = \"email\"\n",
