@@ -204,8 +204,7 @@ async fn serve(validated: ValidatedConfig) -> Result<(), Error> {
             };
             let columns = Arc::new(columns::build(&config, &keys));
             let dsn = protected.control_dsn.clone();
-            let resolved =
-                resolve::resolve_columns(&dsn, &tls, &columns, CONNECT_TIMEOUT).await?;
+            let resolved = resolve::resolve_columns(&dsn, &tls, &columns, CONNECT_TIMEOUT).await?;
             let rows = Arc::new(RowContext::new(resolved, config.on_unprotected));
             refresh = Some((rows.clone(), dsn, columns.clone()));
             (
