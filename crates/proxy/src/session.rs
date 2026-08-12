@@ -349,7 +349,7 @@ mod tests {
         for cert in rustls::pki_types::CertificateDer::pem_file_iter(&cert_path).unwrap() {
             roots.add(cert.unwrap()).unwrap();
         }
-        let client_config = std::sync::Arc::new(
+        let client_config = Arc::new(
             rustls::ClientConfig::builder().with_root_certificates(roots).with_no_client_auth(),
         );
         let mut sock = TcpStream::connect(proxy_addr).await.unwrap();
@@ -389,7 +389,7 @@ mod tests {
             .unwrap();
         let key = rustls::pki_types::PrivateKeyDer::from_pem_file(&key_path).unwrap();
         let upstream_task = tokio::spawn(async move {
-            let server_config = std::sync::Arc::new(
+            let server_config = Arc::new(
                 rustls::ServerConfig::builder()
                     .with_no_client_auth()
                     .with_single_cert(certs, key)

@@ -47,6 +47,40 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 # test-only
 proptest = "1"
+tempfile = "3"
+
+# Lint policy lives here rather than in the flags CI happens to pass, so a local
+# `cargo clippy` enables exactly the set CI enables and both member crates — and
+# every future one — get it by inheriting with `[lints] workspace = true`.
+# `clippy.toml` can only tune thresholds for lints that are already on; this is
+# the table that turns them on.
+#
+# Levels are `deny`, not `warn`: the shared forge workflow runs clippy with
+# `-D warnings`, so a `warn` here would be an error in CI and a passing build
+# locally, which is the divergence this table exists to remove. Groups that this
+# codebase does not satisfy today (`clippy::pedantic`, `missing_docs`) are
+# deliberately left out rather than enabled and then blanket-allowed.
+[workspace.lints.rust]
+# The point of the exercise: a field-level encryption library that can state, in
+# a machine-checked way, that it contains no unsafe code. `forbid` rather than
+# `deny` so no module can re-allow it with an attribute. `fuzz/` is `exclude`d
+# from the workspace and cannot inherit this — libfuzzer's `fuzz_target!`
+# expands to an `extern "C"` entry point that is unsafe by construction, so a
+# forbid there would only be satisfiable by not fuzzing.
+unsafe_code = "forbid"
+unused_qualifications = "deny"
+unused_lifetimes = "deny"
+unused_macro_rules = "deny"
+
+[workspace.lints.clippy]
+all = { level = "deny", priority = -1 }
+# Debugging and placeholder leftovers: cheap to keep out, expensive to find in a
+# proxy that sits on production traffic.
+dbg_macro = "deny"
+todo = "deny"
+unimplemented = "deny"
+# Skipping a destructor on key material would leave it unzeroized.
+mem_forget = "deny"
 
 [profile.release]
 lto = "thin"
