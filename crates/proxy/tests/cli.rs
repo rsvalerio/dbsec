@@ -1,0 +1,231 @@
+//! The `dbsec` binary as a command: argument handling, config discovery, exit
+//! codes, and which stream diagnostics go to (TEST-31).
+//!
+//! These decisions are invisible to unit tests over internal functions, and
+//! they are exactly where CLI regressions land: a changed exit code breaks a
+//! supervisor's restart policy, and a change to config discovery breaks every
+//! deployment relying on the implicit `./dbsec.toml`. Driven with
+//! `std::process::Command` rather than a CLI assertion crate — the e2e harness
+//! already spawns `CARGO_BIN_EXE_dbsec` this way, and every assertion here is
+//! an exact string rather than a fluent chain.
+
+use std::io::{BufRead, BufReader, Read};
+use std::path::Path;
+use std::process::{Child, Command, Stdio};
+use std::sync::mpsc;
+use std::time::Duration;
+
+/// The listen address a run with no config must fall back to.
+const DEFAULT_LISTEN: &str = "127.0.0.1:6432";
+
+/// `max_sessions` for a config with no argument-passing ambiguity: the
+/// default is 256, so any of these values proves *which* file was read.
+const EXPLICIT_SESSIONS: usize = 7;
+const DISCOVERED_SESSIONS: usize = 9;
+
+/// How long a case waits for the line it expects before declaring the binary
+/// hung. Generous: a cold process start on a loaded test runner.
+const LINE_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// A config that binds an ephemeral port, so these cases never contend for
+/// one with each other or with the e2e suites.
+fn config_toml(max_sessions: usize) -> String {
+    format!(
+        "listen = \"127.0.0.1:0\"\nupstream = \"127.0.0.1:5432\"\nmax_sessions = {max_sessions}\n"
+    )
+}
+
+fn dbsec(dir: &Path) -> Command {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_dbsec"));
+    command
+        .current_dir(dir)
+        // Pinned so an inherited RUST_LOG cannot filter away the lines
+        // asserted below.
+        .env("RUST_LOG", "info")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    command
+}
+
+/// A spawned proxy plus a thread draining its stderr, so a case can wait for
+/// one line without blocking on a process that is designed never to exit.
+struct Running {
+    child: Child,
+    lines: mpsc::Receiver<String>,
+}
+
+impl Running {
+    fn start(command: &mut Command) -> Self {
+        let mut child = command.spawn().expect("the dbsec binary must be runnable");
+        let stderr = child.stderr.take().expect("stderr is piped");
+        let (tx, lines) = mpsc::channel();
+        std::thread::spawn(move || {
+            for line in BufReader::new(stderr).lines().map_while(Result::ok) {
+                if tx.send(line).is_err() {
+                    break;
+                }
+            }
+        });
+        Self { child, lines }
+    }
+
+    /// The first stderr line containing `needle`.
+    fn wait_for(&mut self, needle: &str) -> String {
+        let mut seen = Vec::new();
+        loop {
+            match self.lines.recv_timeout(LINE_TIMEOUT) {
+                Ok(line) if line.contains(needle) => return line,
+                Ok(line) => seen.push(line),
+                Err(e) => panic!("no stderr line containing {needle:?} ({e}); saw {seen:#?}"),
+            }
+        }
+    }
+
+    fn assert_still_serving(&mut self) {
+        assert!(
+            matches!(self.child.try_wait(), Ok(None)),
+            "the proxy exited instead of staying up to serve"
+        );
+    }
+
+    /// Stops the proxy and returns everything it wrote to stdout. Read only
+    /// after the kill: a healthy proxy never closes the stream on its own.
+    fn stop(mut self) -> String {
+        self.terminate();
+        let mut stdout = String::new();
+        self.child
+            .stdout
+            .take()
+            .expect("stdout is piped")
+            .read_to_string(&mut stdout)
+            .expect("the proxy's stdout must be readable");
+        stdout
+    }
+
+    /// Idempotent: `stop` calls it, and so does `Drop` for the case where an
+    /// assertion panicked first. Errors are ignored because the only ones
+    /// reachable mean the child is already gone.
+    fn terminate(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+/// A panicking assertion must not leave a proxy running: it would hold a
+/// listener for the rest of the run and make every later case fail for the
+/// wrong reason.
+impl Drop for Running {
+    fn drop(&mut self) {
+        self.terminate();
+    }
+}
+
+/// An explicit path wins over a `dbsec.toml` sitting in the working
+/// directory — otherwise a run that ignored its argument would look correct
+/// by accident.
+#[test]
+fn an_explicit_config_path_is_the_one_loaded() {
+    let dir = tempfile::tempdir().unwrap();
+    let explicit = dir.path().join("custom.toml");
+    std::fs::write(&explicit, config_toml(EXPLICIT_SESSIONS)).unwrap();
+    std::fs::write(dir.path().join("dbsec.toml"), config_toml(DISCOVERED_SESSIONS)).unwrap();
+
+    let mut proxy = Running::start(dbsec(dir.path()).arg(&explicit));
+    let line = proxy.wait_for("dbsec listening");
+    assert!(line.contains(&format!("max_sessions={EXPLICIT_SESSIONS}")), "{line}");
+    proxy.assert_still_serving();
+    assert_eq!(proxy.stop(), "", "diagnostics must not reach stdout");
+}
+
+/// No argument in a directory that has a `dbsec.toml`: the implicit
+/// discovery every deployment relies on.
+#[test]
+fn no_argument_picks_up_the_config_in_the_working_directory() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("dbsec.toml"), config_toml(DISCOVERED_SESSIONS)).unwrap();
+
+    let mut proxy = Running::start(&mut dbsec(dir.path()));
+    let line = proxy.wait_for("dbsec listening");
+    assert!(line.contains(&format!("max_sessions={DISCOVERED_SESSIONS}")), "{line}");
+    proxy.assert_still_serving();
+    assert_eq!(proxy.stop(), "", "diagnostics must not reach stdout");
+}
+
+/// No argument and no `dbsec.toml`: a missing default file is not an error,
+/// it means built-in defaults — so startup gets all the way to binding the
+/// default listen address.
+///
+/// Observed by taking that address away first, rather than by letting the
+/// proxy bind it: a fixed global port cannot be claimed by a test suite that
+/// runs concurrently with the e2e suites, with a second checkout, or with
+/// another CI job. The bind failure names the address, which is the fact
+/// under test — that the run fell back to the default rather than erroring
+/// out on the missing file.
+#[test]
+fn no_argument_and_no_config_file_falls_back_to_the_default_listen_address() {
+    let occupied = std::net::TcpListener::bind(DEFAULT_LISTEN).ok();
+
+    let dir = tempfile::tempdir().unwrap();
+    let output = dbsec(dir.path()).output().expect("the dbsec binary must be runnable");
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    drop(occupied);
+
+    assert_eq!(output.status.code(), Some(1), "stderr: {stderr}");
+    assert!(stderr.contains(&format!("binding listen address {DEFAULT_LISTEN}")), "{stderr}");
+    // The missing `dbsec.toml` itself must not be what failed.
+    assert!(!stderr.contains("dbsec.toml"), "{stderr}");
+    assert!(output.stdout.is_empty(), "stdout: {:?}", String::from_utf8_lossy(&output.stdout));
+}
+
+/// A config path the operator got wrong: non-zero exit, and a message that
+/// names the file so the typo is findable.
+#[test]
+fn a_missing_config_path_exits_non_zero_and_names_the_path() {
+    let dir = tempfile::tempdir().unwrap();
+    let absent = dir.path().join("absent.toml");
+
+    let output =
+        dbsec(dir.path()).arg(&absent).output().expect("the dbsec binary must be runnable");
+    let stderr = String::from_utf8(output.stderr).unwrap();
+
+    assert_eq!(output.status.code(), Some(1), "stderr: {stderr}");
+    assert!(stderr.contains(&absent.display().to_string()), "{stderr}");
+    assert!(stderr.contains("startup failed"), "{stderr}");
+    // The stream choice, pinned: diagnostics are stderr's, so `dbsec
+    // 2>/dev/null` silences them and a pipe on stdout stays clean.
+    assert!(output.stdout.is_empty(), "stdout: {:?}", String::from_utf8_lossy(&output.stdout));
+}
+
+/// Malformed TOML has to reach the operator legibly rather than as a bare
+/// parse error with no file in it.
+#[test]
+fn a_malformed_config_exits_non_zero_and_names_the_path() {
+    let dir = tempfile::tempdir().unwrap();
+    let broken = dir.path().join("broken.toml");
+    std::fs::write(&broken, "listen = \nupstream =\n").unwrap();
+
+    let output =
+        dbsec(dir.path()).arg(&broken).output().expect("the dbsec binary must be runnable");
+    let stderr = String::from_utf8(output.stderr).unwrap();
+
+    assert_eq!(output.status.code(), Some(1), "stderr: {stderr}");
+    assert!(stderr.contains(&broken.display().to_string()), "{stderr}");
+    assert!(output.stdout.is_empty(), "stdout: {:?}", String::from_utf8_lossy(&output.stdout));
+}
+
+/// A config that parses but violates an invariant fails the same way: the
+/// operator sees why, and the exit code is the one a supervisor reads.
+#[test]
+fn an_invalid_config_exits_non_zero_with_the_reason() {
+    let dir = tempfile::tempdir().unwrap();
+    let invalid = dir.path().join("invalid.toml");
+    std::fs::write(&invalid, "max_sessions = 0\n").unwrap();
+
+    let output =
+        dbsec(dir.path()).arg(&invalid).output().expect("the dbsec binary must be runnable");
+    let stderr = String::from_utf8(output.stderr).unwrap();
+
+    assert_eq!(output.status.code(), Some(1), "stderr: {stderr}");
+    assert!(stderr.contains("max_sessions must be greater than 0"), "{stderr}");
+    assert!(output.stdout.is_empty(), "stdout: {:?}", String::from_utf8_lossy(&output.stdout));
+}
