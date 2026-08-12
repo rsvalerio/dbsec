@@ -1,5 +1,23 @@
 //! Flat TOML configuration: addresses, optional TLS for each hop, the keyfile,
-//! and `[[column]]` entries naming the protected columns.
+//! `[[column]]` entries naming the protected columns, and `on_unprotected`,
+//! the switch that decides what happens when a statement cannot be protected.
+//!
+//! # Operating assumptions this file encodes
+//!
+//! - **`search_path`.** A `[[column]]` table without a schema means `public`,
+//!   and the write path resolves unqualified SQL names the same way. A session
+//!   that points `search_path` somewhere else breaks that equivalence in both
+//!   directions — an unqualified write can miss the catalog (plaintext at
+//!   rest) or match the wrong table (sealed for a table the read path never
+//!   resolves). The proxy therefore watches the startup packet and `SET
+//!   search_path` for changes, and stops resolving unqualified names once the
+//!   default no longer holds; `on_unprotected` decides whether that is a
+//!   warning or a refusal. Schema-qualifying either the config or the SQL
+//!   sidesteps the question entirely.
+//! - **`COPY`.** A `COPY ... FROM` payload arrives as a `CopyData` stream the
+//!   proxy does not parse, so a bulk load into a protected table stores
+//!   plaintext; `COPY ... TO` bypasses the read path, so a masked column
+//!   leaves as its unmasked stored value. Both are `on_unprotected` sites.
 
 use std::path::{Path, PathBuf};
 
@@ -39,8 +57,36 @@ pub struct Config {
     pub max_sessions: usize,
     #[serde(default)]
     pub tls: TlsSection,
+    /// What to do with a statement the proxy cannot protect — see
+    /// [`OnUnprotected`].
+    #[serde(default)]
+    pub on_unprotected: OnUnprotected,
     #[serde(default, rename = "column")]
     pub columns: Vec<ColumnConfig>,
+}
+
+/// What the proxy does when a statement touches a protected column but the
+/// rewrite cannot cover it: an `INSERT` whose values are not literals, a
+/// `COPY`, an upsert branch, SQL that does not parse, a session whose
+/// `search_path` no longer makes the catalog's schema the right answer.
+///
+/// The default is [`OnUnprotected::Warn`], which is fail-*open*: the statement
+/// runs and the plaintext lands in the column. It is the default only because
+/// the alternative refuses statements that work today — including SQL that
+/// sqlparser cannot parse but PostgreSQL can, whether or not it touches a
+/// protected table. A deployment that needs the "a protected column is never
+/// at rest in plaintext" invariant actually enforced sets
+/// `on_unprotected = "reject"` and treats the warnings it sees first as the
+/// list of statements to fix.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum OnUnprotected {
+    /// Log `tracing::warn!` and relay the statement unchanged.
+    #[default]
+    Warn,
+    /// Refuse the statement with a PostgreSQL ErrorResponse. Nothing reaches
+    /// the server and the session stays usable.
+    Reject,
 }
 
 #[derive(Debug, Deserialize)]
@@ -213,6 +259,7 @@ impl Default for Config {
             startup_timeout_secs: default_startup_timeout_secs(),
             max_sessions: default_max_sessions(),
             tls: TlsSection::default(),
+            on_unprotected: OnUnprotected::default(),
             columns: Vec::new(),
         }
     }
@@ -318,6 +365,15 @@ mod tests {
     #[test]
     fn unknown_fields_are_rejected() {
         assert!(toml::from_str::<Config>("listne = \"oops\"").is_err());
+    }
+
+    #[test]
+    fn on_unprotected_defaults_to_warn_and_parses_reject() {
+        let cfg: Config = toml::from_str("").unwrap();
+        assert_eq!(cfg.on_unprotected, OnUnprotected::Warn);
+        let strict: Config = toml::from_str("on_unprotected = \"reject\"").unwrap();
+        assert_eq!(strict.on_unprotected, OnUnprotected::Reject);
+        assert!(toml::from_str::<Config>("on_unprotected = \"nonsense\"").is_err());
     }
 
     #[test]

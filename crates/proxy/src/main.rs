@@ -82,6 +82,8 @@ pub enum Error {
     Control(String),
     #[error("configured column {table}.{column} does not exist")]
     ColumnNotFound { table: String, column: String },
+    #[error("a rewritten statement did not re-parse to the same SQL; refusing to send it")]
+    RewriteDiverged,
     #[error(transparent)]
     Wire(#[from] dbsec_core::Error),
     #[error(transparent)]
@@ -152,7 +154,7 @@ async fn serve(config: Config) -> Result<(), Error> {
         let column_map = resolve::resolve_columns(dsn, &tls, &protected).await?;
         (
             Some(Arc::new(RowContext { columns: column_map })),
-            Some(Arc::new(encrypt::WriteCatalog::new(&protected))),
+            Some(Arc::new(encrypt::WriteCatalog::new(&protected, config.on_unprotected))),
         )
     };
 

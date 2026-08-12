@@ -1,15 +1,22 @@
 //! One client connection: startup negotiation (including TLS on either hop),
-//! then a frame-aware relay in each direction. The upstream→client relay
-//! runs the row decryptor; client→upstream is still untouched until the
-//! encrypt milestone.
+//! then a frame-aware relay in each direction. The upstream→client relay runs
+//! the row decryptor; the client→upstream relay runs the query rewriter.
+//!
+//! Each relay can also answer the sender directly instead of forwarding a
+//! frame ([`FrameAction::Reply`]) — that is how the write path refuses a
+//! statement with an ErrorResponse without dropping the connection. Both
+//! writers are therefore shared: a relay writes its own direction and, on a
+//! refusal, the other one. Whole frames are written under the lock, so the
+//! two directions never interleave inside a message.
 
+use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
 use dbsec_core::pgwire::{self, Startup};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpStream;
-use tokio::sync::watch;
+use tokio::sync::{watch, Mutex};
 use tokio::time::timeout;
 
 use crate::encrypt::{QueryRewriter, WriteCatalog};
@@ -36,6 +43,9 @@ const RELAY_BUFFER_RETAIN: usize = 64 * 1024;
 /// disappearance means the accept loop is gone.
 pub type ShutdownRx = watch::Receiver<bool>;
 
+/// The backend's transaction status before any ReadyForQuery has been seen.
+const TX_IDLE: u8 = b'I';
+
 /// Everything a session needs beyond its socket.
 pub struct SessionContext {
     pub upstream_addr: String,
@@ -44,6 +54,28 @@ pub struct SessionContext {
     pub writes: Option<Arc<WriteCatalog>>,
     /// Deadline for the whole client-controlled startup phase.
     pub startup_timeout: Duration,
+}
+
+/// What the relay does with one frame.
+#[derive(Debug, PartialEq, Eq)]
+pub enum FrameAction {
+    /// Forward it unchanged.
+    Relay,
+    /// Forward this body in place of the original.
+    Replace(Vec<u8>),
+    /// Do not forward it; write these already-framed bytes back to the sender
+    /// instead. Empty means the frame is dropped without an answer, which is
+    /// what the backend does to the rest of a batch it has errored on.
+    Reply(Vec<u8>),
+}
+
+/// What the startup phase hands the relay.
+struct Started {
+    client: MaybeTls<TcpStream>,
+    upstream: MaybeTls<TcpStream>,
+    /// Whether the startup packet left unqualified names resolving to
+    /// `public`, which is what the write catalog assumes.
+    search_path_trusted: bool,
 }
 
 pub async fn run(
@@ -58,32 +90,48 @@ pub async fn run(
     let started = timeout(ctx.startup_timeout, start_session(client, ctx))
         .await
         .map_err(|_| Error::StartupTimeout { timeout: ctx.startup_timeout })??;
-    let Some((client, upstream)) = started else {
+    let Some(Started { client, upstream, search_path_trusted }) = started else {
         return Ok(()); // client connected and left (health check)
     };
 
     let mut decryptor = ctx.rows.as_ref().map(|rows| rows.decryptor());
-    let mut rewriter = ctx.writes.as_ref().map(|writes| QueryRewriter::new(writes.clone()));
+    let tx_status = Arc::new(AtomicU8::new(TX_IDLE));
+    let seen_status = tx_status.clone();
+    let mut rewriter = ctx
+        .writes
+        .as_ref()
+        .map(|writes| QueryRewriter::new(writes.clone(), tx_status, search_path_trusted));
     let (client_r, client_w) = tokio::io::split(client);
     let (upstream_r, upstream_w) = tokio::io::split(upstream);
+    let client_w = Arc::new(Mutex::new(client_w));
+    let upstream_w = Arc::new(Mutex::new(upstream_w));
     tokio::try_join!(
         relay(
             client_r,
-            upstream_w,
+            Writers { forward: upstream_w.clone(), back: client_w.clone() },
             "client->upstream",
             move |msg_type, body| match &mut rewriter {
                 Some(rewriter) => rewriter.on_frame(msg_type, body),
-                None => Ok(None),
+                None => Ok(FrameAction::Relay),
             },
             shutdown.clone(),
         ),
         relay(
             upstream_r,
-            client_w,
+            Writers { forward: client_w, back: upstream_w },
             "upstream->client",
-            move |msg_type, body| match &mut decryptor {
-                Some(decryptor) => decryptor.on_frame(msg_type, body),
-                None => Ok(None),
+            move |msg_type, body| {
+                if msg_type == b'Z' {
+                    if let Some(&status) = body.first() {
+                        seen_status.store(status, Ordering::Relaxed);
+                    }
+                }
+                match &mut decryptor {
+                    Some(decryptor) => decryptor
+                        .on_frame(msg_type, body)
+                        .map(|body| body.map_or(FrameAction::Relay, FrameAction::Replace)),
+                    None => Ok(FrameAction::Relay),
+                }
             },
             shutdown,
         ),
@@ -95,10 +143,7 @@ pub async fn run(
 /// GSSENCRequest locally, upgrade to TLS when configured, connect upstream,
 /// and forward the real startup message. Returns both halves of the relay, or
 /// `None` when the client hung up before sending anything.
-async fn start_session(
-    client: TcpStream,
-    ctx: &SessionContext,
-) -> Result<Option<(MaybeTls<TcpStream>, MaybeTls<TcpStream>)>, Error> {
+async fn start_session(client: TcpStream, ctx: &SessionContext) -> Result<Option<Started>, Error> {
     let (upstream_addr, tls) = (ctx.upstream_addr.as_str(), &ctx.tls);
     let mut client = MaybeTls::Plain(client);
 
@@ -145,7 +190,31 @@ async fn start_session(
         None => MaybeTls::Plain(upstream_tcp),
     };
     upstream.write_all(&startup).await?;
-    Ok(Some((client, upstream)))
+    Ok(Some(Started { client, upstream, search_path_trusted: search_path_is_default(&startup) }))
+}
+
+/// Whether the startup packet leaves unqualified table names resolving to
+/// `public`, which is what the write catalog assumes. Drivers can set
+/// `search_path` as a startup parameter or through `options=-c search_path=…`;
+/// either way the assumption no longer holds and the rewriter stops resolving
+/// bare names.
+fn search_path_is_default(startup: &[u8]) -> bool {
+    let Some(mut params) = startup.get(pgwire::STARTUP_HEADER_LEN..) else { return true };
+    while let Ok(key) = pgwire::take_cstr(&mut params) {
+        if key.is_empty() {
+            break;
+        }
+        let Ok(value) = pgwire::take_cstr(&mut params) else { break };
+        let mentions_search_path = match key {
+            b"search_path" => value != b"public",
+            b"options" => value.windows(11).any(|w| w == b"search_path"),
+            _ => false,
+        };
+        if mentions_search_path {
+            return false;
+        }
+    }
+    true
 }
 
 /// Sends SSLRequest upstream and requires the `S` answer; a server that
@@ -211,10 +280,20 @@ fn encode_frame_header(
     Ok(header)
 }
 
-/// Copies framed messages from `reader` to `writer` until EOF at a frame
-/// boundary, passing each frame through `transform` (which returns a
-/// replacement body, or `None` to relay untouched). EOF mid-frame is an
-/// error; frames with invalid lengths or failing transforms abort the
+/// The two writers one relay can reach. `forward` is its own direction;
+/// `back` is the peer's, which is where a [`FrameAction::Reply`] goes so the
+/// sender can be answered without forwarding anything. Both are shared with
+/// the opposite relay, which is why they are behind a mutex — whole frames
+/// are written under the lock, so the two directions never interleave inside
+/// a message.
+struct Writers<W, B> {
+    forward: Arc<Mutex<W>>,
+    back: Arc<Mutex<B>>,
+}
+
+/// Copies framed messages from `reader` to `writers.forward` until EOF at a
+/// frame boundary, passing each frame through `transform`. EOF mid-frame is
+/// an error; frames with invalid lengths or failing transforms abort the
 /// session rather than desyncing the relay or leaking ciphertext.
 ///
 /// `shutdown` is observed *only between frames*: a rewritten frame is a
@@ -227,9 +306,9 @@ fn encode_frame_header(
 /// abandoned socket, so an idle reaper would drop working connections. The
 /// exhaustion risk is bounded at admission instead (`max_sessions` in
 /// `main::accept_loop`) and before the relay by the startup deadline.
-async fn relay<R, W, T>(
+async fn relay<R, W, B, T>(
     mut reader: R,
-    mut writer: W,
+    writers: Writers<W, B>,
     direction: &str,
     mut transform: T,
     mut shutdown: ShutdownRx,
@@ -237,8 +316,10 @@ async fn relay<R, W, T>(
 where
     R: AsyncRead + Unpin,
     W: AsyncWrite + Unpin,
-    T: FnMut(u8, &[u8]) -> Result<Option<Vec<u8>>, Error>,
+    B: AsyncWrite + Unpin,
+    T: FnMut(u8, &[u8]) -> Result<FrameAction, Error>,
 {
+    let Writers { forward, back } = writers;
     let mut header = [0u8; pgwire::FRAME_HEADER_LEN];
     let mut body = Vec::new();
     loop {
@@ -250,14 +331,14 @@ where
             read = reader.read_exact(&mut header) => read,
             _ = shutdown.changed() => {
                 tracing::debug!(direction, "shutdown at frame boundary; closing relay");
-                writer.shutdown().await.ok();
+                forward.lock().await.shutdown().await.ok();
                 return Ok(());
             }
         };
         match next {
             Ok(_) => {}
             Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
-                writer.shutdown().await.ok();
+                forward.lock().await.shutdown().await.ok();
                 return Ok(());
             }
             Err(e) => return Err(e.into()),
@@ -273,17 +354,30 @@ where
             tracing::error!(direction, msg_type = %(msg_type as char), error = %e, "transform failed; closing session");
             e
         })? {
-            Some(new_body) => {
+            FrameAction::Replace(new_body) => {
                 let new_header = encode_frame_header(msg_type, new_body.len()).map_err(|e| {
                     tracing::error!(direction, error = %e, "rewritten frame too large; closing session");
                     e
                 })?;
+                let mut writer = forward.lock().await;
                 writer.write_all(&new_header).await?;
                 writer.write_all(&new_body).await?;
             }
-            None => {
+            FrameAction::Relay => {
+                let mut writer = forward.lock().await;
                 writer.write_all(&header).await?;
                 writer.write_all(&body).await?;
+            }
+            FrameAction::Reply(frames) => {
+                tracing::debug!(
+                    direction,
+                    msg_type = %(msg_type as char),
+                    answered = !frames.is_empty(),
+                    "frame withheld from the peer"
+                );
+                if !frames.is_empty() {
+                    back.lock().await.write_all(&frames).await?;
+                }
             }
         }
         // Give a one-off large frame's buffer back instead of reserving it for
@@ -370,19 +464,28 @@ mod tests {
         (addr, task)
     }
 
+    /// A writer both a relay and its test can look at.
+    fn sink() -> Arc<Mutex<Vec<u8>>> {
+        Arc::new(Mutex::new(Vec::new()))
+    }
+
     #[tokio::test]
     async fn relay_rewrites_transformed_frames_and_lengths() {
         let (_shutdown_tx, shutdown) = no_shutdown();
         let mut input = frame(b'D', b"old");
         input.extend_from_slice(&frame(b'Z', b"I"));
-        let mut output = Vec::new();
+        let (output, back) = (sink(), sink());
         relay(
             input.as_slice(),
-            &mut output,
+            Writers { forward: output.clone(), back: back.clone() },
             "test",
             |msg_type, body| {
                 assert!(matches!(msg_type, b'D' | b'Z'));
-                Ok((msg_type == b'D' && body == b"old").then(|| b"rewritten".to_vec()))
+                Ok(if msg_type == b'D' && body == b"old" {
+                    FrameAction::Replace(b"rewritten".to_vec())
+                } else {
+                    FrameAction::Relay
+                })
             },
             shutdown,
         )
@@ -391,24 +494,69 @@ mod tests {
 
         let mut expected = frame(b'D', b"rewritten");
         expected.extend_from_slice(&frame(b'Z', b"I"));
-        assert_eq!(output, expected);
+        assert_eq!(*output.lock().await, expected);
+        assert!(back.lock().await.is_empty());
+    }
+
+    /// A refused frame reaches neither peer; the answer goes back the way it
+    /// came, and the relay stays in sync for the frames that follow.
+    #[tokio::test]
+    async fn relay_answers_the_sender_without_forwarding() {
+        let (_shutdown_tx, shutdown) = no_shutdown();
+        let mut input = frame(b'Q', b"refuse me");
+        input.extend_from_slice(&frame(b'Q', b"fine"));
+        let (output, back) = (sink(), sink());
+        relay(
+            input.as_slice(),
+            Writers { forward: output.clone(), back: back.clone() },
+            "test",
+            |_, body| {
+                Ok(if body == b"refuse me" {
+                    FrameAction::Reply(frame(b'E', b"nope"))
+                } else {
+                    FrameAction::Relay
+                })
+            },
+            shutdown,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(*output.lock().await, frame(b'Q', b"fine"));
+        assert_eq!(*back.lock().await, frame(b'E', b"nope"));
     }
 
     #[tokio::test]
     async fn relay_fails_closed_on_transform_error() {
         let (_shutdown_tx, shutdown) = no_shutdown();
         let input = frame(b'D', b"boom");
-        let mut output = Vec::new();
-        let result = relay(
+        let (output, back) = (sink(), sink());
+        relay(
             input.as_slice(),
-            &mut output,
+            Writers { forward: output.clone(), back },
             "test",
             |_, _| Err(Error::Wire(dbsec_core::Error::Decrypt)),
             shutdown,
         )
-        .await;
-        assert!(result.is_err());
-        assert!(output.is_empty());
+        .await
+        .unwrap_err();
+        assert!(output.lock().await.is_empty());
+    }
+
+    #[test]
+    fn startup_parameters_reveal_a_moved_search_path() {
+        let startup = |params: &[u8]| {
+            let mut msg = ((8 + params.len()) as i32).to_be_bytes().to_vec();
+            msg.extend_from_slice(&pgwire::PROTOCOL_V3.to_be_bytes());
+            msg.extend_from_slice(params);
+            msg
+        };
+        assert!(search_path_is_default(&startup(b"user\0test\0\0")));
+        assert!(search_path_is_default(&startup(b"search_path\0public\0\0")));
+        assert!(!search_path_is_default(&startup(b"search_path\0tenant7\0\0")));
+        assert!(!search_path_is_default(&startup(b"options\0-c search_path=tenant7\0\0")));
+        // A cancel request has no parameter section at all.
+        assert!(search_path_is_default(&startup(b"")));
     }
 
     #[test]
@@ -437,39 +585,39 @@ mod tests {
     async fn relay_fails_closed_on_an_oversized_rewritten_body() {
         let (_shutdown_tx, shutdown) = no_shutdown();
         let input = frame(b'D', b"small");
-        let mut output = Vec::new();
+        let (output, back) = (sink(), sink());
         let result = relay(
             input.as_slice(),
-            &mut output,
+            Writers { forward: output.clone(), back },
             "test",
             |_, _| {
                 // Zeroed pages: the buffer is never written to and the header
                 // check rejects it before any I/O, so this costs address
                 // space rather than resident memory.
-                Ok(Some(vec![0u8; pgwire::MAX_MESSAGE_LEN + 1]))
+                Ok(FrameAction::Replace(vec![0u8; pgwire::MAX_MESSAGE_LEN + 1]))
             },
             shutdown,
         )
         .await;
         assert!(matches!(result, Err(Error::FrameTooLarge { .. })));
-        assert!(output.is_empty(), "no corrupt header may reach the wire");
+        assert!(output.lock().await.is_empty(), "no corrupt header may reach the wire");
     }
 
     #[tokio::test]
     async fn relay_stops_at_a_frame_boundary_on_shutdown() {
         let (shutdown_tx, shutdown) = no_shutdown();
         let (mut feed, reader) = tokio::io::duplex(1024);
-        let (writer, mut sink) = tokio::io::duplex(1024);
-        let relaying =
-            tokio::spawn(
-                async move { relay(reader, writer, "test", |_, _| Ok(None), shutdown).await },
-            );
+        let (writer, mut peer) = tokio::io::duplex(1024);
+        let writers = Writers { forward: Arc::new(Mutex::new(writer)), back: sink() };
+        let relaying = tokio::spawn(async move {
+            relay(reader, writers, "test", |_, _| Ok(FrameAction::Relay), shutdown).await
+        });
 
         // Reading the whole frame back proves the relay is parked on the next
         // header read, not mid-write, when the signal arrives.
         feed.write_all(&frame(b'Z', b"I")).await.unwrap();
         let mut relayed = vec![0u8; pgwire::FRAME_HEADER_LEN + 1];
-        sink.read_exact(&mut relayed).await.unwrap();
+        peer.read_exact(&mut relayed).await.unwrap();
         assert_eq!(relayed, frame(b'Z', b"I"));
 
         shutdown_tx.send(true).unwrap();
