@@ -3,11 +3,11 @@ id: TASK-0019
 title: >-
   SEC-29: the keyfile and token file are read with no permission check, and no
   warning if world-readable
-status: To Do
+status: Done
 assignee:
   - TASK-0053
 created_date: '2026-08-11 19:15'
-updated_date: '2026-08-11 22:42'
+updated_date: '2026-08-12 16:51'
 labels:
   - code-review-rust
   - security
@@ -40,8 +40,8 @@ Two related notes for the same change:
 
 ## Acceptance Criteria
 <!-- AC:BEGIN -->
-- [ ] #1 keys_file and token_file are rejected (or loudly warned about, with the decision documented) when group- or world-readable on unix
-- [ ] #2 The check has a documented behaviour on non-unix targets rather than a compile error
-- [ ] #3 A test with tempfile covers both the 0600 accept and the 0644 reject paths
-- [ ] #4 The token file is read once per startup rather than once in validate and again in connect
+- [x] #1 keys_file and token_file are rejected (or loudly warned about, with the decision documented) when group- or world-readable on unix
+- [x] #2 The check has a documented behaviour on non-unix targets rather than a compile error
+- [x] #3 A test with tempfile covers both the 0600 accept and the 0644 reject paths
+- [x] #4 The token file is read once per startup rather than once in validate and again in connect
 <!-- AC:END -->

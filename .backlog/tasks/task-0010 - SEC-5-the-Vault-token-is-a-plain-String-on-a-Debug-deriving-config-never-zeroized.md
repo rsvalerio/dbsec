@@ -3,11 +3,11 @@ id: TASK-0010
 title: >-
   SEC-5: the Vault token is a plain String on a Debug-deriving config, never
   zeroized
-status: To Do
+status: Done
 assignee:
   - TASK-0053
 created_date: '2026-08-11 19:12'
-updated_date: '2026-08-11 22:42'
+updated_date: '2026-08-12 16:51'
 labels:
   - code-review-rust
   - security
@@ -49,8 +49,8 @@ Contrast the DEK handling in the same crate, which does this correctly — `Key`
 
 ## Acceptance Criteria
 <!-- AC:BEGIN -->
-- [ ] #1 The token field is a secret-carrying type whose Debug impl redacts the value (manual impl, secrecy::SecretString, or a newtype over Zeroizing<String>)
-- [ ] #2 The token_file read path zeroizes the file contents and any intermediate String
-- [ ] #3 Config::validate no longer materializes a throwaway copy of the token just to check resolvability, or the copy it makes is zeroized
-- [ ] #4 A test asserts that formatting Config/VaultConfig with {:?} does not contain the token value
+- [x] #1 The token field is a secret-carrying type whose Debug impl redacts the value (manual impl, secrecy::SecretString, or a newtype over Zeroizing<String>)
+- [x] #2 The token_file read path zeroizes the file contents and any intermediate String
+- [x] #3 Config::validate no longer materializes a throwaway copy of the token just to check resolvability, or the copy it makes is zeroized
+- [x] #4 A test asserts that formatting Config/VaultConfig with {:?} does not contain the token value
 <!-- AC:END -->

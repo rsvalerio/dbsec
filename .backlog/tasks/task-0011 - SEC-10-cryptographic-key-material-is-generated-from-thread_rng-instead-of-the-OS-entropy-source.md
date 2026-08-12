@@ -3,11 +3,11 @@ id: TASK-0011
 title: >-
   SEC-10: cryptographic key material is generated from thread_rng instead of the
   OS entropy source
-status: To Do
+status: Done
 assignee:
   - TASK-0053
 created_date: '2026-08-11 19:13'
-updated_date: '2026-08-11 22:42'
+updated_date: '2026-08-12 16:51'
 labels:
   - code-review-rust
   - security
@@ -35,6 +35,6 @@ SEC-10 asks for the OS entropy RNG for key generation and security tokens. On `r
 
 ## Acceptance Criteria
 <!-- AC:BEGIN -->
-- [ ] #1 Both key-material draws use rand::rngs::OsRng (or getrandom directly) rather than thread_rng
-- [ ] #2 A grep for thread_rng in non-test crate code returns nothing, or each remaining use is a documented non-cryptographic one
+- [x] #1 Both key-material draws use rand::rngs::OsRng (or getrandom directly) rather than thread_rng
+- [x] #2 A grep for thread_rng in non-test crate code returns nothing, or each remaining use is a documented non-cryptographic one
 <!-- AC:END -->

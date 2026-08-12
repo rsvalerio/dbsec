@@ -3,11 +3,11 @@ id: TASK-0047
 title: >-
   SEC-5: control_dsn carries the database password in a plain String on a
   Debug-deriving Config
-status: To Do
+status: Done
 assignee:
   - TASK-0053
 created_date: '2026-08-11 21:05'
-updated_date: '2026-08-11 22:42'
+updated_date: '2026-08-12 16:51'
 labels:
   - code-review-rust
   - security
@@ -50,8 +50,8 @@ Startup failures make this concrete rather than hypothetical: connecting the con
 
 ## Acceptance Criteria
 <!-- AC:BEGIN -->
-- [ ] #1 control_dsn is a type whose Debug impl redacts the password while keeping host, port and database name legible
-- [ ] #2 The redacting type is used everywhere the DSN is held or passed, including the resolve::resolve_columns call site
-- [ ] #3 A test asserts that formatting a Config containing a password-bearing control_dsn does not emit the password
-- [ ] #4 A test asserts the redacted form still shows host, port and database so startup diagnostics stay useful
+- [x] #1 control_dsn is a type whose Debug impl redacts the password while keeping host, port and database name legible
+- [x] #2 The redacting type is used everywhere the DSN is held or passed, including the resolve::resolve_columns call site
+- [x] #3 A test asserts that formatting a Config containing a password-bearing control_dsn does not emit the password
+- [x] #4 A test asserts the redacted form still shows host, port and database so startup diagnostics stay useful
 <!-- AC:END -->

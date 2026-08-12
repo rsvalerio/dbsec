@@ -3,11 +3,11 @@ id: TASK-0024
 title: >-
   SEC-5: FileKeySource leaves master key material in un-zeroized heap
   allocations
-status: To Do
+status: Done
 assignee:
   - TASK-0053
 created_date: '2026-08-11 19:23'
-updated_date: '2026-08-11 22:42'
+updated_date: '2026-08-12 16:51'
 labels:
   - code-review-rust
   - security
@@ -36,8 +36,8 @@ Note that TOML deserialization makes complete erasure best-effort — `toml` all
 
 ## Acceptance Criteria
 <!-- AC:BEGIN -->
-- [ ] #1 The keyfile contents read in FileKeySource::load are held in a zeroize-on-drop container rather than a plain String
-- [ ] #2 The hex key strings deserialized into KeyFile are zeroized when the KeyFile is dropped
-- [ ] #3 FileKeySource::generate writes hex key material into a zeroizing buffer without an intermediate un-zeroized String
-- [ ] #4 A comment records that toml's own intermediate allocations are outside this crate's control, so erasure is best-effort
+- [x] #1 The keyfile contents read in FileKeySource::load are held in a zeroize-on-drop container rather than a plain String
+- [x] #2 The hex key strings deserialized into KeyFile are zeroized when the KeyFile is dropped
+- [x] #3 FileKeySource::generate writes hex key material into a zeroizing buffer without an intermediate un-zeroized String
+- [x] #4 A comment records that toml's own intermediate allocations are outside this crate's control, so erasure is best-effort
 <!-- AC:END -->
