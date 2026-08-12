@@ -150,8 +150,13 @@ fn control_host(dsn: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
+    use dbsec_core::keys::KeySource;
+
     use super::*;
     use crate::config::Config;
+    use crate::rows::tests::OneKey;
 
     #[test]
     fn control_host_names_the_endpoint_without_the_password() {
@@ -196,17 +201,6 @@ mod tests {
         assert!(started.elapsed() < Duration::from_secs(5), "the deadline did not fire");
         accepting.abort();
     }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use std::sync::Arc;
-
-    use dbsec_core::keys::KeySource;
-
-    use crate::config::Config;
-    use crate::rows::tests::OneKey;
 
     /// One `[[column]]` per read-path shape the filter has to tell apart.
     fn protected() -> Vec<ProtectedColumn> {
