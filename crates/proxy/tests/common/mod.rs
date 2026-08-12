@@ -57,6 +57,12 @@ pub fn port_vault() -> u16 {
     port_at(3)
 }
 
+/// The `COPY` case runs alongside the tokio-postgres suite in the same binary,
+/// so it needs its own port (and its own table) rather than its own binary.
+pub fn port_copy() -> u16 {
+    port_at(4)
+}
+
 pub fn dsn() -> String {
     std::env::var("DBSEC_E2E_DSN").unwrap_or_else(|_| DEFAULT_DSN.to_owned())
 }
@@ -118,11 +124,19 @@ pub struct ProxyOpts<'a> {
     pub port: u16,
     pub table: &'a str,
     pub keys: Keys,
+    /// `on_unprotected = "reject"`: refuse statements the rewrite cannot cover
+    /// instead of relaying them with a warning.
+    pub strict: bool,
 }
 
 impl<'a> ProxyOpts<'a> {
     pub fn file_keys(port: u16, table: &'a str) -> Self {
-        Self { port, table, keys: Keys::File }
+        Self { port, table, keys: Keys::File, strict: false }
+    }
+
+    pub fn strict(mut self) -> Self {
+        self.strict = true;
+        self
     }
 }
 
@@ -191,6 +205,7 @@ listen = "127.0.0.1:{port}"
 upstream = "{upstream}"
 control_dsn = "{dsn}"
 {key_source}
+{on_unprotected}
 
 [tls.downstream]
 cert = {cert:?}
@@ -219,6 +234,8 @@ mask = {{ keep_first = 2 }}
 "#,
         port = opts.port,
         table = opts.table,
+        on_unprotected =
+            if opts.strict { "on_unprotected = \"reject\"" } else { "on_unprotected = \"warn\"" },
         upstream = upstream_addr(),
         dsn = dsn(),
         cert = cert_path(dir),

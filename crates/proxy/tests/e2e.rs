@@ -8,8 +8,13 @@
 mod common;
 
 use common::port_tokio_postgres as port;
+use futures_util::{pin_mut, SinkExt as _, StreamExt as _};
 
 const TABLE: &str = "users";
+
+/// The `COPY` case gets its own table and port: `create_table` drops the table
+/// first, and the two tests in this binary run concurrently.
+const COPY_TABLE: &str = "users_copy";
 
 #[tokio::test]
 #[ignore = "needs the Postgres from `make e2e`"]
@@ -94,4 +99,106 @@ async fn transparent_encryption_end_to_end() {
     let stored3 = direct.query_one("SELECT email FROM users WHERE id = 3", &[]).await.unwrap();
     let email3: Vec<u8> = stored3.get(0);
     assert_eq!(email[..32], email3[..32], "equal plaintexts share the blind index");
+}
+
+/// `COPY` is the one write path the SQL rewrite cannot reach: its payload
+/// arrives as `CopyData` frames, not as SQL. This case pins down both halves
+/// of the decision recorded in `plans/PLAN.md` — that `COPY` is refused rather
+/// than encrypted — against the real binary:
+///
+/// - under the default `on_unprotected = "warn"`, `COPY ... FROM` stores
+///   plaintext in a protected column and `COPY ... TO` hands back the stored
+///   form, which for a mask-only column is the *unmasked* value;
+/// - under `on_unprotected = "reject"`, both directions are refused with an
+///   ErrorResponse the session survives.
+#[tokio::test]
+#[ignore = "needs the Postgres from `make e2e`"]
+async fn copy_bypasses_the_rewrite_and_is_refused_in_strict_mode() {
+    let direct = common::connect_direct().await;
+    common::create_table(&direct, COPY_TABLE).await;
+
+    let dir = tempfile::tempdir().unwrap();
+    let opts = common::ProxyOpts::file_keys(common::port_copy(), COPY_TABLE);
+    let proxy = common::spawn_proxy(dir.path(), &opts).await;
+    let client = common::connect_via_proxy(dir.path(), common::port_copy()).await;
+
+    // A normal INSERT through the proxy: phone is FPE'd, note is stored raw
+    // and masked on the way out. This is the baseline COPY is compared to.
+    client
+        .execute(
+            "INSERT INTO users_copy (phone, ssn, note) VALUES ($1, $2, $3)",
+            &[&"555-123-4567", &"078-05-1120", &"topsecret"],
+        )
+        .await
+        .unwrap();
+
+    // --- COPY FROM under `warn`: the plaintext lands in the column. ---
+    let sink = client.copy_in("COPY users_copy (phone, ssn, note) FROM STDIN").await.unwrap();
+    pin_mut!(sink);
+    sink.send(&b"555-999-8888\t219-09-9999\tbulkloaded\n"[..]).await.unwrap();
+    assert_eq!(sink.finish().await.unwrap(), 1);
+
+    let bulk = direct
+        .query_one("SELECT phone, note FROM users_copy WHERE note = 'bulkloaded'", &[])
+        .await
+        .unwrap();
+    assert_eq!(
+        bulk.get::<_, &str>(0),
+        "555-999-8888",
+        "COPY FROM is not encrypted: the plaintext is at rest, which is why it is a refusal site"
+    );
+
+    // --- COPY TO under `warn`: the read path never sees the rows. ---
+    // A normal read through the proxy masks the column...
+    let rows = client.query("SELECT note FROM users_copy ORDER BY id", &[]).await.unwrap();
+    assert_eq!(
+        rows[0].get::<_, &str>(0),
+        "to*******",
+        "a mask-only column is masked on a normal read"
+    );
+
+    // ...but COPY TO bypasses DataRow interception entirely.
+    let stream = client.copy_out("COPY users_copy (note) TO STDOUT").await.unwrap();
+    pin_mut!(stream);
+    let mut copied = Vec::new();
+    while let Some(chunk) = stream.next().await {
+        copied.extend_from_slice(&chunk.unwrap());
+    }
+    let copied = String::from_utf8(copied).unwrap();
+    assert!(
+        copied.contains("topsecret"),
+        "COPY TO leaks the unmasked stored form, which is why it is a refusal site: {copied}"
+    );
+
+    // --- `on_unprotected = "reject"`: both directions refused. ---
+    proxy.shutdown().await;
+    let _strict = common::spawn_proxy(dir.path(), &opts.strict()).await;
+    let client = common::connect_via_proxy(dir.path(), common::port_copy()).await;
+
+    // `CopyInSink`/`CopyOutStream` are not `Debug`, so the Ok side cannot be
+    // unwrapped away — match the error out instead.
+    // `tokio_postgres::Error`'s own Display is just "db error"; the proxy's
+    // text is in the ErrorResponse it wraps.
+    let refusal = |error: tokio_postgres::Error| {
+        let db = error.as_db_error().expect("a PostgreSQL ErrorResponse, not a dropped connection");
+        assert_eq!(db.code(), &tokio_postgres::error::SqlState::INSUFFICIENT_PRIVILEGE);
+        db.message().to_owned()
+    };
+
+    let Err(error) = client.copy_in::<_, &[u8]>("COPY users_copy (phone) FROM STDIN").await else {
+        panic!("strict mode must refuse COPY FROM")
+    };
+    let message = refusal(error);
+    assert!(message.contains("dbsec refused this statement"), "{message}");
+    assert!(message.contains("COPY into protected table users_copy"), "{message}");
+
+    let Err(error) = client.copy_out("COPY users_copy (note) TO STDOUT").await else {
+        panic!("strict mode must refuse COPY TO")
+    };
+    let message = refusal(error);
+    assert!(message.contains("COPY from protected table users_copy"), "{message}");
+
+    // The refusal is statement-level: the session is still usable.
+    let rows = client.query("SELECT id FROM users_copy ORDER BY id", &[]).await.unwrap();
+    assert_eq!(rows.len(), 2);
 }
