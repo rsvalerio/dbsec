@@ -3,11 +3,11 @@ id: TASK-0059
 title: >-
   ERR-2: VaultKeySource flattens vaultrs and base64 errors into
   Error::KeySource(String)
-status: To Do
+status: Done
 assignee:
   - TASK-0065
 created_date: '2026-08-12 11:03'
-updated_date: '2026-08-12 18:42'
+updated_date: '2026-08-12 19:12'
 labels:
   - code-review-rust
   - errors
@@ -52,6 +52,6 @@ routing its backend failures through the core error type. `Error` is already
 
 ## Acceptance Criteria
 <!-- AC:BEGIN -->
-- [ ] #1 Vault key source failures carry their underlying cause (vaultrs error, base64/hex decode error) via #[source] rather than a formatted String
-- [ ] #2 std::error::Error::source() returns the backend cause for errors originating in VaultKeySource
+- [x] #1 Vault key source failures carry their underlying cause (vaultrs error, base64/hex decode error) via #[source] rather than a formatted String
+- [x] #2 std::error::Error::source() returns the backend cause for errors originating in VaultKeySource
 <!-- AC:END -->

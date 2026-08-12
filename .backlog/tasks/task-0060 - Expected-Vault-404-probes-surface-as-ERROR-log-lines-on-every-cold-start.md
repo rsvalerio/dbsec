@@ -1,11 +1,11 @@
 ---
 id: TASK-0060
 title: Expected Vault 404 probes surface as ERROR log lines on every cold start
-status: To Do
+status: Done
 assignee:
   - TASK-0065
 created_date: '2026-08-12 16:14'
-updated_date: '2026-08-12 18:42'
+updated_date: '2026-08-12 19:21'
 labels:
   - code-review-rust
   - observability
@@ -40,6 +40,14 @@ The fix is on the tracing side, not the key logic: the levels come from the `vau
 
 ## Acceptance Criteria
 <!-- AC:BEGIN -->
-- [ ] #1 An ordinary cold start that mints index keys produces no ERROR-level log lines
-- [ ] #2 A genuine Vault failure (5xx, 403, revoked token) is still visible at ERROR
+- [x] #1 An ordinary cold start that mints index keys produces no ERROR-level log lines
+- [x] #2 A genuine Vault failure (5xx, 403, revoked token) is still visible at ERROR
 <!-- AC:END -->
+
+## Implementation Notes
+
+<!-- SECTION:NOTES:BEGIN -->
+Default subscriber filter is now `info,vaultrs=off,rustify=off` (DEFAULT_LOG_FILTER in main.rs): the expected-absence 404 probes are logged at ERROR from inside vaultrs/rustify, so those targets are silenced rather than lowered. AC2 is kept by the handling site instead: session failures caused by the key backend (KeyBackend/KeySource) now log at ERROR via log_session_error, everything else stays WARN, and startup failures already logged at ERROR. Pinned by two unit tests in main.rs. RUST_LOG, when set, still owns the filter entirely.
+
+Verified live against a dev-mode OpenBao (make e2e-vault): a cold start now mints three index keys with zero ERROR lines. That run also required fixing the e2e config fixture, which wrote on_unprotected after the [vault] table so the proxy refused the config.
+<!-- SECTION:NOTES:END -->
