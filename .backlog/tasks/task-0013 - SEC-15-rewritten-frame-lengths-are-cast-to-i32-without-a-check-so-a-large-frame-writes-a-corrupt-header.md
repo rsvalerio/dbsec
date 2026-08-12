@@ -3,11 +3,11 @@ id: TASK-0013
 title: >-
   SEC-15: rewritten frame lengths are cast to i32 without a check, so a large
   frame writes a corrupt header
-status: To Do
+status: Done
 assignee:
   - TASK-0051
 created_date: '2026-08-11 19:13'
-updated_date: '2026-08-11 22:42'
+updated_date: '2026-08-12 10:46'
 labels:
   - code-review-rust
   - security
@@ -45,7 +45,18 @@ Related unchecked `as i32` length casts exist in `crates/core/src/pgwire.rs` (`e
 
 ## Acceptance Criteria
 <!-- AC:BEGIN -->
-- [ ] #1 The rewritten body length is checked against MAX_MESSAGE_LEN and i32 range before the header is written; overflow fails the session with a clear error rather than truncating
-- [ ] #2 The header construction no longer relies on filling the array with msg_type and overwriting bytes 1..5 — it reads as what it is
-- [ ] #3 A test covers a transform returning an oversized body and asserts the session errors instead of emitting a corrupt header
+- [x] #1 The rewritten body length is checked against MAX_MESSAGE_LEN and i32 range before the header is written; overflow fails the session with a clear error rather than truncating
+- [x] #2 The header construction no longer relies on filling the array with msg_type and overwriting bytes 1..5 — it reads as what it is
+- [x] #3 A test covers a transform returning an oversized body and asserts the session errors instead of emitting a corrupt header
 <!-- AC:END -->
+
+## Implementation Notes
+
+<!-- SECTION:NOTES:BEGIN -->
+Fixed in wave TASK-0051 (branch code-review/TASK-0051), together with TASK-0043 — both target the same three lines of `relay`.
+
+- AC #1 + #2: the `[msg_type; 5]`-then-overwrite construction is replaced by `session::encode_frame_header(msg_type, body_len)`, which does `checked_add(4)`, rejects anything over `pgwire::MAX_MESSAGE_LEN`, and uses `i32::try_from` instead of `as i32`. Overflow fails the session with the new `Error::FrameTooLarge { msg_type, body_len, max }` — the same fail-closed shape as an inbound bad length.
+- AC #3: `session::tests::relay_fails_closed_on_an_oversized_rewritten_body` drives `relay` with a transform returning a `MAX_MESSAGE_LEN + 1` body and asserts `Error::FrameTooLarge` with nothing written to the writer. `frame_header_rejects_oversized_bodies_instead_of_truncating` covers the boundary either side (MAX-4 ok, MAX / i32::MAX / usize::MAX rejected).
+
+The related unchecked `as i32` casts in `crates/core/src/pgwire.rs` (`encode_data_row`, `encode_bind`) noted in the description are out of this wave's file scope and are already the subject of wave6 (TASK-0055, pgwire codec hardening).
+<!-- SECTION:NOTES:END -->

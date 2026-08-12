@@ -1,11 +1,11 @@
 ---
 id: TASK-0051
 title: code-review-plan-wave2
-status: To Do
+status: Done
 assignee:
   - code-review-wave
 created_date: '2026-08-11 22:41'
-updated_date: '2026-08-11 22:41'
+updated_date: '2026-08-12 10:49'
 labels:
   - code-review-wave
 dependencies:
@@ -30,4 +30,6 @@ Session lifecycle and the relay loop: admission control, deadlines on the client
 
 <!-- SECTION:NOTES:BEGIN -->
 Overlaps: TASK-0050 wave1 (session.rs, main.rs); TASK-0053 wave4, TASK-0056 wave7 (crates/proxy/src/main.rs)
+
+Branch: code-review/TASK-0051
 <!-- SECTION:NOTES:END -->

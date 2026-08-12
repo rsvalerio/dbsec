@@ -3,11 +3,11 @@ id: TASK-0015
 title: >-
   CONC-6: Ctrl-C drops the runtime with sessions mid-frame, truncating rewritten
   writes
-status: To Do
+status: Done
 assignee:
   - TASK-0051
 created_date: '2026-08-11 19:14'
-updated_date: '2026-08-11 22:42'
+updated_date: '2026-08-12 10:46'
 labels:
   - code-review-rust
   - concurrency
@@ -44,8 +44,19 @@ Worth handling `SIGTERM` alongside `SIGINT` in the same change — a container r
 
 ## Acceptance Criteria
 <!-- AC:BEGIN -->
-- [ ] #1 Sessions are tracked (JoinSet or equivalent) and awaited on shutdown up to a bounded drain deadline
-- [ ] #2 A shutdown signal reaches sessions so a relay finishes the frame it is mid-write on before closing
-- [ ] #3 SIGTERM triggers the same path as SIGINT on unix
-- [ ] #4 Shutdown logs how many sessions drained and how many were aborted at the deadline
+- [x] #1 Sessions are tracked (JoinSet or equivalent) and awaited on shutdown up to a bounded drain deadline
+- [x] #2 A shutdown signal reaches sessions so a relay finishes the frame it is mid-write on before closing
+- [x] #3 SIGTERM triggers the same path as SIGINT on unix
+- [x] #4 Shutdown logs how many sessions drained and how many were aborted at the deadline
 <!-- AC:END -->
+
+## Implementation Notes
+
+<!-- SECTION:NOTES:BEGIN -->
+Fixed in wave TASK-0051 (branch code-review/TASK-0051).
+
+- AC #1: sessions are spawned into a `JoinSet` owned by `serve` instead of detached `tokio::spawn`s. `drain_sessions` awaits them for `SHUTDOWN_DRAIN_TIMEOUT` (10s) and then `JoinSet::shutdown()`s the remainder. The accept loop also reaps completed sessions with `join_next` so the set does not grow one entry per connection.
+- AC #2: a `tokio::sync::watch<bool>` reaches every session (`session::ShutdownRx`). `relay` observes it in a `biased` `select!` *only* while waiting for the next frame header — never between the header write and the body write — so a rewritten frame is always finished before the relay closes. A dropped sender counts as shutdown too, which is what makes an early `serve` return also close sessions.
+- AC #3: `shutdown_signal()` selects over SIGINT and, on unix, SIGTERM (`SignalKind::terminate()`), with a documented fallback to SIGINT-only if the SIGTERM handler cannot be installed.
+- AC #4: `drain_sessions` returns and logs `(drained, aborted)` plus the deadline. `main::tests::drain_sessions_waits_then_aborts_at_the_deadline` asserts `(1, 1)` for one finished and one pending session, and `(0, 0)` for an empty set.
+<!-- SECTION:NOTES:END -->

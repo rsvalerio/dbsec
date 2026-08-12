@@ -3,11 +3,11 @@ id: TASK-0043
 title: >-
   READ-1: the rewritten frame header is built by filling all five bytes with the
   message type, then overwriting four
-status: To Do
+status: Done
 assignee:
   - TASK-0051
 created_date: '2026-08-11 19:37'
-updated_date: '2026-08-11 22:42'
+updated_date: '2026-08-12 10:46'
 labels:
   - code-review-rust
   - readability
@@ -38,7 +38,19 @@ The literal `4` is also unexplained here, though `pgwire`'s module docs (`crates
 
 ## Acceptance Criteria
 <!-- AC:BEGIN -->
-- [ ] #1 The frame header is built so that each field is written exactly once and the byte layout is readable without cross-referencing two lines
-- [ ] #2 The +4 length convention is either named by a shared helper or carries a comment pointing at pgwire::frame_body_len
-- [ ] #3 Existing relay tests still assert the rewritten header bytes for a transformed frame
+- [x] #1 The frame header is built so that each field is written exactly once and the byte layout is readable without cross-referencing two lines
+- [x] #2 The +4 length convention is either named by a shared helper or carries a comment pointing at pgwire::frame_body_len
+- [x] #3 Existing relay tests still assert the rewritten header bytes for a transformed frame
 <!-- AC:END -->
+
+## Implementation Notes
+
+<!-- SECTION:NOTES:BEGIN -->
+Fixed in wave TASK-0051 (branch code-review/TASK-0051), together with TASK-0013.
+
+- AC #1: `session::encode_frame_header` starts from a zeroed array and writes each field exactly once (`header[0] = msg_type;` then `header[1..]` = the length), so the byte layout reads off the two lines directly.
+- AC #2: the helper is named, and its doc comment states the convention explicitly — the length counts itself but not the type byte, which is the same convention `pgwire::frame_body_len` inverts, "which is why the `+ 4` appears here and the `- 4` appears there".
+- AC #3: `session::tests::relay_rewrites_transformed_frames_and_lengths` still asserts the exact rewritten bytes; `frame_header_writes_each_field_once` additionally asserts the literal header bytes and round-trips them through `pgwire::frame_body_len`.
+
+The helper was kept private to `session.rs` rather than added to `dbsec_core::pgwire`: `crates/core/src/pgwire.rs` is wave6's (TASK-0055) file scope and AC #2 permits either a shared helper or a comment pointing at `frame_body_len` — this does both, without widening the wave's blast radius.
+<!-- SECTION:NOTES:END -->

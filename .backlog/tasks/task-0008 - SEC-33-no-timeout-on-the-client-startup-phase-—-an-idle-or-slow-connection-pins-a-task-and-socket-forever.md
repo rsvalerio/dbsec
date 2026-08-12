@@ -3,11 +3,11 @@ id: TASK-0008
 title: >-
   SEC-33: no timeout on the client startup phase — an idle or slow connection
   pins a task and socket forever
-status: To Do
+status: Done
 assignee:
   - TASK-0051
 created_date: '2026-08-11 19:12'
-updated_date: '2026-08-11 22:42'
+updated_date: '2026-08-12 10:45'
 labels:
   - code-review-rust
   - security
@@ -35,8 +35,19 @@ priority: high
 
 ## Acceptance Criteria
 <!-- AC:BEGIN -->
-- [ ] #1 The startup phase (first read through TLS handshake through the forwarded startup message) is wrapped in a single configurable deadline
-- [ ] #2 The downstream TLS handshake has its own timeout so a stalled handshake cannot pin the task
-- [ ] #3 An idle timeout applies to the relay loop, or the decision not to have one is documented with its rationale
-- [ ] #4 A test asserts that a client which connects and sends nothing is dropped within the deadline
+- [x] #1 The startup phase (first read through TLS handshake through the forwarded startup message) is wrapped in a single configurable deadline
+- [x] #2 The downstream TLS handshake has its own timeout so a stalled handshake cannot pin the task
+- [x] #3 An idle timeout applies to the relay loop, or the decision not to have one is documented with its rationale
+- [x] #4 A test asserts that a client which connects and sends nothing is dropped within the deadline
 <!-- AC:END -->
+
+## Implementation Notes
+
+<!-- SECTION:NOTES:BEGIN -->
+Fixed in wave TASK-0051 (branch code-review/TASK-0051).
+
+- `session::run` wraps the whole client-driven prologue (`start_session`: first read → TLS handshake → upstream connect → forwarded startup message) in one `tokio::time::timeout` set from the new `startup_timeout_secs` config option (default 30s, validated non-zero). Timeout surfaces as `Error::StartupTimeout`.
+- The downstream TLS handshake carries its own `TLS_HANDSHAKE_TIMEOUT` (10s) inside that deadline, surfacing as `Error::TlsHandshakeTimeout`.
+- AC #3: the decision *not* to add a relay idle timeout is documented on `relay`'s doc comment — a pooled pgwire session is legitimately idle for hours and the relay cannot tell that from an abandoned socket, so the exhaustion risk is bounded at admission (`max_sessions`, TASK-0009) and by the startup deadline instead.
+- AC #4: `session::tests::idle_client_is_dropped_at_the_startup_deadline` connects and sends nothing against a 100ms deadline and asserts `Error::StartupTimeout`.
+<!-- SECTION:NOTES:END -->
