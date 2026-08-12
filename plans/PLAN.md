@@ -108,7 +108,9 @@ TLS: `MaybeTls` stream enum both hops. Downstream handles `SSLRequest` from clie
    record, so minting column B cannot overwrite column A's key and two proxies racing
    to mint the same name cannot lose one; the loser adopts the winner's key. A failed
    read is an error, never "no keys yet". The pre-versioning shared-map layout is still
-   read and migrated on first touch. Every roundtrip is bounded by `[vault] timeout_secs`.
+   read and migrated on first touch, at WARN, leaving the old copy for an operator to
+   retire (see "Retiring the shared-map layout"). Every roundtrip is bounded by
+   `[vault] timeout_secs`.
    Needs live-server integration coverage in milestone 10)*
 10. **Hardening** — cargo-fuzz on the frame parser; driver integration suite (sqlx,
     psycopg) over TLS against dockerized Postgres. *(done; `fuzz/` has `pgwire`,
@@ -233,6 +235,44 @@ The honest summary: steps 4 and 5 are a migration the operator writes. What chan
 that the key material is versioned rather than stored under one unversioned name, so the
 migration has something to point at, and a partially completed rotation is a legible state
 rather than a lost key.
+
+### Retiring the shared-map layout
+
+Deployments predating the per-name layout kept every deterministic key in one shared KV
+secret at `{path}/index_keys`. A name still found there is copied into its own versioned
+secret on first touch and used from there — but the copy is not deleted, because deleting
+key material as a side effect of a read path is not a decision the proxy gets to make
+unprompted, and at that moment the destination write is not yet confirmed durable.
+
+So the same key lives at two paths until an operator retires the old one. That is worth
+doing: a policy granting read on the shared map still yields keys that are live at the new
+paths, and the duplicate is invisible to anyone auditing `{path}/index_keys/*`. Each
+migration announces itself with a WARN line naming the key, so a log capture from one full
+pass over the workload tells you which names came from the legacy layout.
+
+Cleanup is an operator step, run once the deployment has served every protected column at
+least once (that is what forces each name to migrate):
+
+1. **List both sides.** Read the shared map at `{path}/index_keys` and list the per-name
+   secrets under `{path}/index_keys/`.
+2. **Verify every name migrated.** For each name in the shared map, confirm
+   `{path}/index_keys/{name}` exists and that its `current` version holds the *same* key
+   material as the map. A name whose per-name secret is missing has not been touched
+   since the upgrade — connect and issue one query against that column, then re-check.
+   Never hand-copy it: a mistyped key is indistinguishable from a rotation and silently
+   invalidates the column's index.
+3. **Delete the shared secret and its history.** Deleting the latest version leaves the
+   old versions readable, so remove the metadata:
+   `bao kv metadata delete {mount}/{path}/index_keys`. In KV v2 the per-name secrets
+   under `{path}/index_keys/` are separate secrets, not children of that record, so they
+   are unaffected.
+4. **Narrow the policy.** Drop any read capability naming the shared path, so a
+   re-created secret cannot become a second source of truth.
+
+If step 2 cannot be completed — a column that no longer exists, a name nothing queries —
+the safe end state is to keep the shared map and its policy restricted rather than to
+delete material that no per-name secret carries. Losing a deterministic key is
+unrecoverable without a full re-index.
 
 ## Infra
 
