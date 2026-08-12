@@ -3,11 +3,11 @@ id: TASK-0032
 title: >-
   SEC-15: encode_data_row and encode_bind cast counts and lengths with unchecked
   as, silently emitting a corrupt frame
-status: To Do
+status: Done
 assignee:
   - TASK-0055
 created_date: '2026-08-11 19:26'
-updated_date: '2026-08-11 22:42'
+updated_date: '2026-08-12 10:51'
 labels:
   - code-review-rust
   - security
@@ -44,7 +44,13 @@ Cheapest honest fix: `i16::try_from(values.len())` / `i32::try_from(v.len())` re
 
 ## Acceptance Criteria
 <!-- AC:BEGIN -->
-- [ ] #1 Column counts, format counts and value lengths are converted with try_from rather than as, or the functions document an explicit precondition backed by a debug_assert
-- [ ] #2 If the encoders become fallible, callers in crates/proxy handle the new Result
-- [ ] #3 A test covers the over-limit case for at least the column-count path
+- [x] #1 Column counts, format counts and value lengths are converted with try_from rather than as, or the functions document an explicit precondition backed by a debug_assert
+- [x] #2 If the encoders become fallible, callers in crates/proxy handle the new Result
+- [x] #3 A test covers the over-limit case for at least the column-count path
 <!-- AC:END -->
+
+## Implementation Notes
+
+<!-- SECTION:NOTES:BEGIN -->
+Fixed in code-review/TASK-0055: encode_data_row/encode_bind now return Result<Vec<u8>, Error>. Counts go through a private wire_count() (i16::try_from) and value lengths through push_nullable() (i32::try_from); both fail with the new Error::WireFieldOverflow instead of truncating. Callers updated: rows.rs on_frame (D path), encrypt.rs on_frame (B path) — both already propagate dbsec_core::Error via Error::Wire — plus tests, crates/core/tests/props.rs and fuzz/fuzz_targets/pgwire.rs (parsed input can never overflow, so .expect there). New unit test encoding_more_columns_than_the_count_field_holds_errors covers i16::MAX (ok) and i16::MAX + 1 (WireFieldOverflow) for both encoders. The value-length path is documented but not tested: it would need a 2 GiB allocation.
+<!-- SECTION:NOTES:END -->

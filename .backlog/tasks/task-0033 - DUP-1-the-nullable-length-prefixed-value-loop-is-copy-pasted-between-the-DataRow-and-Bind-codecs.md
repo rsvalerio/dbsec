@@ -3,11 +3,11 @@ id: TASK-0033
 title: >-
   DUP-1: the nullable length-prefixed value loop is copy-pasted between the
   DataRow and Bind codecs
-status: To Do
+status: Done
 assignee:
   - TASK-0055
 created_date: '2026-08-11 19:26'
-updated_date: '2026-08-11 22:42'
+updated_date: '2026-08-12 10:51'
 labels:
   - code-review-rust
   - duplication
@@ -45,7 +45,13 @@ The extraction is small and obvious: `take_nullable(buf: &mut &[u8]) -> Result<O
 
 ## Acceptance Criteria
 <!-- AC:BEGIN -->
-- [ ] #1 A single private helper decodes a nullable length-prefixed value, used by both parse_data_row and parse_bind
-- [ ] #2 A single private helper encodes a nullable length-prefixed value, used by both encode_data_row and encode_bind
-- [ ] #3 Existing pgwire unit tests, property tests and fuzz targets still pass unchanged
+- [x] #1 A single private helper decodes a nullable length-prefixed value, used by both parse_data_row and parse_bind
+- [x] #2 A single private helper encodes a nullable length-prefixed value, used by both encode_data_row and encode_bind
+- [x] #3 Existing pgwire unit tests, property tests and fuzz targets still pass unchanged
 <!-- AC:END -->
+
+## Implementation Notes
+
+<!-- SECTION:NOTES:BEGIN -->
+Fixed in code-review/TASK-0055: added private take_nullable()/push_nullable() next to take/take_i16/skip_cstr in crates/core/src/pgwire.rs. parse_data_row and parse_bind now share take_nullable; encode_data_row and encode_bind share push_nullable, so the checked length conversion from TASK-0032 exists in exactly one place. Behaviour is unchanged: all pgwire unit tests and the props.rs roundtrip proptest pass untouched apart from .unwrap() on the now-fallible encoders. The fuzz target needed the same mechanical .expect() for that reason; its assertions are unchanged.
+<!-- SECTION:NOTES:END -->

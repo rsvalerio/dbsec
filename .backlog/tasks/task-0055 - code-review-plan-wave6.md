@@ -1,11 +1,11 @@
 ---
 id: TASK-0055
 title: code-review-plan-wave6
-status: To Do
+status: Done
 assignee:
   - code-review-wave
 created_date: '2026-08-11 22:41'
-updated_date: '2026-08-11 22:42'
+updated_date: '2026-08-12 11:03'
 labels:
   - code-review-wave
 dependencies:
@@ -25,4 +25,6 @@ pgwire codec hardening: the two encoders narrow usize into fixed-width wire fiel
 
 <!-- SECTION:NOTES:BEGIN -->
 Overlaps: none
+
+Branch: code-review/TASK-0055
 <!-- SECTION:NOTES:END -->
