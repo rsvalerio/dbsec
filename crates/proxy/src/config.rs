@@ -19,11 +19,235 @@
 //!   plaintext; `COPY ... TO` bypasses the read path, so a masked column
 //!   leaves as its unmasked stored value. Both are `on_unprotected` sites.
 
+use std::fmt;
 use std::path::{Path, PathBuf};
 
 use serde::Deserialize;
+use zeroize::Zeroizing;
 
 use crate::Error;
+
+/// What a redacted secret renders as, in both [`Secret`] and [`Dsn`].
+const REDACTED: &str = "<redacted>";
+
+/// A configured credential, held in a buffer that is wiped when it drops and
+/// whose [`Debug`] never prints the value.
+///
+/// [`Config`] derives `Debug`, and the reason to derive it is that somebody
+/// eventually writes `?config` into a `tracing` call while chasing a startup
+/// failure. The Vault token is the credential that unwraps every DEK and reads
+/// every deterministic index key, so it is the one value in the config that
+/// must survive that without leaking. `expose` is deliberately ugly: it makes
+/// every read site greppable.
+///
+/// Erasure is best-effort at the edges. `serde` materialises the token in its
+/// own `String` before this type can take ownership of it, and `toml` keeps
+/// intermediate buffers of the whole config text — neither is reachable from
+/// here. What this removes is the copies the proxy itself owns and keeps.
+#[derive(Clone)]
+pub struct Secret(Zeroizing<String>);
+
+impl Secret {
+    pub fn new(value: String) -> Self {
+        Self(Zeroizing::new(value))
+    }
+
+    /// The credential itself, for the one call that has to send it.
+    pub fn expose(&self) -> &str {
+        &self.0
+    }
+}
+
+impl fmt::Debug for Secret {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(REDACTED)
+    }
+}
+
+impl<'de> Deserialize<'de> for Secret {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        String::deserialize(deserializer).map(Self::new)
+    }
+}
+
+/// A PostgreSQL connection string, printed with its password masked.
+///
+/// Unlike [`Secret`] the whole value is not sensitive: the scheme, user, host,
+/// port and database name are exactly what an operator needs when the control
+/// connection fails at boot, which is the most failure-prone step there is.
+/// Only the password is hidden, so a `?config` stays useful.
+#[derive(Clone, Deserialize)]
+pub struct Dsn(String);
+
+impl Dsn {
+    /// Configuration builds these through `serde`; only tests need to name one
+    /// directly, so the constructor does not exist outside them.
+    #[cfg(test)]
+    pub fn new(raw: String) -> Self {
+        Self(raw)
+    }
+
+    /// The connection string as `tokio_postgres` needs it.
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+
+    /// The connection string with any password replaced by [`REDACTED`].
+    ///
+    /// A value that is not a connection string at all is never echoed: it
+    /// cannot connect either, so there is nothing to lose by hiding it, and
+    /// masking a shape this function does not recognise is guesswork.
+    pub fn redacted(&self) -> String {
+        if self.0.parse::<tokio_postgres::Config>().is_err() {
+            return format!("<unparseable control_dsn {REDACTED}>");
+        }
+        redact_dsn(&self.0)
+    }
+}
+
+impl fmt::Debug for Dsn {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt::Debug::fmt(&self.redacted(), f)
+    }
+}
+
+/// Masked, like [`Debug`] — so `%dsn` in a `tracing` call is safe too. The raw
+/// string is reachable only through [`Dsn::as_str`].
+impl fmt::Display for Dsn {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.redacted())
+    }
+}
+
+/// Masks the password out of a connection string in either shape
+/// `tokio_postgres` accepts: the URL form (`postgres://user:pw@host/db`) and
+/// the libpq keyword/value form (`host=... password=...`). Everything else is
+/// preserved verbatim, because everything else is diagnostics.
+fn redact_dsn(dsn: &str) -> String {
+    let mut out = String::with_capacity(dsn.len());
+    let rest = match dsn.split_once("://") {
+        Some((scheme, rest)) => {
+            out.push_str(scheme);
+            out.push_str("://");
+            // Userinfo ends at the last `@` before the path or query starts.
+            let authority = rest.find(['/', '?']).unwrap_or(rest.len());
+            match rest[..authority].rfind('@') {
+                Some(at) => {
+                    let (userinfo, from_at) = rest.split_at(at);
+                    match userinfo.split_once(':') {
+                        Some((user, _)) => {
+                            out.push_str(user);
+                            out.push(':');
+                            out.push_str(REDACTED);
+                        }
+                        None => out.push_str(userinfo),
+                    }
+                    from_at
+                }
+                None => rest,
+            }
+        }
+        None => dsn,
+    };
+    mask_password_parameters(rest, &mut out);
+    out
+}
+
+/// Masks `password=<value>` wherever it appears as a parameter — a libpq
+/// keyword or a URL query parameter — leaving every other parameter legible.
+///
+/// Values may be single-quoted with backslash escapes (libpq's grammar), so a
+/// password containing a space cannot be masked by splitting on whitespace
+/// alone. Only ASCII bytes are ever compared, so this never cuts a multi-byte
+/// character in half.
+fn mask_password_parameters(input: &str, out: &mut String) {
+    const DELIMITERS: [u8; 6] = *b" \t&?/@";
+    let bytes = input.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if DELIMITERS.contains(&bytes[i]) {
+            out.push(char::from(bytes[i]));
+            i += 1;
+            continue;
+        }
+        let key_start = i;
+        while i < bytes.len() && bytes[i] != b'=' && !DELIMITERS.contains(&bytes[i]) {
+            i += 1;
+        }
+        let key = &input[key_start..i];
+        out.push_str(key);
+        if i >= bytes.len() || bytes[i] != b'=' {
+            continue;
+        }
+        out.push('=');
+        i += 1;
+        let value_start = i;
+        if bytes.get(i) == Some(&b'\'') {
+            i += 1;
+            while i < bytes.len() {
+                match bytes[i] {
+                    b'\\' => i += 2,
+                    b'\'' => {
+                        i += 1;
+                        break;
+                    }
+                    _ => i += 1,
+                }
+            }
+            i = i.min(bytes.len());
+        } else {
+            while i < bytes.len() && !matches!(bytes[i], b' ' | b'\t' | b'&') {
+                i += 1;
+            }
+        }
+        if key.eq_ignore_ascii_case("password") {
+            out.push_str(REDACTED);
+        } else {
+            out.push_str(&input[value_start..i]);
+        }
+    }
+}
+
+/// Refuses a secret file that anyone but its owner can read.
+///
+/// `keys_file` is every master key in plaintext hex and `[vault] token_file`
+/// is the credential that unwraps them, so a `0644` on either defeats the
+/// product outright — and `0644` is what `cp`, a Docker `COPY`, an editor that
+/// recreates the file on save, or a config-management template with no
+/// explicit mode all produce silently. `ssh` refuses a private key on the same
+/// grounds (SEC-29). Refusing rather than warning is deliberate: a startup
+/// warning scrolls past, and the failure mode this prevents is permanent.
+///
+/// A file that cannot be stat'ed is left alone. The read that follows reports
+/// the real I/O error with its path (ERR-13), which is a better message than
+/// anything this check could invent for a path that may not exist yet.
+#[cfg(unix)]
+fn check_secret_file_mode(path: &Path) -> Result<(), Error> {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let Ok(metadata) = std::fs::metadata(path) else {
+        return Ok(());
+    };
+    let mode = metadata.permissions().mode();
+    if mode & 0o077 != 0 {
+        return Err(Error::InvalidConfig(format!(
+            "{} is readable beyond its owner (mode {:04o}); it holds secret material — chmod 600 {}",
+            path.display(),
+            mode & 0o7777,
+            path.display()
+        )));
+    }
+    Ok(())
+}
+
+/// Non-unix targets have no `st_mode` to inspect and no equivalent this crate
+/// can check portably, so the check is a documented no-op there rather than a
+/// build failure. Secret-file permissions on those platforms are the
+/// deployment's responsibility.
+#[cfg(not(unix))]
+fn check_secret_file_mode(_path: &Path) -> Result<(), Error> {
+    Ok(())
+}
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -41,8 +265,9 @@ pub struct Config {
     pub vault: Option<VaultConfig>,
     /// DSN for the startup control connection that resolves configured
     /// columns to table OID + attnum. Required when any `[[column]]` is
-    /// configured, e.g. `postgres://dbsec:secret@127.0.0.1:5432/app`.
-    pub control_dsn: Option<String>,
+    /// configured, e.g. `postgres://dbsec:secret@127.0.0.1:5432/app`. Carries
+    /// a password, so it is a [`Dsn`] rather than a `String`: see that type.
+    pub control_dsn: Option<Dsn>,
     /// Deadline for the client-controlled startup phase: the first read, the
     /// downstream TLS handshake, the upstream connection, and forwarding the
     /// startup message. A client that stalls any of them is dropped here
@@ -139,7 +364,7 @@ pub struct VaultConfig {
     /// e.g. `https://bao.internal:8200`.
     pub addr: String,
     /// Static token; prefer `token_file` outside of dev.
-    pub token: Option<String>,
+    pub token: Option<Secret>,
     /// File containing the token (e.g. written by an agent sidecar).
     pub token_file: Option<PathBuf>,
     /// KV v2 mount holding wrapped DEKs and index keys.
@@ -163,13 +388,26 @@ pub struct VaultConfig {
 }
 
 impl VaultConfig {
-    pub fn token(&self) -> Result<String, Error> {
+    /// Resolves the token from whichever of the two sources is configured.
+    ///
+    /// Called once, by [`Config::validate`], and the result is carried in the
+    /// [`VaultSetup`] validation hands out — so `token_file` is read exactly
+    /// once per startup, and the async connect path neither re-reads it nor
+    /// performs blocking file I/O on the runtime (CONC-5).
+    fn resolve_token(&self) -> Result<Secret, Error> {
         match (&self.token, &self.token_file) {
             (Some(token), None) => Ok(token.clone()),
-            (None, Some(path)) => Ok(std::fs::read_to_string(path)
-                .map_err(|e| Error::Vault(format!("reading {}: {e}", path.display())))?
-                .trim()
-                .to_owned()),
+            (None, Some(path)) => {
+                check_secret_file_mode(path)?;
+                // The file contents are the token: read into a buffer that is
+                // wiped on drop, and hand the trimmed copy straight to
+                // `Secret`, which is wiped in turn.
+                let raw = Zeroizing::new(
+                    std::fs::read_to_string(path)
+                        .map_err(|e| Error::Vault(format!("reading {}: {e}", path.display())))?,
+                );
+                Ok(Secret::new(raw.trim().to_owned()))
+            }
             _ => {
                 Err(Error::InvalidConfig("[vault] needs exactly one of token or token_file".into()))
             }
@@ -272,8 +510,19 @@ impl Default for Config {
 pub enum KeySourceConfig {
     /// TOML keyfile for `dbsec_core::keys::FileKeySource`.
     File(PathBuf),
-    /// OpenBao/Vault Transit + KV.
-    Vault(VaultConfig),
+    /// OpenBao/Vault Transit + KV. Boxed: a resolved Vault setup is eight
+    /// fields where a keyfile is one path, and this enum is matched once at
+    /// startup rather than moved around.
+    Vault(Box<VaultSetup>),
+}
+
+/// A `[vault]` section with its token already resolved — the form the connect
+/// path consumes. Validation proves the token is obtainable *by obtaining it*,
+/// rather than by resolving a throwaway copy and dropping it (SEC-5).
+#[derive(Debug, Clone)]
+pub struct VaultSetup {
+    pub config: VaultConfig,
+    pub token: Secret,
 }
 
 /// What the protected-column path needs, proved present by validation:
@@ -284,7 +533,7 @@ pub enum KeySourceConfig {
 #[derive(Debug)]
 pub struct ProtectedConfig {
     pub keys: KeySourceConfig,
-    pub control_dsn: String,
+    pub control_dsn: Dsn,
 }
 
 /// A [`Config`] that has passed [`Config::validate`], carrying what
@@ -299,8 +548,14 @@ pub struct ValidatedConfig {
 
 impl Config {
     pub fn load(path: &Path) -> Result<ValidatedConfig, Error> {
-        let raw = std::fs::read_to_string(path)
-            .map_err(|source| Error::ConfigRead { path: path.to_owned(), source })?;
+        // A config with an inline `[vault] token` holds a credential, so the
+        // file's text is wiped when it drops rather than left in the heap for
+        // the life of the process. Same best-effort caveat as [`Secret`]:
+        // `toml`'s own intermediate buffers are outside this crate's reach.
+        let raw = Zeroizing::new(
+            std::fs::read_to_string(path)
+                .map_err(|source| Error::ConfigRead { path: path.to_owned(), source })?,
+        );
         let config: Self = toml::from_str(&raw)
             .map_err(|source| Error::ConfigParse { path: path.to_owned(), source })?;
         config.validated()
@@ -322,12 +577,30 @@ impl Config {
         if self.max_sessions == 0 {
             return Err(Error::InvalidConfig("max_sessions must be greater than 0".into()));
         }
+        // Resolved before the `[[column]]` branch below, and only here: a
+        // `[vault]` section is validated whether or not a column uses it, and
+        // resolving once means `token_file` is read exactly once per startup
+        // rather than once to prove it is readable and again to connect.
+        let vault = match &self.vault {
+            None => None,
+            Some(vault) => {
+                if vault.timeout_secs == 0 {
+                    return Err(Error::InvalidConfig(
+                        "[vault] timeout_secs must be greater than 0".into(),
+                    ));
+                }
+                Some(VaultSetup { config: vault.clone(), token: vault.resolve_token()? })
+            }
+        };
         let protected = if self.columns.is_empty() {
             None
         } else {
-            let keys = match (&self.keys_file, &self.vault) {
-                (Some(keys_file), None) => KeySourceConfig::File(keys_file.clone()),
-                (None, Some(vault)) => KeySourceConfig::Vault(vault.clone()),
+            let keys = match (&self.keys_file, vault) {
+                (Some(keys_file), None) => {
+                    check_secret_file_mode(keys_file)?;
+                    KeySourceConfig::File(keys_file.clone())
+                }
+                (None, Some(setup)) => KeySourceConfig::Vault(Box::new(setup)),
                 (None, None) => {
                     return Err(Error::InvalidConfig(
                         "[[column]] entries require keys_file or [vault]".into(),
@@ -344,14 +617,6 @@ impl Config {
             })?;
             Some(ProtectedConfig { keys, control_dsn })
         };
-        if let Some(vault) = &self.vault {
-            vault.token()?;
-            if vault.timeout_secs == 0 {
-                return Err(Error::InvalidConfig(
-                    "[vault] timeout_secs must be greater than 0".into(),
-                ));
-            }
-        }
         let mut seen = std::collections::HashSet::new();
         for column in &self.columns {
             let (schema, table) = column.schema_and_table();
@@ -481,7 +746,7 @@ mod tests {
         assert_eq!(vault.mount, "secret");
         assert_eq!(vault.path, "dbsec");
         assert_eq!(vault.transit_mount, "transit");
-        assert_eq!(vault.token().unwrap(), "root");
+        assert_eq!(vault.resolve_token().unwrap().expose(), "root");
         assert_eq!(vault.timeout_secs, 5, "every Vault call is bounded by default");
 
         let zero_timeout: Config = toml::from_str(
@@ -501,6 +766,134 @@ mod tests {
 
         let no_token: Config = toml::from_str("[vault]\naddr = \"a\"\n").unwrap();
         assert!(matches!(no_token.validate(), Err(Error::InvalidConfig(_))));
+    }
+
+    /// The whole reason `Config` may be `Debug`-formatted at all.
+    #[test]
+    fn debugging_the_config_never_prints_the_vault_token() {
+        let cfg: Config = toml::from_str(
+            "control_dsn = \"postgres://dbsec:hunter2@db.internal:5433/app\"\n\n\
+             [vault]\naddr = \"https://bao.internal:8200\"\ntoken = \"s3cr3t-token\"\n\n\
+             [[column]]\ntable = \"users\"\ncolumn = \"email\"\n",
+        )
+        .unwrap();
+
+        let vault = format!("{:?}", cfg.vault.as_ref().unwrap());
+        assert!(!vault.contains("s3cr3t-token"), "VaultConfig leaked the token: {vault}");
+
+        let rendered = format!("{cfg:?}");
+        assert!(!rendered.contains("s3cr3t-token"), "Config leaked the token: {rendered}");
+        assert!(!rendered.contains("hunter2"), "Config leaked the DSN password: {rendered}");
+        // The resolved form is what the connect path is handed, so it has to
+        // hold the same line.
+        let validated = cfg.validated().unwrap();
+        let resolved = format!("{:?}", validated.protected.as_ref().unwrap());
+        assert!(!resolved.contains("s3cr3t-token"), "ProtectedConfig leaked the token: {resolved}");
+        assert!(!resolved.contains("hunter2"), "ProtectedConfig leaked the password: {resolved}");
+    }
+
+    /// A DSN is a mixed value: the password is the only part worth hiding, and
+    /// hiding the rest would cost the operator the startup diagnostic.
+    #[test]
+    fn debugging_a_dsn_masks_the_password_and_keeps_the_endpoint() {
+        let url = Dsn::new("postgres://dbsec:hunter2@db.internal:5433/app?sslmode=require".into());
+        let rendered = format!("{url:?}");
+        assert!(!rendered.contains("hunter2"), "password survived: {rendered}");
+        for legible in ["dbsec", "db.internal", "5433", "app", "sslmode=require"] {
+            assert!(rendered.contains(legible), "{legible} must stay legible: {rendered}");
+        }
+
+        let keyword_value =
+            Dsn::new("host=db.internal port=5433 dbname=app user=dbsec password=hunter2".into());
+        let rendered = format!("{keyword_value:?}");
+        assert!(!rendered.contains("hunter2"), "password survived: {rendered}");
+        for legible in ["host=db.internal", "port=5433", "dbname=app", "user=dbsec"] {
+            assert!(rendered.contains(legible), "{legible} must stay legible: {rendered}");
+        }
+
+        // libpq quotes a value containing a space, so masking cannot be a
+        // matter of splitting on whitespace.
+        let quoted = Dsn::new("host=db.internal password='hunter 2' dbname=app".into());
+        let rendered = format!("{quoted:?}");
+        assert!(!rendered.contains("hunter"), "quoted password survived: {rendered}");
+        assert!(rendered.contains("dbname=app"), "masking ate the rest: {rendered}");
+
+        // A password in a URL query string rather than the userinfo.
+        let query = Dsn::new("postgres://dbsec@db.internal:5433/app?password=hunter2".into());
+        assert!(!format!("{query:?}").contains("hunter2"));
+
+        // Not a connection string at all: nothing here is known to be safe.
+        let junk = Dsn::new("this is not a dsn".into());
+        assert!(!format!("{junk:?}").contains("not a dsn"));
+
+        // Display carries the same guarantee, so `%dsn` is safe in a log line.
+        assert!(!format!("{url}").contains("hunter2"));
+    }
+
+    #[cfg(unix)]
+    fn write_mode(dir: &Path, name: &str, contents: &str, mode: u32) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let path = dir.join(name);
+        std::fs::write(&path, contents).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(mode)).unwrap();
+        path
+    }
+
+    /// SEC-29. `0644` on a keyfile is what `cp`, a Docker `COPY` or an editor
+    /// that recreates the file on save all produce, and it defeats the product
+    /// outright.
+    #[cfg(unix)]
+    #[test]
+    fn secret_files_must_be_readable_only_by_their_owner() {
+        let dir = tempfile::tempdir().unwrap();
+        let config_for = |path: &Path| {
+            format!(
+                "control_dsn = \"postgres://x\"\nkeys_file = {path:?}\n\n\
+                 [[column]]\ntable = \"users\"\ncolumn = \"email\"\n"
+            )
+        };
+
+        let tight = write_mode(dir.path(), "tight.toml", "active = \"00\"\n", 0o600);
+        toml::from_str::<Config>(&config_for(&tight)).unwrap().validate().unwrap();
+
+        let loose = write_mode(dir.path(), "loose.toml", "active = \"00\"\n", 0o644);
+        let Err(err) = toml::from_str::<Config>(&config_for(&loose)).unwrap().validate() else {
+            panic!("a world-readable keyfile must not be accepted");
+        };
+        assert!(matches!(err, Error::InvalidConfig(_)), "got {err:?}");
+        assert!(err.to_string().contains("0644"), "the mode must be named: {err}");
+
+        // The same rule for the Vault token file, which is the credential that
+        // unwraps everything the keyfile would have held.
+        let token = write_mode(dir.path(), "token", "s3cr3t\n", 0o640);
+        let cfg: Config =
+            toml::from_str(&format!("[vault]\naddr = \"a\"\ntoken_file = {token:?}\n")).unwrap();
+        assert!(matches!(cfg.validate(), Err(Error::InvalidConfig(_))));
+    }
+
+    /// TASK-0019: the token file is read once per startup, not once to prove
+    /// it is readable and again to connect.
+    #[cfg(unix)]
+    #[test]
+    fn the_token_file_is_read_once_and_carried() {
+        let dir = tempfile::tempdir().unwrap();
+        let token = write_mode(dir.path(), "token", "  s3cr3t\n", 0o600);
+        let cfg: Config = toml::from_str(&format!(
+            "control_dsn = \"postgres://x\"\n\n[vault]\naddr = \"a\"\ntoken_file = {token:?}\n\n\
+             [[column]]\ntable = \"users\"\ncolumn = \"email\"\n"
+        ))
+        .unwrap();
+
+        let validated = cfg.validated().unwrap();
+        let KeySourceConfig::Vault(setup) = &validated.protected.as_ref().unwrap().keys else {
+            panic!("a [vault] section must resolve to a Vault key source");
+        };
+        assert_eq!(setup.token.expose(), "s3cr3t", "the token is trimmed and carried");
+
+        // Nothing reads the file again, so removing it changes nothing.
+        std::fs::remove_file(&token).unwrap();
+        assert_eq!(setup.token.expose(), "s3cr3t");
     }
 
     #[test]

@@ -10,6 +10,7 @@ use tokio_postgres::tls::{MakeTlsConnect, TlsConnect};
 use tokio_postgres::Socket;
 
 use crate::columns::ProtectedColumn;
+use crate::config::Dsn;
 use crate::rows::{ColumnMap, ReadColumn};
 use crate::tls::TlsContext;
 use crate::Error;
@@ -27,7 +28,7 @@ WHERE n.nspname = $1 AND c.relname = $2 AND a.attname = $3
 /// control endpoint that accepts TCP and then goes silent fails startup
 /// instead of hanging the proxy before it ever binds its listener (ASYNC-6).
 pub async fn resolve_columns(
-    dsn: &str,
+    dsn: &Dsn,
     tls: &TlsContext,
     columns: &[ProtectedColumn],
     deadline: Duration,
@@ -44,7 +45,7 @@ pub async fn resolve_columns(
             ),
         )
         .await
-        .map_err(|_| Error::ControlTimeout { host: control_host(dsn), timeout: deadline })?
+        .map_err(|_| Error::ControlTimeout { host: control_host(dsn.as_str()), timeout: deadline })?
         .map_err(|e| Error::Control(e.to_string()))?
         .ok_or_else(|| Error::ColumnNotFound {
             table: format!("{}.{}", column.schema, column.table),
@@ -83,7 +84,7 @@ fn read_column(column: &ProtectedColumn) -> Option<ReadColumn> {
 /// the data path), plaintext otherwise. Both hops share one body: only the
 /// connector differs (DUP-4).
 async fn connect(
-    dsn: &str,
+    dsn: &Dsn,
     tls: &TlsContext,
     deadline: Duration,
 ) -> Result<tokio_postgres::Client, Error> {
@@ -100,7 +101,7 @@ async fn connect(
 /// Connects with `connector` under `deadline` and spawns the connection task
 /// that drives the resulting client.
 async fn connect_with<T>(
-    dsn: &str,
+    dsn: &Dsn,
     connector: T,
     deadline: Duration,
 ) -> Result<tokio_postgres::Client, Error>
@@ -110,9 +111,9 @@ where
     T::TlsConnect: Send,
     <T::TlsConnect as TlsConnect<Socket>>::Future: Send,
 {
-    let (client, connection) = timeout(deadline, tokio_postgres::connect(dsn, connector))
+    let (client, connection) = timeout(deadline, tokio_postgres::connect(dsn.as_str(), connector))
         .await
-        .map_err(|_| Error::ControlTimeout { host: control_host(dsn), timeout: deadline })?
+        .map_err(|_| Error::ControlTimeout { host: control_host(dsn.as_str()), timeout: deadline })?
         .map_err(|e| Error::Control(e.to_string()))?;
     tokio::spawn(async move {
         if let Err(e) = connection.await {
@@ -185,7 +186,7 @@ mod tests {
         });
 
         let tls = TlsContext::from_config(&Config::default()).unwrap();
-        let dsn = format!("postgres://dbsec:hunter2@127.0.0.1:{}/app", addr.port());
+        let dsn = Dsn::new(format!("postgres://dbsec:hunter2@127.0.0.1:{}/app", addr.port()));
         let deadline = Duration::from_millis(200);
         let started = std::time::Instant::now();
         let Err(err) = resolve_columns(&dsn, &tls, &[], deadline).await else {

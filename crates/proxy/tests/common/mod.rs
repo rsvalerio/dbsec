@@ -194,6 +194,12 @@ pub async fn spawn_proxy(dir: &Path, opts: &ProxyOpts<'_>) -> Proxy {
         Keys::File => {
             let path = dir.join("keys.toml");
             std::fs::write(&path, keyfile(opts.table)).unwrap();
+            // The proxy refuses a keyfile anyone but its owner can read
+            // (SEC-29), and `fs::write` inherits the umask — so the fixture
+            // has to set the mode the same way a deployment would.
+            #[cfg(unix)]
+            std::fs::set_permissions(&path, std::os::unix::fs::PermissionsExt::from_mode(0o600))
+                .unwrap();
             format!("keys_file = {path:?}")
         }
         Keys::Vault(section) => section.clone(),

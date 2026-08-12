@@ -172,8 +172,8 @@ async fn serve(validated: ValidatedConfig) -> Result<(), Error> {
         Some(protected) => {
             let keys: Arc<dyn dbsec_core::keys::KeySource> = match &protected.keys {
                 KeySourceConfig::File(keys_file) => Arc::new(FileKeySource::load(keys_file)?),
-                KeySourceConfig::Vault(vault_config) => {
-                    Arc::new(vault::VaultKeySource::connect(vault_config).await?)
+                KeySourceConfig::Vault(setup) => {
+                    Arc::new(vault::VaultKeySource::connect(setup).await?)
                 }
             };
             let columns = columns::build(&config, &keys);

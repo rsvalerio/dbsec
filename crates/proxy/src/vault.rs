@@ -62,7 +62,7 @@ use vaultrs::client::{VaultClient, VaultClientSettingsBuilder};
 use vaultrs::error::ClientError;
 use zeroize::{Zeroize, Zeroizing};
 
-use crate::config::VaultConfig;
+use crate::config::{VaultConfig, VaultSetup};
 use crate::Error;
 
 /// Negative cache for DEK ids Vault has no record of.
@@ -287,12 +287,13 @@ pub(crate) struct VaultKeySource<S = VaultStore> {
 impl VaultKeySource<VaultStore> {
     /// Connects, generates this run's DEK through Transit, and records its
     /// wrapped form in KV. DEKs rotate freely — every startup gets a new one.
-    pub(crate) async fn connect(config: &VaultConfig) -> Result<Self, Error> {
-        let token = config.token()?;
+    pub(crate) async fn connect(setup: &VaultSetup) -> Result<Self, Error> {
+        let config = &setup.config;
         let timeout = Duration::from_secs(config.timeout_secs);
         let settings = VaultClientSettingsBuilder::default()
             .address(&config.addr)
-            .token(token.as_str())
+            // Resolved by validation, so no file is read from this async path.
+            .token(setup.token.expose())
             // vaultrs 0.7 only calls `reqwest::ClientBuilder::timeout` when
             // this is `Some`, and reqwest's own default is no timeout at all,
             // so leaving it unset means every roundtrip below is unbounded.
@@ -315,8 +316,13 @@ impl VaultKeySource<VaultStore> {
             .ok_or_else(|| Error::Vault("transit returned no plaintext data key".into()))?;
         let key = decode_key_b64(&plaintext)?;
 
+        // The OS entropy source rather than `thread_rng` (SEC-10): this id is
+        // stamped into every envelope this run writes, and drawing it from a
+        // userspace generator state puts that state — the one that survives
+        // `fork()` and that reseeding bugs live in — between the OS and a
+        // long-lived value. It is drawn once per process, so it costs nothing.
         let mut key_id = [0u8; KEY_ID_LEN];
-        rand::thread_rng().fill_bytes(&mut key_id);
+        rand::rngs::OsRng.try_fill_bytes(&mut key_id).map_err(CoreError::Entropy)?;
         vaultrs::kv2::set(
             &client,
             &config.mount,
@@ -385,8 +391,11 @@ impl<S: KeyStore> VaultKeySource<S> {
             return Ok(key);
         }
 
+        // The OS entropy source rather than `thread_rng` (SEC-10). This is the
+        // highest-consequence random draw in the crate: a deterministic index
+        // key by design can never rotate, so it has to be right the once.
         let mut fresh = Zeroizing::new([0u8; 32]);
-        rand::thread_rng().fill_bytes(fresh.as_mut());
+        rand::rngs::OsRng.try_fill_bytes(fresh.as_mut()).map_err(CoreError::Entropy)?;
         // `as_slice` rather than `*fresh`: dereferencing would copy the key
         // material into a temporary that nothing zeroizes.
         let record = IndexKeyRecord::first(hex::encode(fresh.as_slice()));
