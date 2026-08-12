@@ -325,6 +325,14 @@ pub struct Config {
 /// at rest in plaintext" invariant actually enforced sets
 /// `on_unprotected = "reject"` and treats the warnings it sees first as the
 /// list of statements to fix.
+///
+/// It governs the read path's one fail-closed reading too — a result column
+/// named like a protected column that the resolved map does not cover
+/// ([`crate::rows`]) — rather than that having a switch of its own. Both paths
+/// are asking the same question about the same columns, and a deployment that
+/// is strict about writing plaintext but lax about handing back stored bytes
+/// enforces neither half of the invariant. Refusals on either path are
+/// statement-level: ErrorResponse, then the session carries on.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum OnUnprotected {

@@ -52,20 +52,30 @@ either side. The default is 300 s, and a session that sees a result column it
 cannot explain asks for a re-resolution immediately, so the timer is a backstop
 rather than the exposure window. `0` disables the timer.
 
-Under `on_unprotected = "reject"` that same detection fails the session instead
-of relaying. The name match it rests on is a heuristic — a RowDescription names
-its fields but identifies their table only by OID — so an unrelated table with a
-column named like a protected one trips it too.
+Under `on_unprotected = "reject"` that same detection refuses the result set
+instead of relaying it. The name match it rests on is a heuristic — a
+RowDescription names its fields but identifies their table only by OID — so an
+unrelated table with a column named like a protected one trips it too. The read
+path deliberately has no separate switch for this: `on_unprotected` is the one
+answer to "this may be unprotected, error rather than guess", and a deployment
+that is strict about writing plaintext but lax about handing back stored bytes
+is the half-enforced state the setting exists to rule out.
 
 One read-path behaviour is not configurable: a `DataRow` the proxy cannot tie to
-any described statement fails the session. In the extended protocol the server
-sends `RowDescription` in reply to `Describe`, not to `Execute`, so the proxy
-tracks `Parse`/`Bind`/`Describe`/`Execute` and keys protected column positions
-to the portal being executed rather than to the last `RowDescription` on the
+any described statement is refused. In the extended protocol the server sends
+`RowDescription` in reply to `Describe`, not to `Execute`, so the proxy tracks
+`Parse`/`Bind`/`Describe`/`Execute` and keys protected column positions to the
+portal being executed rather than to the last `RowDescription` on the
 connection. A client that never describes what it executes leaves nothing to key
 on, and relaying those rows is exactly the silent passthrough of ciphertext this
 path exists to prevent. Every driver the e2e matrix covers describes its
 statements.
+
+Read-path refusals are statement-level, like the write path's: the client gets a
+PostgreSQL `ERROR` (SQLSTATE 42501), the rest of that result set is withheld,
+and the session resynchronises at the backend's next `ReadyForQuery` — not a
+dropped connection, which application retry logic would read as a network fault
+rather than a policy refusal.
 
 `COPY` is never encrypted. `COPY ... FROM` carries its payload in `CopyData`
 frames rather than SQL, and `COPY ... TO` bypasses the read path — so a
