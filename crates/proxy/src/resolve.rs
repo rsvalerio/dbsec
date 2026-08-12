@@ -3,6 +3,12 @@
 //! RowDescription fields. A column that doesn't exist is a startup error —
 //! silently protecting nothing would be worse than refusing to start.
 
+use std::time::Duration;
+
+use tokio::time::timeout;
+use tokio_postgres::tls::{MakeTlsConnect, TlsConnect};
+use tokio_postgres::Socket;
+
 use crate::columns::ProtectedColumn;
 use crate::rows::{ColumnMap, ReadColumn};
 use crate::tls::TlsContext;
@@ -16,26 +22,34 @@ JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
 WHERE n.nspname = $1 AND c.relname = $2 AND a.attname = $3
   AND a.attnum > 0 AND NOT a.attisdropped";
 
+/// Resolves every configured column over one control connection. `deadline`
+/// bounds each network step separately — the connect and each lookup — so a
+/// control endpoint that accepts TCP and then goes silent fails startup
+/// instead of hanging the proxy before it ever binds its listener (ASYNC-6).
 pub async fn resolve_columns(
     dsn: &str,
     tls: &TlsContext,
     columns: &[ProtectedColumn],
+    deadline: Duration,
 ) -> Result<ColumnMap, Error> {
-    let client = connect(dsn, tls).await?;
+    let client = connect(dsn, tls, deadline).await?;
 
     let mut map = ColumnMap::new();
     for column in columns {
-        let row = client
-            .query_opt(
+        let row = timeout(
+            deadline,
+            client.query_opt(
                 LOOKUP,
                 &[&column.schema.as_str(), &column.table.as_str(), &column.column.as_str()],
-            )
-            .await
-            .map_err(|e| Error::Control(e.to_string()))?
-            .ok_or_else(|| Error::ColumnNotFound {
-                table: format!("{}.{}", column.schema, column.table),
-                column: column.column.clone(),
-            })?;
+            ),
+        )
+        .await
+        .map_err(|_| Error::ControlTimeout { host: control_host(dsn), timeout: deadline })?
+        .map_err(|e| Error::Control(e.to_string()))?
+        .ok_or_else(|| Error::ColumnNotFound {
+            table: format!("{}.{}", column.schema, column.table),
+            column: column.column.clone(),
+        })?;
         let table_oid: u32 = row.get(0);
         let attnum: i16 = row.get(1);
         tracing::info!(
@@ -66,33 +80,121 @@ fn read_column(column: &ProtectedColumn) -> Option<ReadColumn> {
 }
 
 /// Connects with TLS when `[tls.upstream]` is configured (same trust root as
-/// the data path), plaintext otherwise.
-async fn connect(dsn: &str, tls: &TlsContext) -> Result<tokio_postgres::Client, Error> {
+/// the data path), plaintext otherwise. Both hops share one body: only the
+/// connector differs (DUP-4).
+async fn connect(
+    dsn: &str,
+    tls: &TlsContext,
+    deadline: Duration,
+) -> Result<tokio_postgres::Client, Error> {
     match &tls.upstream_client {
         Some(client_config) => {
             let connector =
                 tokio_postgres_rustls::MakeRustlsConnect::new((**client_config).clone());
-            let (client, connection) = tokio_postgres::connect(dsn, connector)
-                .await
-                .map_err(|e| Error::Control(e.to_string()))?;
-            tokio::spawn(async move {
-                if let Err(e) = connection.await {
-                    tracing::warn!(error = %e, "control connection ended with error");
-                }
-            });
-            Ok(client)
+            connect_with(dsn, connector, deadline).await
         }
-        None => {
-            let (client, connection) = tokio_postgres::connect(dsn, tokio_postgres::NoTls)
-                .await
-                .map_err(|e| Error::Control(e.to_string()))?;
-            tokio::spawn(async move {
-                if let Err(e) = connection.await {
-                    tracing::warn!(error = %e, "control connection ended with error");
-                }
-            });
-            Ok(client)
+        None => connect_with(dsn, tokio_postgres::NoTls, deadline).await,
+    }
+}
+
+/// Connects with `connector` under `deadline` and spawns the connection task
+/// that drives the resulting client.
+async fn connect_with<T>(
+    dsn: &str,
+    connector: T,
+    deadline: Duration,
+) -> Result<tokio_postgres::Client, Error>
+where
+    T: MakeTlsConnect<Socket>,
+    T::Stream: Send + 'static,
+    T::TlsConnect: Send,
+    <T::TlsConnect as TlsConnect<Socket>>::Future: Send,
+{
+    let (client, connection) = timeout(deadline, tokio_postgres::connect(dsn, connector))
+        .await
+        .map_err(|_| Error::ControlTimeout { host: control_host(dsn), timeout: deadline })?
+        .map_err(|e| Error::Control(e.to_string()))?;
+    tokio::spawn(async move {
+        if let Err(e) = connection.await {
+            tracing::warn!(error = %e, "control connection ended with error");
         }
+    });
+    Ok(client)
+}
+
+/// The endpoint(s) `dsn` points at, for diagnostics. Parsed out rather than
+/// echoed: `control_dsn` carries the control user's password, and an error
+/// message is the one place it must not surface.
+fn control_host(dsn: &str) -> String {
+    let Ok(config) = dsn.parse::<tokio_postgres::Config>() else {
+        return "<unparseable control_dsn>".to_owned();
+    };
+    let ports = config.get_ports();
+    let hosts: Vec<String> = config
+        .get_hosts()
+        .iter()
+        .enumerate()
+        .map(|(i, host)| match host {
+            tokio_postgres::config::Host::Tcp(name) => match ports.get(i).or(ports.first()) {
+                Some(port) => format!("{name}:{port}"),
+                None => name.clone(),
+            },
+            tokio_postgres::config::Host::Unix(path) => path.display().to_string(),
+        })
+        .collect();
+    if hosts.is_empty() {
+        return "<no host in control_dsn>".to_owned();
+    }
+    hosts.join(",")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::Config;
+
+    #[test]
+    fn control_host_names_the_endpoint_without_the_password() {
+        assert_eq!(
+            control_host("postgres://dbsec:hunter2@db.internal:5433/app"),
+            "db.internal:5433"
+        );
+        assert_eq!(control_host("host=/var/run/postgresql dbname=app"), "/var/run/postgresql");
+        assert!(control_host("this is not a dsn").starts_with('<'));
+    }
+
+    /// A control endpoint that completes the TCP connect and then says
+    /// nothing is the case a bare `tokio_postgres::connect` waits out
+    /// forever, before the proxy has bound its listener.
+    #[tokio::test]
+    async fn a_silent_control_endpoint_fails_within_the_deadline() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let accepting = tokio::spawn(async move {
+            // Accepted sockets are held, not answered: dropping them would
+            // close the connection and turn this into a connect *error*.
+            let mut accepted = Vec::new();
+            while let Ok((socket, _)) = listener.accept().await {
+                accepted.push(socket);
+            }
+        });
+
+        let tls = TlsContext::from_config(&Config::default()).unwrap();
+        let dsn = format!("postgres://dbsec:hunter2@127.0.0.1:{}/app", addr.port());
+        let deadline = Duration::from_millis(200);
+        let started = std::time::Instant::now();
+        let Err(err) = resolve_columns(&dsn, &tls, &[], deadline).await else {
+            panic!("a control endpoint that never answers must not resolve");
+        };
+
+        assert!(
+            matches!(&err, Error::ControlTimeout { host, timeout }
+                if host.contains(&addr.port().to_string()) && *timeout == deadline),
+            "expected a control timeout naming the endpoint, got: {err}"
+        );
+        assert!(!err.to_string().contains("hunter2"), "the DSN password must not reach the error");
+        assert!(started.elapsed() < Duration::from_secs(5), "the deadline did not fire");
+        accepting.abort();
     }
 }
 
