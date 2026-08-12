@@ -3,11 +3,11 @@ id: TASK-0017
 title: >-
   SEC-11: table names are resolved against a hardcoded 'public' default,
   ignoring the session search_path
-status: To Do
+status: Done
 assignee:
   - TASK-0049
 created_date: '2026-08-11 19:14'
-updated_date: '2026-08-11 22:42'
+updated_date: '2026-08-12 16:25'
 labels:
   - code-review-rust
   - security
@@ -41,7 +41,7 @@ The read path is immune — it matches on `(table_oid, attnum)` resolved at star
 
 ## Acceptance Criteria
 <!-- AC:BEGIN -->
-- [ ] #1 The search_path assumption is stated in the crate/module docs and in the operator-facing config documentation, not only in a private fn comment
-- [ ] #2 Either the proxy tracks search_path (startup options plus SET statements) when resolving unqualified names, or it enforces the assumption — e.g. refusing sessions that change search_path when protected tables are configured
-- [ ] #3 The mis-protection direction (a bare name sealed for the wrong schema's table) is covered by a test
+- [x] #1 The search_path assumption is stated in the crate/module docs and in the operator-facing config documentation, not only in a private fn comment
+- [x] #2 Either the proxy tracks search_path (startup options plus SET statements) when resolving unqualified names, or it enforces the assumption — e.g. refusing sessions that change search_path when protected tables are configured
+- [x] #3 The mis-protection direction (a bare name sealed for the wrong schema's table) is covered by a test
 <!-- AC:END -->

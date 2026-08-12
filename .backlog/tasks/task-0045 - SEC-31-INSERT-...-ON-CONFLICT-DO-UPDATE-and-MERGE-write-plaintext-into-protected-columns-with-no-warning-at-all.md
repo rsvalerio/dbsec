@@ -3,11 +3,11 @@ id: TASK-0045
 title: >-
   SEC-31: INSERT ... ON CONFLICT DO UPDATE and MERGE write plaintext into
   protected columns with no warning at all
-status: To Do
+status: Done
 assignee:
   - TASK-0049
 created_date: '2026-08-11 21:04'
-updated_date: '2026-08-11 22:42'
+updated_date: '2026-08-12 16:25'
 labels:
   - code-review-rust
   - security
@@ -56,9 +56,9 @@ The damage is also self-reinforcing. Plaintext rows written this way are indisti
 
 ## Acceptance Criteria
 <!-- AC:BEGIN -->
-- [ ] #1 The conflict action of INSERT ... ON CONFLICT DO UPDATE is walked and its assignments to protected columns are sealed, reusing the same path as Statement::Update
-- [ ] #2 A statement shape that touches a protected table but is not rewritten emits a warning rather than returning Ok(false) silently, so it is visible to log-based alerting and to any future strict mode
-- [ ] #3 MERGE against a protected table is either rewritten or explicitly warned about, not swallowed by the catch-all arm
-- [ ] #4 A test asserts INSERT ... ON CONFLICT DO UPDATE SET <protected> = <literal> stores ciphertext, for both an inline literal and a bound placeholder
-- [ ] #5 A test asserts MERGE against a protected table does not silently return Ok(false)
+- [x] #1 The conflict action of INSERT ... ON CONFLICT DO UPDATE is walked and its assignments to protected columns are sealed, reusing the same path as Statement::Update
+- [x] #2 A statement shape that touches a protected table but is not rewritten emits a warning rather than returning Ok(false) silently, so it is visible to log-based alerting and to any future strict mode
+- [x] #3 MERGE against a protected table is either rewritten or explicitly warned about, not swallowed by the catch-all arm
+- [x] #4 A test asserts INSERT ... ON CONFLICT DO UPDATE SET <protected> = <literal> stores ciphertext, for both an inline literal and a bound placeholder
+- [x] #5 A test asserts MERGE against a protected table does not silently return Ok(false)
 <!-- AC:END -->

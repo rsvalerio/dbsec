@@ -3,11 +3,11 @@ id: TASK-0037
 title: >-
   SEC-31: only a bare = on a searchable column is rewritten, so IN, joins, CTEs
   and set operations silently return no rows
-status: To Do
+status: In Progress
 assignee:
   - TASK-0049
 created_date: '2026-08-11 19:35'
-updated_date: '2026-08-11 22:42'
+updated_date: '2026-08-12 16:25'
 labels:
   - code-review-rust
   - security
@@ -58,9 +58,29 @@ At minimum the proxy must *notice*: any reference to a searchable column that re
 
 ## Acceptance Criteria
 <!-- AC:BEGIN -->
-- [ ] #1 A searchable column referenced in a predicate the rewriter cannot handle produces a warning naming the column and the unsupported shape, instead of silently passing through
+- [x] #1 A searchable column referenced in a predicate the rewriter cannot handle produces a warning naming the column and the unsupported shape, instead of silently passing through
 - [ ] #2 IN and = ANY over a searchable column are rewritten to blind-index comparisons, for both literal lists and bound parameters
-- [ ] #3 Join ON constraints, CTE bodies and set-operation branches are traversed by the same rewrite that handles the top-level WHERE, or are explicitly warned about
-- [ ] #4 Tests cover IN, = ANY, a JOIN ON equality, a CTE and a UNION over a searchable column, asserting either a correct rewrite or the warning
-- [ ] #5 The module docs state which query shapes support searchable equality and what happens to the rest
+- [x] #3 Join ON constraints, CTE bodies and set-operation branches are traversed by the same rewrite that handles the top-level WHERE, or are explicitly warned about
+- [x] #4 Tests cover IN, = ANY, a JOIN ON equality, a CTE and a UNION over a searchable column, asserting either a correct rewrite or the warning
+- [x] #5 The module docs state which query shapes support searchable equality and what happens to the rest
 <!-- AC:END -->
+
+## Implementation Notes
+
+<!-- SECTION:NOTES:BEGIN -->
+Landed in TASK-0049 except AC #2's bound-array half.
+
+Done: unhandled predicates over a searchable column are now an `Unprotected::Predicate`
+site (warn by default, ErrorResponse under `on_unprotected = "reject"`) instead of a
+silent `Ok(false)`; `IN (<literals>)`, `IN ($1, $2)` and `= ANY(ARRAY[...])` rewrite to
+blind-index prefix matches; traversal now covers JOIN ON constraints, CTE bodies,
+set-operation branches, derived-table subqueries and HAVING as well as WHERE; the module
+docs state which shapes are supported and what happens to the rest.
+
+Left open: AC #2 asks for `= ANY` over *bound parameters* too. `= ANY($1)` passes the
+whole list as one array parameter, so rewriting it needs a Bind-time array codec (text
+and binary formats) that decodes, indexes each element and re-encodes as bytea[]. That
+was deliberately not attempted here: a half-tested codec produces a *valid* query that
+matches the wrong rows, which is worse than the refusal it would replace. Filed as
+TASK-0062 (Triage).
+<!-- SECTION:NOTES:END -->

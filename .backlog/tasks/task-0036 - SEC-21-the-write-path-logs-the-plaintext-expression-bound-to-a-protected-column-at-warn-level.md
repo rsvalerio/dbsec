@@ -3,11 +3,11 @@ id: TASK-0036
 title: >-
   SEC-21: the write path logs the plaintext expression bound to a protected
   column at warn level
-status: To Do
+status: Done
 assignee:
   - TASK-0049
 created_date: '2026-08-11 19:34'
-updated_date: '2026-08-11 22:42'
+updated_date: '2026-08-12 16:25'
 labels:
   - code-review-rust
   - security
@@ -50,8 +50,8 @@ Both are `warn!`, which passes the default `EnvFilter` fallback of `"info"` (`cr
 
 ## Acceptance Criteria
 <!-- AC:BEGIN -->
-- [ ] #1 The unsupported-expression warning identifies the column and the expression *shape* (e.g. the AST discriminant or function name) without emitting any literal value
-- [ ] #2 The unparseable-SQL warning does not carry the sqlparser message verbatim, or the message is stripped of the offending token before logging
-- [ ] #3 Every remaining tracing call in the encrypt path is audited for payload-bearing fields, and the audit result is recorded in the module docs
-- [ ] #4 A test asserts that sealing a protected column's unsupported expression does not put the plaintext into the emitted event
+- [x] #1 The unsupported-expression warning identifies the column and the expression *shape* (e.g. the AST discriminant or function name) without emitting any literal value
+- [x] #2 The unparseable-SQL warning does not carry the sqlparser message verbatim, or the message is stripped of the offending token before logging
+- [x] #3 Every remaining tracing call in the encrypt path is audited for payload-bearing fields, and the audit result is recorded in the module docs
+- [x] #4 A test asserts that sealing a protected column's unsupported expression does not put the plaintext into the emitted event
 <!-- AC:END -->

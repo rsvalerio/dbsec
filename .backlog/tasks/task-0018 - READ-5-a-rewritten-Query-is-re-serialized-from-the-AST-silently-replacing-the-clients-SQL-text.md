@@ -3,11 +3,11 @@ id: TASK-0018
 title: >-
   READ-5: a rewritten Query is re-serialized from the AST, silently replacing
   the client's SQL text
-status: To Do
+status: Done
 assignee:
   - TASK-0049
 created_date: '2026-08-11 19:14'
-updated_date: '2026-08-11 22:42'
+updated_date: '2026-08-12 16:25'
 labels:
   - code-review-rust
   - correctness
@@ -44,8 +44,8 @@ The crate already treats the parser as untrusted in one direction: unparseable S
 
 ## Acceptance Criteria
 <!-- AC:BEGIN -->
-- [ ] #1 Statements that were not modified are relayed as their original text rather than re-rendered from the AST
-- [ ] #2 The rewritten text is validated before it goes on the wire — re-parsed and compared, or another check that catches a Display round-trip divergence — and a divergence fails the session
-- [ ] #3 The reliance on sqlparser's Display fidelity is documented in the module docs alongside the existing passthrough caveats
-- [ ] #4 A test covers a multi-statement Query where only one statement is protected, asserting the others are byte-identical on the wire
+- [x] #1 Statements that were not modified are relayed as their original text rather than re-rendered from the AST
+- [x] #2 The rewritten text is validated before it goes on the wire — re-parsed and compared, or another check that catches a Display round-trip divergence — and a divergence fails the session
+- [x] #3 The reliance on sqlparser's Display fidelity is documented in the module docs alongside the existing passthrough caveats
+- [x] #4 A test covers a multi-statement Query where only one statement is protected, asserting the others are byte-identical on the wire
 <!-- AC:END -->

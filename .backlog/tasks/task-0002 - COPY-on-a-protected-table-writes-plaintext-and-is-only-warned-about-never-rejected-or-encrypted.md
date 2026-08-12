@@ -3,11 +3,11 @@ id: TASK-0002
 title: >-
   COPY on a protected table writes plaintext and is only warned about, never
   rejected or encrypted
-status: To Do
+status: Done
 assignee:
   - TASK-0049
 created_date: '2026-08-11 20:40'
-updated_date: '2026-08-11 22:42'
+updated_date: '2026-08-12 16:25'
 labels:
   - security
   - encrypt-path
@@ -34,8 +34,8 @@ Two directions worth deciding between (they are not equivalent in cost):
 
 ## Acceptance Criteria
 <!-- AC:BEGIN -->
-- [ ] #1 A decision is recorded in plans/PLAN.md: reject COPY on protected tables, or encrypt the CopyData stream
-- [ ] #2 COPY FROM on a protected table is rejected with a clear ErrorResponse under strict mode, or encrypted, per that decision
-- [ ] #3 COPY TO behaviour on a protected table is verified and documented — specifically whether masked columns leak their unmasked stored form
-- [ ] #4 An e2e case covers COPY against a protected table through the real binary
+- [x] #1 A decision is recorded in plans/PLAN.md: reject COPY on protected tables, or encrypt the CopyData stream
+- [x] #2 COPY FROM on a protected table is rejected with a clear ErrorResponse under strict mode, or encrypted, per that decision
+- [x] #3 COPY TO behaviour on a protected table is verified and documented — specifically whether masked columns leak their unmasked stored form
+- [x] #4 An e2e case covers COPY against a protected table through the real binary
 <!-- AC:END -->
