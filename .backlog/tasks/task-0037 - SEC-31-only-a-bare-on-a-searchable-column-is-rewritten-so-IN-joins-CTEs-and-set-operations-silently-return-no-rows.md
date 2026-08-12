@@ -3,11 +3,11 @@ id: TASK-0037
 title: >-
   SEC-31: only a bare = on a searchable column is rewritten, so IN, joins, CTEs
   and set operations silently return no rows
-status: In Progress
+status: Done
 assignee:
   - TASK-0049
 created_date: '2026-08-11 19:35'
-updated_date: '2026-08-12 16:25'
+updated_date: '2026-08-12 19:35'
 labels:
   - code-review-rust
   - security
@@ -59,7 +59,7 @@ At minimum the proxy must *notice*: any reference to a searchable column that re
 ## Acceptance Criteria
 <!-- AC:BEGIN -->
 - [x] #1 A searchable column referenced in a predicate the rewriter cannot handle produces a warning naming the column and the unsupported shape, instead of silently passing through
-- [ ] #2 IN and = ANY over a searchable column are rewritten to blind-index comparisons, for both literal lists and bound parameters
+- [x] #2 IN and = ANY over a searchable column are rewritten to blind-index comparisons, for both literal lists and bound parameters
 - [x] #3 Join ON constraints, CTE bodies and set-operation branches are traversed by the same rewrite that handles the top-level WHERE, or are explicitly warned about
 - [x] #4 Tests cover IN, = ANY, a JOIN ON equality, a CTE and a UNION over a searchable column, asserting either a correct rewrite or the warning
 - [x] #5 The module docs state which query shapes support searchable equality and what happens to the rest
@@ -83,4 +83,6 @@ and binary formats) that decodes, indexes each element and re-encodes as bytea[]
 was deliberately not attempted here: a half-tested codec produces a *valid* query that
 matches the wrong rows, which is worse than the refusal it would replace. Filed as
 TASK-0062 (Triage).
+
+AC #2 completed by TASK-0062 in wave 10 (TASK-0066): `= ANY($1)` over a searchable column is now rewritten to substring(col from 1 for 32) = ANY($1), with the bound array decoded, indexed element by element and re-encoded as bytea[] at Bind time in both the text and binary parameter formats. An array the codec cannot decode faithfully falls back to the Unprotected::Predicate signal rather than going out half-indexed. Every AC of this task is now satisfied.
 <!-- SECTION:NOTES:END -->

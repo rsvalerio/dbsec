@@ -3,11 +3,11 @@ id: TASK-0064
 title: >-
   The read path refuses by dropping the connection instead of sending an
   ErrorResponse
-status: To Do
+status: Done
 assignee:
   - TASK-0066
 created_date: '2026-08-12 17:01'
-updated_date: '2026-08-12 18:42'
+updated_date: '2026-08-12 19:33'
 labels:
   - code-review-rust
   - read-path
@@ -39,7 +39,13 @@ Related: the read path's fail-closed reading of a suspect column is currently co
 
 ## Acceptance Criteria
 <!-- AC:BEGIN -->
-- [ ] #1 A read-path refusal reaches the client as a PostgreSQL ErrorResponse with a SQLSTATE and a message, not as a closed socket
-- [ ] #2 The session survives a refusal the way it does on the write path, resynchronising at the next ReadyForQuery
-- [ ] #3 Whether the read path's fail-closed reading needs a setting separate from on_unprotected is decided and recorded
+- [x] #1 A read-path refusal reaches the client as a PostgreSQL ErrorResponse with a SQLSTATE and a message, not as a closed socket
+- [x] #2 The session survives a refusal the way it does on the write path, resynchronising at the next ReadyForQuery
+- [x] #3 Whether the read path's fail-closed reading needs a setting separate from on_unprotected is decided and recorded
 <!-- AC:END -->
+
+## Implementation Notes
+
+<!-- SECTION:NOTES:BEGIN -->
+Read-path refusals now mirror the write path. RowDecryptor::on_frame returns FrameAction; UndescribedRow and StaleColumnMap are classified as refusals (rows::is_refusal), answered with the write path's ErrorResponse (SQLSTATE 42501, encrypt::error_response now pub(crate)) via a new FrameAction::Substitute — already-framed bytes written forward in place of the frame, since on the read path the client is the receiver. The rest of the result set is dropped and the backend's own ReadyForQuery is relayed, which ends the refusal and resynchronises portal state via batch_answered(). Crypto/wire errors are still fatal. AC3 decision, recorded in crates/proxy/src/rows.rs (module docs), crates/proxy/src/config.rs (OnUnprotected) and README.md: the read path does NOT get a knob of its own — on_unprotected is the single "error rather than guess" answer for both paths, and splitting it would allow the half-enforced state the setting exists to rule out. e2e (crates/proxy/tests/e2e.rs) now asserts the client sees SqlState::INSUFFICIENT_PRIVILEGE and that the session serves the next statement; run green against dockerized Postgres.
+<!-- SECTION:NOTES:END -->

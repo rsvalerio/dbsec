@@ -1,11 +1,11 @@
 ---
 id: TASK-0049
 title: code-review-plan-wave0
-status: In Progress
+status: Done
 assignee:
   - code-review-wave
 created_date: '2026-08-11 22:41'
-updated_date: '2026-08-12 16:25'
+updated_date: '2026-08-12 19:35'
 labels:
   - code-review-wave
 dependencies:
@@ -45,4 +45,6 @@ Also fixed in-wave, found while writing the COPY coverage: sqlparser cannot pars
 `COPY ... FROM STDIN` without a terminator (it tries to consume the TSV payload, which on
 the wire arrives later as CopyData frames), so the COPY site was unreachable and COPY was
 being reported as unparseable SQL. `encrypt::parse_sql` now retries once with a `;`.
+
+Closed: TASK-0037 — the last member left open — is Done now that its AC #2 (`= ANY($1)` as a bound array) landed via TASK-0062 in wave 10 (TASK-0066). All seven members Done, wave0 merged onto main earlier.
 <!-- SECTION:NOTES:END -->

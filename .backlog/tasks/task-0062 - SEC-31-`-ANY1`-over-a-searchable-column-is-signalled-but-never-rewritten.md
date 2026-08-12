@@ -1,11 +1,11 @@
 ---
 id: TASK-0062
 title: 'SEC-31: `= ANY($1)` over a searchable column is signalled but never rewritten'
-status: To Do
+status: Done
 assignee:
   - TASK-0066
 created_date: '2026-08-12 16:14'
-updated_date: '2026-08-12 18:42'
+updated_date: '2026-08-12 19:22'
 labels:
   - code-review-rust
   - security
@@ -48,7 +48,13 @@ it was deliberately not attempted inside TASK-0049 because a half-tested array c
 
 ## Acceptance Criteria
 <!-- AC:BEGIN -->
-- [ ] #1 Bind-time array parameters for `= ANY($1)` over a searchable column are decoded, indexed element by element, and re-encoded as bytea[], in both text and binary parameter formats
-- [ ] #2 A mixed or undecodable array falls back to the existing Unprotected::Predicate signal rather than sending a partially-indexed array
-- [ ] #3 An e2e case covers `= ANY($1)` through sqlx against a real Postgres, asserting the rows come back
+- [x] #1 Bind-time array parameters for `= ANY($1)` over a searchable column are decoded, indexed element by element, and re-encoded as bytea[], in both text and binary parameter formats
+- [x] #2 A mixed or undecodable array falls back to the existing Unprotected::Predicate signal rather than sending a partially-indexed array
+- [x] #3 An e2e case covers `= ANY($1)` through sqlx against a real Postgres, asserting the rows come back
 <!-- AC:END -->
+
+## Implementation Notes
+
+<!-- SECTION:NOTES:BEGIN -->
+Bind-time array codec: new ParamAction::SearchIndexArray, index_array/decode_binary_array/decode_text_array/encode_* in encrypt.rs. `= ANY($1)` over a searchable column now rewrites to substring(col from 1 for 32) = ANY($1) and the array parameter is decoded, indexed element by element and re-encoded as bytea[] in whichever parameter format it arrived in. Undecodable or non-indexable arrays (wrong element OID, nested/multi-dim, truncated, over 65536 elements) fall back to the Unprotected::Predicate signal at Bind time — warn relays the array untouched (matches no rows), reject answers with the same ErrorResponse the write path uses and owns the batch until Sync. Other parameters of the same Bind are still transformed on the fallback path. e2e: sqlx `= ANY($1)` case in crates/proxy/tests/e2e_sqlx.rs, run green against dockerized Postgres.
+<!-- SECTION:NOTES:END -->
