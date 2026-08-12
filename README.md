@@ -13,8 +13,8 @@ Status: scaffold. Roadmap and design in [plans/PLAN.md](plans/PLAN.md).
 
 ## Operating the proxy
 
-Two settings decide how much of the "a protected column is never at rest in
-plaintext" invariant the proxy can actually enforce. Both are documented in full
+Three settings decide how much of the "a protected column is never at rest in
+plaintext" invariant the proxy can actually enforce. All are documented in full
 in `crates/proxy/src/config.rs`; the short version:
 
 **`on_unprotected`** — what happens to a statement the SQL rewrite cannot cover,
@@ -42,6 +42,30 @@ points `search_path` elsewhere breaks that equivalence in both directions, so
 the proxy watches the startup packet and `SET search_path` and stops resolving
 bare names once the default no longer holds (an `on_unprotected` site).
 Schema-qualifying either the config or the SQL avoids the question entirely.
+
+**`column_refresh_secs`** — how often the `[[column]]` list is re-resolved to
+`(table oid, attnum)`. The read path matches result columns on those; the write
+path matches on names. A migration that recreates a table or a column moves the
+first and not the second, so between the migration and the next resolution the
+proxy keeps encrypting writes and hands reads back the stored form — no error on
+either side. The default is 300 s, and a session that sees a result column it
+cannot explain asks for a re-resolution immediately, so the timer is a backstop
+rather than the exposure window. `0` disables the timer.
+
+Under `on_unprotected = "reject"` that same detection fails the session instead
+of relaying. The name match it rests on is a heuristic — a RowDescription names
+its fields but identifies their table only by OID — so an unrelated table with a
+column named like a protected one trips it too.
+
+One read-path behaviour is not configurable: a `DataRow` the proxy cannot tie to
+any described statement fails the session. In the extended protocol the server
+sends `RowDescription` in reply to `Describe`, not to `Execute`, so the proxy
+tracks `Parse`/`Bind`/`Describe`/`Execute` and keys protected column positions
+to the portal being executed rather than to the last `RowDescription` on the
+connection. A client that never describes what it executes leaves nothing to key
+on, and relaying those rows is exactly the silent passthrough of ciphertext this
+path exists to prevent. Every driver the e2e matrix covers describes its
+statements.
 
 `COPY` is never encrypted. `COPY ... FROM` carries its payload in `CopyData`
 frames rather than SQL, and `COPY ... TO` bypasses the read path — so a
