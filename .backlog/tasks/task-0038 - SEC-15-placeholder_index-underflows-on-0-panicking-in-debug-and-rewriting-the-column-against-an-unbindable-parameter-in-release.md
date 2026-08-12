@@ -3,11 +3,11 @@ id: TASK-0038
 title: >-
   SEC-15: placeholder_index underflows on $0, panicking in debug and rewriting
   the column against an unbindable parameter in release
-status: To Do
+status: Done
 assignee:
   - TASK-0050
 created_date: '2026-08-11 19:35'
-updated_date: '2026-08-11 22:42'
+updated_date: '2026-08-12 16:54'
 labels:
   - code-review-rust
   - security
@@ -44,8 +44,18 @@ Both `rewrite_equality` (`encrypt.rs:426`) and `seal_expr` (`encrypt.rs:493`) ca
 
 ## Acceptance Criteria
 <!-- AC:BEGIN -->
-- [ ] #1 placeholder_index returns None for $0 rather than underflowing — e.g. via checked_sub(1)
-- [ ] #2 A parameter reference the rewriter cannot resolve leaves the surrounding expression untouched; the column is not rewritten to an index prefix when the matching parameter action was not recorded
-- [ ] #3 A test sends WHERE email = $0 and INSERT ... VALUES ($0) through on_frame and asserts no panic and no partial rewrite, and it passes under a debug profile
-- [ ] #4 Other arithmetic on client-supplied protocol values in the encrypt path is audited for the same pattern
+- [x] #1 placeholder_index returns None for $0 rather than underflowing — e.g. via checked_sub(1)
+- [x] #2 A parameter reference the rewriter cannot resolve leaves the surrounding expression untouched; the column is not rewritten to an index prefix when the matching parameter action was not recorded
+- [x] #3 A test sends WHERE email = $0 and INSERT ... VALUES ($0) through on_frame and asserts no panic and no partial rewrite, and it passes under a debug profile
+- [x] #4 Other arithmetic on client-supplied protocol values in the encrypt path is audited for the same pattern
 <!-- AC:END -->
+
+## Implementation Notes
+
+<!-- SECTION:NOTES:BEGIN -->
+`placeholder_index` is now `…parse::<usize>().ok()?.checked_sub(1)`, so `$0` returns `None`.
+
+AC#2 was already satisfied by wave0's restructuring, which checks `placeholder_index(...).is_some()` before rewriting the column to an index prefix: an unresolvable placeholder is an `Unprotected::Predicate` site, so the comparison is left alone rather than half-rewritten.
+AC#3: `a_zero_placeholder_resolves_to_nothing_and_leaves_the_statement_alone` drives `$0` through Query and Parse for the search, insert and update paths and asserts no panic and no rewrite. It runs under the debug profile like every other unit test, which is the profile that used to panic.
+AC#4 (audit): the only unchecked arithmetic on a client-supplied numeric in the encrypt path was this one. `Error::ConflictingParameter` uses `saturating_add`; the SQL-text scanner's index arithmetic (`skip_quoted`, `skip_dollar_quoted`, `skip_block_comment`, `push_statement`, `ScopedTable::matches`) is either `.get()`-based or guarded by an explicit length/position check; frame lengths are checked in `session::encode_frame_header` and `dbsec_core::pgwire`.
+<!-- SECTION:NOTES:END -->

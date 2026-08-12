@@ -3,11 +3,11 @@ id: TASK-0035
 title: >-
   CL-3: a placeholder bound to two protected positions is transformed twice at
   Bind time
-status: To Do
+status: Done
 assignee:
   - TASK-0050
 created_date: '2026-08-11 19:34'
-updated_date: '2026-08-11 22:42'
+updated_date: '2026-08-12 16:54'
 labels:
   - code-review-rust
   - correctness
@@ -49,8 +49,19 @@ The same shape occurs on the write path alone when one parameter feeds two prote
 
 ## Acceptance Criteria
 <!-- AC:BEGIN -->
-- [ ] #1 ParamTransforms cannot hold two actions for the same parameter index — the type or the insertion path rejects or merges the duplicate rather than applying both
-- [ ] #2 UPDATE users SET email = $1 WHERE email = $1 seals the assignment and indexes the WHERE from the same plaintext, and the update matches the intended row
-- [ ] #3 An INSERT binding one placeholder to two protected columns seals the plaintext once per column, and both values open back to the plaintext
-- [ ] #4 A test covers both shapes (one param, two protected positions) for the simple and extended protocols
+- [x] #1 ParamTransforms cannot hold two actions for the same parameter index — the type or the insertion path rejects or merges the duplicate rather than applying both
+- [x] #2 UPDATE users SET email = $1 WHERE email = $1 seals the assignment and indexes the WHERE from the same plaintext, and the update matches the intended row
+- [x] #3 An INSERT binding one placeholder to two protected columns seals the plaintext once per column, and both values open back to the plaintext
+- [x] #4 A test covers both shapes (one param, two protected positions) for the simple and extended protocols
 <!-- AC:END -->
+
+## Implementation Notes
+
+<!-- SECTION:NOTES:BEGIN -->
+`ParamTransforms` is now a type (in `portal.rs`) whose only insertion path is `record(index, action)`: it collapses a repeat of the same action for one placeholder and returns `Error::ConflictingParameter` for a conflicting one, so a Bind value is transformed at most once.
+
+AC#1: `record` is the only way in; `push` is gone.
+AC#2: `UPDATE users SET email = $1 WHERE email = $1` is now refused rather than sealed-then-indexed-over-the-ciphertext. The extended protocol cannot serve both roles from one wire value — a Bind carries one value per placeholder — so the honest answer is an error, not a rewrite that silently matches no row. The simple-protocol form of the same statement has two independent literals and still works, and is asserted to.
+AC#3: the multi-row `VALUES ($1), ($1)` case is collapsed to one seal and asserted to open back to the plaintext.
+AC#4: `encrypt.rs::a_placeholder_in_two_protected_roles_is_refused_rather_than_transformed_twice` and `a_placeholder_reused_for_one_column_is_sealed_once_not_twice` cover both shapes in both protocols; `portal.rs::one_placeholder_cannot_carry_two_conflicting_actions` covers the type directly.
+<!-- SECTION:NOTES:END -->

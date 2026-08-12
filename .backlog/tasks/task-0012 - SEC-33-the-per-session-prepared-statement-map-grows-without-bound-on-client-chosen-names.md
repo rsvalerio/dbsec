@@ -3,11 +3,11 @@ id: TASK-0012
 title: >-
   SEC-33: the per-session prepared-statement map grows without bound on
   client-chosen names
-status: To Do
+status: Done
 assignee:
   - TASK-0050
 created_date: '2026-08-11 19:13'
-updated_date: '2026-08-11 22:42'
+updated_date: '2026-08-12 16:54'
 labels:
   - code-review-rust
   - security
@@ -36,7 +36,19 @@ Entries are removed only by an explicit `Close` with the `'S'` target (line 159)
 
 ## Acceptance Criteria
 <!-- AC:BEGIN -->
-- [ ] #1 The statement map has a documented maximum entry count, and exceeding it is a session error rather than unbounded growth
-- [ ] #2 The statement-name length used as a key is bounded
-- [ ] #3 A test asserts that a client issuing more than the cap in distinct named Parse messages is rejected instead of growing the map
+- [x] #1 The statement map has a documented maximum entry count, and exceeding it is a session error rather than unbounded growth
+- [x] #2 The statement-name length used as a key is bounded
+- [x] #3 A test asserts that a client issuing more than the cap in distinct named Parse messages is rejected instead of growing the map
 <!-- AC:END -->
+
+## Implementation Notes
+
+<!-- SECTION:NOTES:BEGIN -->
+The per-session prepared-statement map moved into `portal.rs`, where every map keyed by a client-chosen name is capped.
+
+AC#1: `MAX_PREPARED_STATEMENTS` (1024) and `MAX_PORTALS` (1024); exceeding either is `Error::SessionLimit`, which fails the session. Re-parsing a name already held still works, and a `Close` frees the slot, so no real driver can reach the cap.
+AC#2: `MAX_NAME_LEN` (256 bytes) on statement, portal and describe-target names — `Error::NameTooLong`.
+AC#3: `encrypt.rs::parse_messages_are_refused_once_the_statement_cap_is_reached` fills the cap through real Parse frames, asserts the refusal, asserts a Close frees a slot, and asserts an over-long name is refused. `portal.rs::client_chosen_names_and_pipelines_are_bounded` covers the same limits directly.
+
+Also bounded while restructuring: the outstanding-response queue (`MAX_PENDING_RESPONSES`, 4096), which the new read/write agreement adds and which a client that pipelines without ever sending Sync would otherwise grow for the life of the session.
+<!-- SECTION:NOTES:END -->

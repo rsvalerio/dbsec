@@ -3,11 +3,11 @@ id: TASK-0044
 title: >-
   CL-3: DataRows with no preceding RowDescription are decrypted using the
   previous result set's column positions
-status: To Do
+status: Done
 assignee:
   - TASK-0050
 created_date: '2026-08-11 21:04'
-updated_date: '2026-08-11 22:42'
+updated_date: '2026-08-12 16:54'
 labels:
   - code-review-rust
   - read-path
@@ -54,9 +54,24 @@ The correct fix is to key the DataRow's protected positions to the portal/statem
 
 ## Acceptance Criteria
 <!-- AC:BEGIN -->
-- [ ] #1 A DataRow that arrives with no known RowDescription for its portal never relays a protected column untouched — it is either decrypted using the correct positions or fails the session
-- [ ] #2 Protected positions are associated with the portal/statement the DataRow belongs to, not with the most recent 'T' frame on the connection
-- [ ] #3 A unit test in rows.rs interleaves two described statements and re-executes the first, asserting its protected column is still decrypted
-- [ ] #4 A unit test asserts a DataRow arriving with no prior RowDescription does not pass a protected value through in stored form
-- [ ] #5 An e2e test exercises a driver's prepared-statement cache with at least two distinct statements over the same connection and asserts both decrypt correctly
+- [x] #1 A DataRow that arrives with no known RowDescription for its portal never relays a protected column untouched — it is either decrypted using the correct positions or fails the session
+- [x] #2 Protected positions are associated with the portal/statement the DataRow belongs to, not with the most recent 'T' frame on the connection
+- [x] #3 A unit test in rows.rs interleaves two described statements and re-executes the first, asserting its protected column is still decrypted
+- [x] #4 A unit test asserts a DataRow arriving with no prior RowDescription does not pass a protected value through in stored form
+- [x] #5 An e2e test exercises a driver's prepared-statement cache with at least two distinct statements over the same connection and asserts both decrypt correctly
 <!-- AC:END -->
+
+## Implementation Notes
+
+<!-- SECTION:NOTES:BEGIN -->
+Fixed by keying protected column positions to the portal/statement rather than to the last 'T' frame.
+
+New `crates/proxy/src/portal.rs` holds one `SessionPortals` per session, shared by both relay directions. The write path records Parse/Bind/Describe/Execute/Sync; the read path consumes those expectations in order and asks `row_source()` which statement the DataRows now in flight belong to. A RowDescription is attributed to the Describe that asked for it and stored on the statement, so every later Execute of that statement — the steady state of every prepared-statement cache — decrypts with its own positions. `NoData` counts as a description (empty positions), so an Execute of a statement that returns no rows cannot fall back to another statement's positions. Recovery is anchored on ReadyForQuery.
+
+AC#1: `RowSource::Undescribed` and a `LastDescription` with no prior 'T' both return `Error::UndescribedRow`, which fails the session rather than relaying. Documented in README as a deliberate, non-configurable fail-closed.
+AC#2: positions live on the `Statement` entry, reached through the portal the Execute names.
+AC#3/#4: `rows.rs::a_cached_statement_decrypts_with_its_own_positions_not_the_last_described_ones` and `a_data_row_no_description_covers_fails_instead_of_relaying_stored_values`.
+AC#5: `e2e.rs::a_cached_prepared_statement_decrypts_with_its_own_columns` — two prepared statements interleaved over one connection through the real binary, including one pipelined pair.
+
+Found and fixed while proving it: PostgreSQL ignores Flush/Sync in copy-in mode, so a driver's pipelined Sync leaves a batch marker no ReadyForQuery ever answers and every later response is attributed one expectation early. `SessionPortals::copy_data`, driven by the client's CopyData/CopyDone/CopyFail, drops exactly those markers.
+<!-- SECTION:NOTES:END -->
