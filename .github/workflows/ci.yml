@@ -8,3 +8,16 @@ on:
 jobs:
   rust:
     uses: rsvalerio/forge/.github/workflows/rust-ci.yml@v1
+
+  # The reusable workflows above follow forge automatically because they are
+  # referenced by tag; the config files copied out of forge do not. This job is
+  # what makes "keep in sync" a checked claim rather than a remembered one.
+  forge-sync:
+    name: forge config drift
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+      - run: ./scripts/forge-sync-check.sh

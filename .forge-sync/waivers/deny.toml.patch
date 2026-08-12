@@ -1,0 +1,11 @@
+# reason: dbsec pins the ring LICENSE hash in [[licenses.clarify]]; the forge baseline states the expression only, and without the file hash cargo-deny cannot confirm the vendored BoringSSL license text that this repo's Cargo.lock actually resolves to.
+--- forge/config/deny.toml
++++ deny.toml
+@@ -41,6 +41,7 @@
+ [[licenses.clarify]]
+ name = "ring"
+ expression = "MIT AND ISC AND OpenSSL"
++license-files = [{ path = "LICENSE", hash = 0xbd0eed23 }]
+
+ [bans]
+ multiple-versions = "warn"

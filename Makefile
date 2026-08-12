@@ -1,6 +1,6 @@
 # Developer entrypoint for dbsec. `make help` lists targets.
 SHELL := /bin/bash
-.PHONY: help build release run test e2e e2e-vault fuzz fmt clippy check deny cog-check pre-release clean
+.PHONY: help build release run test e2e e2e-vault fuzz fmt clippy check deny forge-sync cog-check pre-release clean
 
 E2E_PG := dbsec-e2e-pg
 E2E_BAO := dbsec-e2e-bao
@@ -94,13 +94,18 @@ check: ## All QA gates via ops
 deny: ## Dependency audit: licenses, advisories, bans (deny.toml)
 	cargo deny check
 
+# Deliberate divergence is recorded as a waiver rather than exempting the file:
+# `FORGE_SYNC_REASON='...' ./scripts/forge-sync-check.sh --update`.
+forge-sync: ## Check the configs copied from forge against the tag CI pins
+	./scripts/forge-sync-check.sh
+
 cog-check: ## Validate conventional commits since last tag + dry-run the version bump
 	@command -v cog >/dev/null || { echo "cog not found — install with: brew install cocogitto"; exit 1; }
 	@if git describe --tags --abbrev=0 >/dev/null 2>&1; then cog check --from-latest-tag; \
 	else echo "no tags yet — skipping cog check (bump dry-run still parses commits)"; fi
 	cog bump --auto --dry-run
 
-pre-release: check deny cog-check ## Everything CI will run, locally
+pre-release: check deny forge-sync cog-check ## Everything CI will run, locally
 
 clean: ## Remove build artifacts
 	cargo clean

@@ -1,0 +1,9 @@
+# Files copied from rsvalerio/forge, checked for drift by
+# `scripts/forge-sync-check.sh` (see `make forge-sync`) against the tag
+# `.github/workflows/` pins forge at.
+#
+# <path in this repo>   <path in rsvalerio/forge>
+clippy.toml             config/clippy.toml
+deny.toml               config/deny.toml
+rustfmt.toml            config/rustfmt.toml
+CONTRIBUTING.md         templates/CONTRIBUTING.md
