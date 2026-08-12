@@ -3,11 +3,11 @@ id: TASK-0040
 title: >-
   ASYNC-6: the Vault client is built with no timeout, so a hung server blocks a
   runtime worker indefinitely
-status: To Do
+status: Done
 assignee:
   - TASK-0052
 created_date: '2026-08-11 19:36'
-updated_date: '2026-08-11 22:42'
+updated_date: '2026-08-12 16:10'
 labels:
   - code-review-rust
   - async
@@ -55,8 +55,8 @@ A cache miss is client-reachable: the key id comes out of the stored ciphertext 
 
 ## Acceptance Criteria
 <!-- AC:BEGIN -->
-- [ ] #1 The Vault client is constructed with an explicit request timeout, configurable from [vault] with a documented default
-- [ ] #2 Confirm and record what vaultrs 0.7 / its transport defaults to when no timeout is set, so the finding's premise is verified rather than assumed
-- [ ] #3 A Vault call that exceeds the timeout returns Error::Vault naming the operation, and the relay fails the session rather than stalling
-- [ ] #4 The runtime-path calls (fetch_dek, fetch_or_create_index_key) cannot hold a worker thread past the timeout
+- [x] #1 The Vault client is constructed with an explicit request timeout, configurable from [vault] with a documented default
+- [x] #2 Confirm and record what vaultrs 0.7 / its transport defaults to when no timeout is set, so the finding's premise is verified rather than assumed
+- [x] #3 A Vault call that exceeds the timeout returns Error::Vault naming the operation, and the relay fails the session rather than stalling
+- [x] #4 The runtime-path calls (fetch_dek, fetch_or_create_index_key) cannot hold a worker thread past the timeout
 <!-- AC:END -->

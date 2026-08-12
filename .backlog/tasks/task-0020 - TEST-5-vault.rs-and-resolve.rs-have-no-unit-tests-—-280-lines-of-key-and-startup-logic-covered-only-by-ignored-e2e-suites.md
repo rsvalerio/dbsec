@@ -3,11 +3,11 @@ id: TASK-0020
 title: >-
   TEST-5: vault.rs and resolve.rs have no unit tests — 280 lines of key and
   startup logic covered only by ignored e2e suites
-status: To Do
+status: Done
 assignee:
   - TASK-0052
 created_date: '2026-08-11 19:15'
-updated_date: '2026-08-11 22:42'
+updated_date: '2026-08-12 16:10'
 labels:
   - code-review-rust
   - tests
@@ -46,8 +46,8 @@ Specific untested behaviour, all of it failure-path:
 
 ## Acceptance Criteria
 <!-- AC:BEGIN -->
-- [ ] #1 decode_key_b64 and decode_key_hex have unit tests covering bad encoding, wrong length, and success
-- [ ] #2 The readable/mask filter in resolve_columns is covered by a unit test, including a column that is neither readable nor masked and must not enter the map
-- [ ] #3 The mint-vs-reuse branch of the index-key path is tested behind a seam that does not require a live Vault
-- [ ] #4 cargo test with no external services reports non-zero coverage for both files
+- [x] #1 decode_key_b64 and decode_key_hex have unit tests covering bad encoding, wrong length, and success
+- [x] #2 The readable/mask filter in resolve_columns is covered by a unit test, including a column that is neither readable nor masked and must not enter the map
+- [x] #3 The mint-vs-reuse branch of the index-key path is tested behind a seam that does not require a live Vault
+- [x] #4 cargo test with no external services reports non-zero coverage for both files
 <!-- AC:END -->

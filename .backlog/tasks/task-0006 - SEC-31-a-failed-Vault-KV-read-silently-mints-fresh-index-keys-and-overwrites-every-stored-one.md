@@ -3,11 +3,11 @@ id: TASK-0006
 title: >-
   SEC-31: a failed Vault KV read silently mints fresh index keys and overwrites
   every stored one
-status: To Do
+status: Done
 assignee:
   - TASK-0052
 created_date: '2026-08-11 19:12'
-updated_date: '2026-08-11 22:42'
+updated_date: '2026-08-12 16:10'
 labels:
   - code-review-rust
   - security
@@ -45,7 +45,7 @@ Nothing surfaces the loss: `kv2::set` succeeds, the proxy logs `minted new deter
 
 ## Acceptance Criteria
 <!-- AC:BEGIN -->
-- [ ] #1 kv2::read failure is propagated as an error rather than collapsed to an empty map; only a genuine not-found is treated as 'no keys stored yet'
-- [ ] #2 Minting a new index key never writes back a map missing entries that are present in the store
-- [ ] #3 A test covers both branches: read error -> index_key fails without writing; read not-found -> key is minted and stored
+- [x] #1 kv2::read failure is propagated as an error rather than collapsed to an empty map; only a genuine not-found is treated as 'no keys stored yet'
+- [x] #2 Minting a new index key never writes back a map missing entries that are present in the store
+- [x] #3 A test covers both branches: read error -> index_key fails without writing; read not-found -> key is minted and stored
 <!-- AC:END -->

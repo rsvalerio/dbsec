@@ -3,11 +3,11 @@ id: TASK-0003
 title: >-
   Deterministic keys (blind index, FPE, token) have no rotation or re-index path
   — a leak is unrecoverable
-status: To Do
+status: Done
 assignee:
   - TASK-0052
 created_date: '2026-08-11 20:40'
-updated_date: '2026-08-11 22:42'
+updated_date: '2026-08-12 16:10'
 labels:
   - security
   - keys
@@ -34,8 +34,19 @@ The cheapest real improvement is a **dual-key read window**: accept indexes comp
 
 ## Acceptance Criteria
 <!-- AC:BEGIN -->
-- [ ] #1 A key-compromise recovery procedure for deterministic keys is written down in plans/PLAN.md or a runbook
-- [ ] #2 A decision is recorded on whether the proxy supports a dual-key read window for blind indexes, or leaves re-indexing entirely to the operator
+- [x] #1 A key-compromise recovery procedure for deterministic keys is written down in plans/PLAN.md or a runbook
+- [x] #2 A decision is recorded on whether the proxy supports a dual-key read window for blind indexes, or leaves re-indexing entirely to the operator
 - [ ] #3 If dual-key is adopted: index_key resolution accepts an ordered set of keys on read and uses only the newest on write
-- [ ] #4 Index keys are versioned in KV rather than stored under one unversioned name, so a rotation is expressible at all
+- [x] #4 Index keys are versioned in KV rather than stored under one unversioned name, so a rotation is expressible at all
 <!-- AC:END -->
+
+## Implementation Notes
+
+<!-- SECTION:NOTES:BEGIN -->
+Resolved in TASK-0052 (wave3).
+
+AC #3 is conditional on adopting a dual-key read window. It was considered and **not** adopted; the decision and its rationale are recorded in `plans/PLAN.md` under "Deterministic key rotation and compromise recovery" (a dual-key window only helps blind index — FPE has no way to tell which key produced a stored value and tokens are irreversible — while adding a disjunction to every searchable query). AC #3 is therefore not applicable rather than outstanding.
+
+Implemented: AC #4 — index keys are versioned in KV (`{path}/index_keys/{name}` holding `current` plus a `version -> key` map) instead of one unversioned shared map, so a rotation is expressible and superseded key material survives it.
+Designed/documented only: AC #1 and #2 — the compromise-recovery runbook (revoke, take the column out of search, mint the next version, operator re-index, drop the old version) is written down; the re-index itself remains an operator migration the proxy does not drive.
+<!-- SECTION:NOTES:END -->

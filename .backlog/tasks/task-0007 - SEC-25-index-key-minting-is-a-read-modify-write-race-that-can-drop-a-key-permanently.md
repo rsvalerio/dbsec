@@ -3,11 +3,11 @@ id: TASK-0007
 title: >-
   SEC-25: index-key minting is a read-modify-write race that can drop a key
   permanently
-status: To Do
+status: Done
 assignee:
   - TASK-0052
 created_date: '2026-08-11 19:12'
-updated_date: '2026-08-11 22:42'
+updated_date: '2026-08-12 16:10'
 labels:
   - code-review-rust
   - security
@@ -32,7 +32,7 @@ The window is wider than the comment suggests. It is not only two proxies starti
 
 ## Acceptance Criteria
 <!-- AC:BEGIN -->
-- [ ] #1 Index-key creation is atomic against concurrent writers — KV v2 check-and-set on the read version, per-key paths instead of one shared map, or a documented startup-only provisioning step that refuses to mint at runtime
-- [ ] #2 A losing writer detects the conflict and re-reads rather than overwriting
-- [ ] #3 The behaviour under concurrent minting is documented in the module docs and covered by a test or an e2e case with two proxies
+- [x] #1 Index-key creation is atomic against concurrent writers — KV v2 check-and-set on the read version, per-key paths instead of one shared map, or a documented startup-only provisioning step that refuses to mint at runtime
+- [x] #2 A losing writer detects the conflict and re-reads rather than overwriting
+- [x] #3 The behaviour under concurrent minting is documented in the module docs and covered by a test or an e2e case with two proxies
 <!-- AC:END -->

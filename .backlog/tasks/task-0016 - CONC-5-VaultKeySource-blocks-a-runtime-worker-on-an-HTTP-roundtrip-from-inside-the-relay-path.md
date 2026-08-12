@@ -3,11 +3,11 @@ id: TASK-0016
 title: >-
   CONC-5: VaultKeySource blocks a runtime worker on an HTTP roundtrip from
   inside the relay path
-status: To Do
+status: Done
 assignee:
   - TASK-0052
 created_date: '2026-08-11 19:14'
-updated_date: '2026-08-11 22:42'
+updated_date: '2026-08-12 16:10'
 labels:
   - code-review-rust
   - async
@@ -44,7 +44,7 @@ The structural fix is to resolve keys asynchronously (prefetch at startup, or ma
 
 ## Acceptance Criteria
 <!-- AC:BEGIN -->
-- [ ] #1 Vault roundtrips reached from the relay path are bounded by a timeout
-- [ ] #2 Unknown key ids are negatively cached (with a bound/TTL) so one unopenable column does not issue a Vault request per value
-- [ ] #3 The multi-thread-runtime requirement of block_in_place is documented on VaultKeySource, or the design is changed so it no longer applies
+- [x] #1 Vault roundtrips reached from the relay path are bounded by a timeout
+- [x] #2 Unknown key ids are negatively cached (with a bound/TTL) so one unopenable column does not issue a Vault request per value
+- [x] #3 The multi-thread-runtime requirement of block_in_place is documented on VaultKeySource, or the design is changed so it no longer applies
 <!-- AC:END -->
