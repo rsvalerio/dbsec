@@ -3,11 +3,11 @@ id: TASK-0023
 title: >-
   TEST-31: no test runs the dbsec binary as a command — argument handling and
   exit codes are uncovered
-status: To Do
+status: Done
 assignee:
   - TASK-0056
 created_date: '2026-08-11 19:16'
-updated_date: '2026-08-11 22:42'
+updated_date: '2026-08-12 16:28'
 labels:
   - code-review-rust
   - tests
@@ -40,7 +40,18 @@ The stdout-vs-stderr question should be settled explicitly in the same change ra
 
 ## Acceptance Criteria
 <!-- AC:BEGIN -->
-- [ ] #1 A test binary runs dbsec as a process (assert_cmd or equivalent) covering: explicit config path, missing config path, no argument with ./dbsec.toml present, no argument without it, and malformed TOML
-- [ ] #2 Each case asserts the exit code and that the diagnostic names the offending path
-- [ ] #3 The stream the log output goes to is a deliberate, documented choice, and a test pins it
+- [x] #1 A test binary runs dbsec as a process (assert_cmd or equivalent) covering: explicit config path, missing config path, no argument with ./dbsec.toml present, no argument without it, and malformed TOML
+- [x] #2 Each case asserts the exit code and that the diagnostic names the offending path
+- [x] #3 The stream the log output goes to is a deliberate, documented choice, and a test pins it
 <!-- AC:END -->
+
+## Implementation Notes
+
+<!-- SECTION:NOTES:BEGIN -->
+Implemented in wave TASK-0056.
+
+- Cases covered by `crates/proxy/tests/cli.rs`: explicit config path (wins over a `dbsec.toml` in the cwd), no argument with `./dbsec.toml`, no argument without one, a missing config path, malformed TOML, and a config that parses but fails validation.
+- AC #2 substitution: the two cases where the proxy starts successfully have no exit code to assert (the binary is a long-running server), so they assert the process is still serving and that the startup log names the config actually loaded. The three failing cases assert exit code 1 plus the offending path.
+- The "no argument, no `dbsec.toml`" case observes the defaults by taking `127.0.0.1:6432` away first and asserting the bind failure names it, rather than binding a fixed global port in a suite that runs alongside the e2e suites and other checkouts. `main.rs` gained an `Error::Listen { addr, source }` variant so that diagnostic names the address.
+- AC #3: diagnostics now go to stderr (`with_writer(std::io::stderr)`), with ANSI colour enabled only when stderr is a terminal; the choice is documented at the call site and pinned by asserting stdout stays empty in every case.
+<!-- SECTION:NOTES:END -->

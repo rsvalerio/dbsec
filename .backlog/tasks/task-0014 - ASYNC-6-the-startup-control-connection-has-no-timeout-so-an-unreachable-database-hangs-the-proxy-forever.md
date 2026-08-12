@@ -3,11 +3,11 @@ id: TASK-0014
 title: >-
   ASYNC-6: the startup control connection has no timeout, so an unreachable
   database hangs the proxy forever
-status: To Do
+status: Done
 assignee:
   - TASK-0056
 created_date: '2026-08-11 19:13'
-updated_date: '2026-08-11 22:42'
+updated_date: '2026-08-12 16:28'
 labels:
   - code-review-rust
   - async
@@ -37,8 +37,8 @@ This is inconsistent with the data path, which does get a deadline: `session.rs:
 
 ## Acceptance Criteria
 <!-- AC:BEGIN -->
-- [ ] #1 The control-connection connect is wrapped in a timeout, reusing or generalizing session.rs's CONNECT_TIMEOUT rather than introducing a second unrelated constant
-- [ ] #2 The per-column lookup query is bounded by a timeout as well
-- [ ] #3 A timeout produces a distinct Error variant naming the control DSN host, and startup exits non-zero
-- [ ] #4 A test covers a control endpoint that accepts TCP but never responds, asserting startup fails within the deadline
+- [x] #1 The control-connection connect is wrapped in a timeout, reusing or generalizing session.rs's CONNECT_TIMEOUT rather than introducing a second unrelated constant
+- [x] #2 The per-column lookup query is bounded by a timeout as well
+- [x] #3 A timeout produces a distinct Error variant naming the control DSN host, and startup exits non-zero
+- [x] #4 A test covers a control endpoint that accepts TCP but never responds, asserting startup fails within the deadline
 <!-- AC:END -->

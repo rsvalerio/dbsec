@@ -3,11 +3,11 @@ id: TASK-0041
 title: >-
   ERR-11: serve() restates a config invariant with unreachable! and expect
   instead of encoding it in the type
-status: To Do
+status: Done
 assignee:
   - TASK-0056
 created_date: '2026-08-11 19:36'
-updated_date: '2026-08-11 22:42'
+updated_date: '2026-08-12 16:28'
 labels:
   - code-review-rust
   - error-handling
@@ -42,7 +42,7 @@ Both invariants are real, but they are enforced in `Config::validate` (`config.r
 
 ## Acceptance Criteria
 <!-- AC:BEGIN -->
-- [ ] #1 Validation produces a type in which exactly one key source and a present control_dsn are structurally guaranteed, rather than re-checked at the use site
-- [ ] #2 serve() constructs the key source and reads the DSN with no unreachable! and no expect
-- [ ] #3 Config::default() cannot produce a value that reaches the key-source selection in an invalid state
+- [x] #1 Validation produces a type in which exactly one key source and a present control_dsn are structurally guaranteed, rather than re-checked at the use site
+- [x] #2 serve() constructs the key source and reads the DSN with no unreachable! and no expect
+- [x] #3 Config::default() cannot produce a value that reaches the key-source selection in an invalid state
 <!-- AC:END -->

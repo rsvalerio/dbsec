@@ -3,11 +3,11 @@ id: TASK-0021
 title: >-
   DUP-4: the two arms of resolve::connect duplicate the whole connect-and-spawn
   body
-status: To Do
+status: Done
 assignee:
   - TASK-0056
 created_date: '2026-08-11 19:15'
-updated_date: '2026-08-11 22:42'
+updated_date: '2026-08-12 16:28'
 labels:
   - code-review-rust
   - duplication
@@ -44,6 +44,6 @@ Ok(client)
 
 ## Acceptance Criteria
 <!-- AC:BEGIN -->
-- [ ] #1 The connect-and-spawn body exists once, as a generic helper over MakeTlsConnect, called by both arms
-- [ ] #2 Behaviour is unchanged: the same error mapping and the same connection-task warning on both paths
+- [x] #1 The connect-and-spawn body exists once, as a generic helper over MakeTlsConnect, called by both arms
+- [x] #2 Behaviour is unchanged: the same error mapping and the same connection-task warning on both paths
 <!-- AC:END -->

@@ -3,11 +3,11 @@ id: TASK-0042
 title: >-
   TEST-6: every error path in tls.rs is uncovered — bad certs, an empty CA
   bundle and an invalid hostname are never exercised
-status: To Do
+status: Done
 assignee:
   - TASK-0056
 created_date: '2026-08-11 19:36'
-updated_date: '2026-08-11 22:42'
+updated_date: '2026-08-12 16:28'
 labels:
   - code-review-rust
   - tests
@@ -48,8 +48,8 @@ The happy paths are covered indirectly by `session.rs`'s tests, which build a re
 
 ## Acceptance Criteria
 <!-- AC:BEGIN -->
-- [ ] #1 load_certs is tested for a missing file, an unparseable file and a syntactically valid file containing no certificates, asserting the Error::TlsConfig message names the path
-- [ ] #2 load_key is tested for a missing and an unparseable key file
-- [ ] #3 TlsContext::from_config is tested for a mismatched cert/key pair and an invalid upstream hostname
-- [ ] #4 The upstream hostname default is tested end to end — [tls.upstream] without hostname derives the name from the upstream address
+- [x] #1 load_certs is tested for a missing file, an unparseable file and a syntactically valid file containing no certificates, asserting the Error::TlsConfig message names the path
+- [x] #2 load_key is tested for a missing and an unparseable key file
+- [x] #3 TlsContext::from_config is tested for a mismatched cert/key pair and an invalid upstream hostname
+- [x] #4 The upstream hostname default is tested end to end — [tls.upstream] without hostname derives the name from the upstream address
 <!-- AC:END -->

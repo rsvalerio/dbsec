@@ -3,11 +3,11 @@ id: TASK-0048
 title: >-
   SEC-8: install_crypto_provider discards the install result, so the proxy may
   run TLS on a provider it did not choose
-status: To Do
+status: Done
 assignee:
   - TASK-0056
 created_date: '2026-08-11 21:05'
-updated_date: '2026-08-11 22:42'
+updated_date: '2026-08-12 16:28'
 labels:
   - code-review-rust
   - security
@@ -49,8 +49,14 @@ Related: [[task-0042]] covers the missing error-path coverage in the rest of thi
 
 ## Acceptance Criteria
 <!-- AC:BEGIN -->
-- [ ] #1 install_crypto_provider inspects the install_default result instead of discarding it
-- [ ] #2 A provider other than the intended one being already installed is either a startup error or a warn-level log naming the provider actually in force
-- [ ] #3 install_crypto_provider's return type lets TlsContext::from_config propagate the failure through the existing Error::TlsConfig path
-- [ ] #4 A test asserts the outcome is observable — a second install attempt with a different provider is reported rather than silently ignored
+- [x] #1 install_crypto_provider inspects the install_default result instead of discarding it
+- [x] #2 A provider other than the intended one being already installed is either a startup error or a warn-level log naming the provider actually in force
+- [x] #3 install_crypto_provider's return type lets TlsContext::from_config propagate the failure through the existing Error::TlsConfig path
+- [x] #4 A test asserts the outcome is observable — a second install attempt with a different provider is reported rather than silently ignored
 <!-- AC:END -->
+
+## Implementation Notes
+
+<!-- SECTION:NOTES:BEGIN -->
+Implemented in wave TASK-0056. One correction to the obvious reading of the rustls API, worth recording: `CryptoProvider::install_default` returns `Err(Arc<CryptoProvider>)` carrying the provider it **rejected** (the one you passed), not the one already in force — it is `OnceLock::set` underneath. Comparing that value against the intended provider is therefore vacuous. `install_crypto_provider` reads the provider actually in force back with `CryptoProvider::get_default()` and compares negotiation policy (cipher suites + key exchange groups, since providers carry no name); a mismatch fails startup through `Error::TlsConfig`. The test pins the `install_default` semantics so the check cannot silently regress to the vacuous form.
+<!-- SECTION:NOTES:END -->
