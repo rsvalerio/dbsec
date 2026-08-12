@@ -280,6 +280,15 @@ pub struct Config {
     /// backend connection) well inside a 1024 `ulimit -n`.
     #[serde(default = "default_max_sessions")]
     pub max_sessions: usize,
+    /// How often the `[[column]]` list is re-resolved to `(table oid, attnum)`
+    /// against the live catalog. The read path matches on those, the write
+    /// path matches on names, so a migration that recreates a table or a
+    /// column desynchronises them until the next resolution — writes keep
+    /// being encrypted while reads relay stored values. `0` disables the
+    /// timer and leaves only the on-demand re-resolution a session triggers
+    /// when it sees a result column it cannot explain.
+    #[serde(default = "default_column_refresh_secs")]
+    pub column_refresh_secs: u64,
     #[serde(default)]
     pub tls: TlsSection,
     /// What to do with a statement the proxy cannot protect — see
@@ -486,6 +495,14 @@ fn default_max_sessions() -> usize {
     256
 }
 
+/// Five minutes: short enough that a migration is picked up well inside a
+/// deploy window, long enough that the control connection is idle in every
+/// steady state. The on-demand trigger is what actually bounds the exposure;
+/// this is the backstop for a migration nobody reads across.
+fn default_column_refresh_secs() -> u64 {
+    300
+}
+
 impl Default for Config {
     fn default() -> Self {
         Self {
@@ -496,6 +513,7 @@ impl Default for Config {
             control_dsn: None,
             startup_timeout_secs: default_startup_timeout_secs(),
             max_sessions: default_max_sessions(),
+            column_refresh_secs: default_column_refresh_secs(),
             tls: TlsSection::default(),
             on_unprotected: OnUnprotected::default(),
             columns: Vec::new(),

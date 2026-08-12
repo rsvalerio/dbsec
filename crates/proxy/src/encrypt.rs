@@ -7,6 +7,15 @@
 //! seals any inline literals); `Bind` seals those parameters. Seal errors fail
 //! the session.
 //!
+//! The extended protocol's per-session state does not live here but in
+//! [`crate::portal`], which the read path shares: this direction is the only
+//! one that sees which statement a portal was bound to and which portal is
+//! being executed, and the read path cannot decrypt a DataRow correctly
+//! without knowing both. Every expectation recorded there is recorded only for
+//! a frame that is actually forwarded upstream — a refused statement is
+//! answered by the proxy and never reaches the backend, so queueing a response
+//! for it would leave the read path waiting for an answer nobody will send.
+//!
 //! # Statements the rewrite cannot cover
 //!
 //! Every place a write to a protected column is *not* rewritten is an
@@ -98,6 +107,7 @@ use sqlparser::parser::{Parser, ParserError};
 
 use crate::columns::ProtectedColumn;
 use crate::config::OnUnprotected;
+use crate::portal::{ParamAction, ParamTransforms, SessionPortals, Target};
 use crate::session::FrameAction;
 use crate::Error;
 
@@ -157,20 +167,6 @@ fn normalize(ident: &Ident) -> String {
     }
 }
 
-/// What Bind must do to one parameter of a prepared statement.
-#[derive(Clone)]
-enum ParamAction {
-    /// The parameter feeds a protected column: seal it.
-    Seal(Arc<dyn FieldTransform>),
-    /// The parameter is compared for equality against a searchable column:
-    /// replace it with the blind index (the SQL was rewritten to match the
-    /// index prefix).
-    SearchIndex(Arc<dyn FieldTransform>),
-}
-
-/// Which parameter placeholders of a prepared statement need transforming.
-type ParamTransforms = Vec<(usize, ParamAction)>;
-
 /// Why a rewrite stopped: the session cannot continue, or this one statement
 /// is refused and the client is told why.
 enum Rejection {
@@ -198,10 +194,13 @@ enum SqlOutcome {
 }
 
 /// Per-session write-path state: rewrites Query/Parse SQL and Bind
-/// parameters using the shared catalog, remembering prepared statements.
+/// parameters using the shared catalog. What it learns about statements and
+/// portals goes into [`SessionPortals`], which the read path shares.
 pub struct QueryRewriter {
     catalog: Arc<WriteCatalog>,
-    statements: HashMap<Vec<u8>, ParamTransforms>,
+    /// Prepared statements, portals and the responses the backend still owes,
+    /// shared with the read path. Bounded — every key here is client-chosen.
+    portals: Arc<SessionPortals>,
     /// The backend's transaction status, as last seen by the upstream→client
     /// relay. Read only to pick the status byte of a synthesized
     /// ReadyForQuery, so a relaxed load of a possibly stale value is exactly
@@ -218,16 +217,11 @@ pub struct QueryRewriter {
 impl QueryRewriter {
     pub fn new(
         catalog: Arc<WriteCatalog>,
+        portals: Arc<SessionPortals>,
         tx_status: Arc<AtomicU8>,
         search_path_trusted: bool,
     ) -> Self {
-        Self {
-            catalog,
-            statements: HashMap::new(),
-            tx_status,
-            search_path_trusted,
-            awaiting_sync: false,
-        }
+        Self { catalog, portals, tx_status, search_path_trusted, awaiting_sync: false }
     }
 
     /// Inspects one client→upstream frame, returning what the relay should do
@@ -241,19 +235,28 @@ impl QueryRewriter {
                 let mut sql = body;
                 let query = pgwire::take_cstr(&mut sql).map_err(Error::Wire)?;
                 match self.rewrite_sql(query)? {
+                    // Refused here, so the backend never sees it and owes no
+                    // ReadyForQuery: the proxy answers with its own, and no
+                    // batch is recorded.
                     SqlOutcome::Refuse(message) => {
                         let mut reply = error_response(&message);
                         reply.extend_from_slice(&self.ready_for_query());
                         Ok(FrameAction::Reply(reply))
                     }
-                    SqlOutcome::Rewrite(outcome) => Ok(match outcome.rewritten {
-                        None => FrameAction::Relay,
-                        Some(rewritten) => {
-                            let mut new_body = rewritten.into_bytes();
-                            new_body.push(0);
-                            FrameAction::Replace(new_body)
-                        }
-                    }),
+                    SqlOutcome::Rewrite(outcome) => {
+                        // A simple Query is its own batch: the backend answers
+                        // it with a ReadyForQuery, which is where the read
+                        // path resynchronises.
+                        self.portals.expect_batch()?;
+                        Ok(match outcome.rewritten {
+                            None => FrameAction::Relay,
+                            Some(rewritten) => {
+                                let mut new_body = rewritten.into_bytes();
+                                new_body.push(0);
+                                FrameAction::Replace(new_body)
+                            }
+                        })
+                    }
                 }
             }
             b'P' => {
@@ -261,13 +264,15 @@ impl QueryRewriter {
                 let outcome = match self.rewrite_sql(parse.query)? {
                     SqlOutcome::Refuse(message) => {
                         // The backend is not going to answer this batch, so
-                        // the proxy owns the error state until Sync.
+                        // the proxy owns the error state until Sync. Nothing
+                        // is recorded for this statement: the frame is not
+                        // forwarded, so no response is owed for it.
                         self.awaiting_sync = true;
                         return Ok(FrameAction::Reply(error_response(&message)));
                     }
                     SqlOutcome::Rewrite(outcome) => outcome,
                 };
-                self.statements.insert(parse.statement.to_vec(), outcome.params);
+                self.portals.parse(parse.statement, outcome.params)?;
                 Ok(match outcome.rewritten {
                     None => FrameAction::Relay,
                     Some(sql) => FrameAction::Replace(pgwire::encode_parse(
@@ -278,13 +283,36 @@ impl QueryRewriter {
                 })
             }
             b'B' => self.bind(body),
+            b'D' => {
+                // Describe: the RowDescription it provokes is what tells the
+                // read path which columns of this statement are protected.
+                let (target, name) = describe_target(body)?;
+                self.portals.expect_describe(target, name)?;
+                Ok(FrameAction::Relay)
+            }
+            b'E' => {
+                let mut rest = body;
+                let portal = pgwire::take_cstr(&mut rest)?;
+                self.portals.expect_execute(portal)?;
+                Ok(FrameAction::Relay)
+            }
+            b'S' => {
+                self.portals.expect_batch()?;
+                Ok(FrameAction::Relay)
+            }
+            // CopyData, CopyDone, CopyFail: the client only sends these in
+            // copy-in mode, which is where the backend ignores the Sync it has
+            // already pipelined — see [`SessionPortals::copy_data`].
+            b'd' | b'c' | b'f' => {
+                self.portals.copy_data();
+                Ok(FrameAction::Relay)
+            }
             b'C' => {
                 // Close: 'S' = statement, 'P' = portal.
-                if let [b'S', name @ ..] = body {
-                    let mut name = name;
-                    if let Ok(statement) = pgwire::take_cstr(&mut name) {
-                        self.statements.remove(statement);
-                    }
+                let (target, name) = describe_target(body)?;
+                match target {
+                    Target::Statement => self.portals.close_statement(name),
+                    Target::Portal => self.portals.close_portal(name),
                 }
                 Ok(FrameAction::Relay)
             }
@@ -294,7 +322,9 @@ impl QueryRewriter {
 
     fn bind(&mut self, body: &[u8]) -> Result<FrameAction, Error> {
         let bind = pgwire::parse_bind(body)?;
-        let Some(params) = self.statements.get(bind.statement) else {
+        // Recorded even when the statement is unknown to the rewriter: the
+        // read path still needs to know which statement this portal names.
+        let Some(params) = self.portals.bind(bind.portal, bind.statement)? else {
             return Ok(FrameAction::Relay);
         };
         if params.is_empty() {
@@ -302,7 +332,7 @@ impl QueryRewriter {
         }
         let mut values: Vec<Option<Cow<'_, [u8]>>> =
             bind.params.iter().map(|p| p.map(Cow::Borrowed)).collect();
-        for (index, action) in params {
+        for (index, action) in params.iter() {
             let Some(Some(value)) = values.get_mut(*index) else { continue };
             let (replacement, wire) = match action {
                 ParamAction::Seal(transform) => (transform.seal(value)?, transform.wire()),
@@ -410,7 +440,7 @@ impl QueryRewriter {
             Err(error) => return self.unprotected_sql(&Unprotected::Unparseable(&error)),
         };
 
-        let mut params = ParamTransforms::new();
+        let mut params = ParamTransforms::default();
         let mut changed = vec![false; statements.len()];
         for (statement, changed) in statements.iter_mut().zip(&mut changed) {
             let result = self
@@ -832,7 +862,7 @@ impl QueryRewriter {
         match unwrap_casts(expr) {
             Expr::Value(Value::Placeholder(placeholder)) => {
                 if let Some(index) = placeholder_index(placeholder) {
-                    params.push((index, ParamAction::Seal(transform.clone())));
+                    params.record(index, ParamAction::Seal(transform.clone()))?;
                 }
                 return Ok(false);
             }
@@ -1080,7 +1110,7 @@ fn index_value(
         let Some(index) = placeholder_index(placeholder) else {
             return Err(Error::Wire(dbsec_core::Error::Malformed));
         };
-        params.push((index, ParamAction::SearchIndex(transform.clone())));
+        params.record(index, ParamAction::SearchIndex(transform.clone()))?;
         return Ok(());
     }
     let Some(plaintext) = literal_plaintext(value, transform.wire()) else {
@@ -1093,6 +1123,33 @@ fn index_value(
     Ok(())
 }
 
+/// Splits a Describe or Close body into its target and name — both messages
+/// share the shape `u8 kind | cstr name`. A kind byte that is neither `'S'`
+/// (statement) nor `'P'` (portal) is a protocol violation the relay must not
+/// guess at: carrying on would leave the read path's expectations misaligned
+/// with what the server is about to answer.
+fn describe_target(body: &[u8]) -> Result<(Target, &[u8]), Error> {
+    let [kind, rest @ ..] = body else {
+        return Err(Error::Wire(dbsec_core::Error::Malformed));
+    };
+    let target = match kind {
+        b'S' => Target::Statement,
+        b'P' => Target::Portal,
+        _ => return Err(Error::Wire(dbsec_core::Error::Malformed)),
+    };
+    let mut rest = rest;
+    let name = pgwire::take_cstr(&mut rest)?;
+    Ok((target, name))
+}
+
+/// The zero-based parameter index a `$n` placeholder refers to, or `None` when
+/// it names no bindable parameter.
+///
+/// `n` is client-supplied SQL, so the subtraction is checked: PostgreSQL
+/// numbers parameters from 1 and `$0` is not a parameter at all. Subtracting
+/// unchecked panicked the session task in debug builds and wrapped to
+/// `usize::MAX` in release, where the rewrite went ahead against an index no
+/// Bind can ever fill (SEC-15).
 fn placeholder_index(placeholder: &str) -> Option<usize> {
     placeholder.strip_prefix('$').and_then(|n| n.parse::<usize>().ok())?.checked_sub(1)
 }
@@ -1134,7 +1191,7 @@ struct RewriteOutcome {
 
 impl RewriteOutcome {
     fn passthrough() -> Self {
-        Self { rewritten: None, params: Vec::new() }
+        Self { rewritten: None, params: ParamTransforms::default() }
     }
 }
 
@@ -1502,8 +1559,11 @@ mod tests {
         ))
     }
 
+    /// A rewriter with extended-protocol state of its own; tests that also
+    /// drive the read path build the [`SessionPortals`] themselves and share
+    /// it (see `rows::tests::session`).
     fn rewriter(catalog: Arc<WriteCatalog>) -> QueryRewriter {
-        QueryRewriter::new(catalog, Arc::new(AtomicU8::new(b'I')), true)
+        QueryRewriter::new(catalog, SessionPortals::new(), Arc::new(AtomicU8::new(b'I')), true)
     }
 
     fn query_frame(sql: &str) -> Vec<u8> {
@@ -1838,6 +1898,141 @@ mod tests {
         }
     }
 
+    /// One placeholder cannot be sealed *and* blind-indexed: a Bind carries
+    /// one value per placeholder. Before, both actions were applied in
+    /// sequence and the index was computed over the ciphertext, so the WHERE
+    /// matched nothing and the UPDATE silently affected no rows.
+    #[test]
+    fn a_placeholder_in_two_protected_roles_is_refused_rather_than_transformed_twice() {
+        let mut extended = rewriter(catalog(true));
+        let parse = pgwire::encode_parse(
+            b"u",
+            b"UPDATE users SET email = $1 WHERE email = $1",
+            &0i16.to_be_bytes(),
+        );
+        assert!(matches!(
+            extended.on_frame(b'P', &parse),
+            Err(Error::ConflictingParameter { placeholder: 1 })
+        ));
+        // The same shape in the simple protocol has two independent literals,
+        // so both roles are served from the plaintext and it still works.
+        let mut simple = rewriter(catalog(true));
+        let sql = "UPDATE users SET email = 'alice@example.com' WHERE email = 'alice@example.com'";
+        let sql = rewritten_query(&mut simple, sql).expect("rewritten");
+        assert!(!sql.contains("alice@example.com"), "{sql}");
+        assert!(sql.contains("SUBSTRING(email FROM 1 FOR 32)"), "{sql}");
+        assert_eq!(open_hex_literal(&sql, true), b"alice@example.com");
+        let index = blind_index::compute(&crate::rows::tests::INDEX_KEY, b"alice@example.com");
+        assert!(sql.contains(&format!("'\\x{}'", hex::encode(index))), "{sql}");
+    }
+
+    /// The same action recorded twice for one placeholder — a multi-row INSERT
+    /// repeating `$1` — is one transform. Applying it twice sealed an already
+    /// sealed value, which no read path can undo.
+    #[test]
+    fn a_placeholder_reused_for_one_column_is_sealed_once_not_twice() {
+        let mut extended = rewriter(catalog(false));
+        let parse = pgwire::encode_parse(
+            b"i",
+            b"INSERT INTO users (email) VALUES ($1), ($1)",
+            &0i16.to_be_bytes(),
+        );
+        assert!(matches!(extended.on_frame(b'P', &parse).unwrap(), FrameAction::Relay));
+        let bind = pgwire::encode_bind(
+            b"",
+            b"i",
+            &[],
+            &[Some(Cow::Borrowed(b"alice@example.com".as_slice()))],
+            &0i16.to_be_bytes(),
+        )
+        .unwrap();
+        let FrameAction::Replace(rewritten) = extended.on_frame(b'B', &bind).unwrap() else {
+            panic!("bind not rewritten")
+        };
+        let bound = pgwire::parse_bind(&rewritten).unwrap();
+        let stored = hex::decode(bound.params[0].unwrap().strip_prefix(b"\\x").unwrap()).unwrap();
+        // A double seal would open to the inner ciphertext, not the plaintext.
+        assert_eq!(transform(false).open(&stored).unwrap().unwrap(), b"alice@example.com");
+
+        // The simple protocol seals each literal from the plaintext already.
+        let mut simple = rewriter(catalog(false));
+        let sql = rewritten_query(
+            &mut simple,
+            "INSERT INTO users (email) VALUES ('bob@x.io'), ('bob@x.io')",
+        )
+        .expect("rewritten");
+        for literal in sql.split("'\\x").skip(1) {
+            let stored = hex::decode(&literal[..literal.find('\'').unwrap()]).unwrap();
+            assert_eq!(transform(false).open(&stored).unwrap().unwrap(), b"bob@x.io");
+        }
+    }
+
+    /// `$0` names no bindable parameter. It used to underflow: a panic in
+    /// debug builds (a remote panic on a pre-authentication path) and a
+    /// rewrite against `usize::MAX` in release ones.
+    #[test]
+    fn a_zero_placeholder_resolves_to_nothing_and_leaves_the_statement_alone() {
+        assert_eq!(placeholder_index("$0"), None);
+        assert_eq!(placeholder_index("$1"), Some(0));
+        assert_eq!(placeholder_index("$"), None);
+        assert_eq!(placeholder_index("$x"), None);
+        assert_eq!(placeholder_index("$99999999999999999999999999"), None);
+
+        let mut rewriter = rewriter(catalog(true));
+        for sql in [
+            "SELECT id FROM users WHERE email = $0",
+            "INSERT INTO users (email) VALUES ($0)",
+            "UPDATE users SET email = $0 WHERE id = 1",
+        ] {
+            assert!(rewritten_query(&mut rewriter, sql).is_none(), "{sql}");
+            let parse = pgwire::encode_parse(b"", sql.as_bytes(), &0i16.to_be_bytes());
+            assert!(
+                matches!(rewriter.on_frame(b'P', &parse).unwrap(), FrameAction::Relay),
+                "{sql}"
+            );
+        }
+    }
+
+    /// The statement map is keyed by a client-chosen name off the wire, so a
+    /// client that never closes what it parses must hit a ceiling (SEC-33).
+    #[test]
+    fn parse_messages_are_refused_once_the_statement_cap_is_reached() {
+        use crate::portal::{MAX_NAME_LEN, MAX_PREPARED_STATEMENTS};
+
+        let mut rewriter = rewriter(catalog(false));
+        for i in 0..MAX_PREPARED_STATEMENTS {
+            let parse =
+                pgwire::encode_parse(format!("s{i}").as_bytes(), b"SELECT 1", &0i16.to_be_bytes());
+            rewriter.on_frame(b'P', &parse).expect("within the cap");
+        }
+        let parse = pgwire::encode_parse(b"one too many", b"SELECT 1", &0i16.to_be_bytes());
+        assert!(matches!(rewriter.on_frame(b'P', &parse), Err(Error::SessionLimit { .. })));
+
+        // Closing a statement makes room again.
+        let mut close = vec![b'S'];
+        close.extend_from_slice(b"s0\0");
+        rewriter.on_frame(b'C', &close).unwrap();
+        rewriter.on_frame(b'P', &parse).expect("a closed statement freed a slot");
+
+        // The key itself is bounded: a Parse body may be up to 1 GiB.
+        let long = vec![b'x'; MAX_NAME_LEN + 1];
+        let parse = pgwire::encode_parse(&long, b"SELECT 1", &0i16.to_be_bytes());
+        assert!(matches!(
+            rewriter.on_frame(b'P', &parse),
+            Err(Error::NameTooLong { max: MAX_NAME_LEN, .. })
+        ));
+    }
+
+    #[test]
+    fn malformed_describe_and_close_targets_fail_the_session() {
+        let mut rewriter = rewriter(catalog(false));
+        for body in [b"X".as_slice(), b"", b"Sunterminated"] {
+            assert!(rewriter.on_frame(b'D', body).is_err(), "{body:?}");
+            assert!(rewriter.on_frame(b'C', body).is_err(), "{body:?}");
+        }
+        assert!(rewriter.on_frame(b'E', b"unterminated").is_err());
+    }
+
     #[test]
     fn null_and_unsupported_expressions_pass_through() {
         let mut rewriter = rewriter(catalog(false));
@@ -1926,7 +2121,8 @@ mod tests {
     #[test]
     fn refusal_reports_the_backend_transaction_state() {
         let status = Arc::new(AtomicU8::new(b'T'));
-        let mut strict = QueryRewriter::new(strict_catalog(false), status.clone(), true);
+        let mut strict =
+            QueryRewriter::new(strict_catalog(false), SessionPortals::new(), status.clone(), true);
         let action = strict.on_frame(b'Q', &query_frame("COPY users FROM STDIN")).unwrap();
         let FrameAction::Reply(bytes) = action else { panic!("expected a refusal") };
         assert_eq!(bytes[bytes.len() - 1], b'E', "aborted transaction status");
@@ -2061,7 +2257,12 @@ mod tests {
     /// untrusted from the first statement.
     #[test]
     fn untrusted_session_never_seals_unqualified_names() {
-        let mut rewriter = QueryRewriter::new(catalog(false), Arc::new(AtomicU8::new(b'I')), false);
+        let mut rewriter = QueryRewriter::new(
+            catalog(false),
+            SessionPortals::new(),
+            Arc::new(AtomicU8::new(b'I')),
+            false,
+        );
         assert!(
             rewritten_query(&mut rewriter, "INSERT INTO users (email) VALUES ('a@b.io')").is_none()
         );

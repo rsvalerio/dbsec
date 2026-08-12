@@ -3,15 +3,41 @@
 //! transform's stored form are opened, then masked when a mask is configured.
 //! Everything else passes through untouched. Crypto errors fail the session —
 //! never a silent passthrough of ciphertext.
+//!
+//! Which positions of a DataRow are protected is *not* simply "whatever the
+//! last RowDescription said". In the extended protocol the server describes a
+//! statement when it is asked to (Describe), not when it is executed, so the
+//! DataRows of a cached prepared statement arrive with no RowDescription in
+//! front of them. Positions are therefore keyed to the portal being executed,
+//! which only the client→upstream direction can see; [`crate::portal`] is the
+//! state the two directions share to keep them in agreement, and a DataRow
+//! whose columns nothing on the connection identifies fails the session
+//! instead of relaying possibly-protected values (CL-3).
+//!
+//! *Which* columns are protected is keyed differently here than on the write
+//! path, and the difference matters. `encrypt::WriteCatalog` matches by
+//! `(schema, table, column)` **name**, resolved from the SQL text of every
+//! statement; this module matches by `(table_oid, attnum)`, resolved against
+//! the catalog by [`crate::resolve`]. Names survive a migration and OIDs do
+//! not, so a `DROP TABLE`/`CREATE TABLE` or a dropped-and-re-added column
+//! leaves the write path still sealing and this path recognising nothing —
+//! the failure that leaks. [`Resolved`] is therefore a snapshot that the
+//! refresher replaces, not a startup constant, and
+//! [`RowDecryptor::check_for_stale_mapping`] is what makes a session notice
+//! the gap between two refreshes (CL-3).
 
 use std::borrow::Cow;
-use std::collections::HashMap;
-use std::sync::Arc;
+use std::collections::{HashMap, HashSet};
+use std::sync::{Arc, PoisonError};
 
 use dbsec_core::mask::MaskSpec;
 use dbsec_core::pgwire;
 use dbsec_core::transform::{FieldTransform, WireForm};
 
+use tokio::sync::Notify;
+
+use crate::config::OnUnprotected;
+use crate::portal::{Positions, RowSource, SessionPortals};
 use crate::Error;
 
 /// What the read path does to one column: open with the transform (when
@@ -22,25 +48,98 @@ pub struct ReadColumn {
     pub mask: Option<MaskSpec>,
 }
 
-/// Configured columns keyed by `(table oid, attnum)`, resolved at startup.
+/// Configured columns keyed by `(table oid, attnum)`, as resolved by one run
+/// of [`crate::resolve::resolve_columns`].
 pub type ColumnMap = HashMap<(u32, i16), ReadColumn>;
 
-/// Shared, per-process state for the decrypt path.
-pub struct RowContext {
+/// One resolution of the configured columns against the live catalog.
+///
+/// The read path matches by `(table_oid, attnum)` while the write path matches
+/// by *name*, so the two disagree the moment a migration moves a column: a
+/// recreated table gets a new `pg_class.oid`, and a dropped-and-re-added column
+/// gets a new `attnum` (PostgreSQL never reuses one). The write path keeps
+/// sealing, the read path stops finding anything, and the client is handed
+/// stored bytes. That is why this is a *snapshot* that gets replaced rather
+/// than a value resolved once for the process lifetime (CL-3), and why it
+/// carries the two extra sets below: they are what lets a session notice the
+/// mismatch before the next refresh does.
+#[derive(Default)]
+pub struct Resolved {
     pub columns: ColumnMap,
+    /// Lowercased names of every configured column — the only thing a
+    /// RowDescription field can be matched against by name, since the message
+    /// identifies a field's table by OID and never by name.
+    pub names: HashSet<String>,
+    /// Where each configured column resolved to, by qualified name, so a
+    /// re-resolution can name what moved instead of only which OID did.
+    pub positions: HashMap<String, (u32, i16)>,
+}
+
+/// Shared, per-process state for the decrypt path.
+///
+/// `resolved` is swapped by the refresher ([`crate::resolve::refresh_loop`]),
+/// so a long-lived session picks up a re-resolution at its next
+/// RowDescription without reconnecting. The lock is taken for a clone of one
+/// `Arc` and never across an `.await`.
+pub struct RowContext {
+    resolved: std::sync::RwLock<Arc<Resolved>>,
+    /// What a session does when a RowDescription looks like it was resolved
+    /// against a schema that has since changed: warn, or fail the session.
+    on_unprotected: OnUnprotected,
+    /// Woken by a session that saw a suspect field, so a migration is picked
+    /// up at the first read that notices it rather than at the next tick.
+    refresh: Notify,
 }
 
 impl RowContext {
-    pub fn decryptor(self: &Arc<Self>) -> RowDecryptor {
-        RowDecryptor { ctx: self.clone(), active: Vec::new() }
+    pub fn new(resolved: Resolved, on_unprotected: OnUnprotected) -> Self {
+        Self {
+            resolved: std::sync::RwLock::new(Arc::new(resolved)),
+            on_unprotected,
+            refresh: Notify::new(),
+        }
+    }
+
+    /// The current resolution. A poisoned lock means a session task panicked
+    /// while holding it, which it can only have done between a clone and a
+    /// swap — the value is intact either way.
+    pub fn resolved(&self) -> Arc<Resolved> {
+        self.resolved.read().unwrap_or_else(PoisonError::into_inner).clone()
+    }
+
+    /// Publishes a fresh resolution to every live session.
+    pub fn publish(&self, resolved: Resolved) {
+        *self.resolved.write().unwrap_or_else(PoisonError::into_inner) = Arc::new(resolved);
+    }
+
+    /// Resolves as soon as the refresher is next scheduled.
+    pub async fn refresh_requested(&self) {
+        self.refresh.notified().await;
+    }
+
+    /// Asks the refresher to re-resolve now. Coalescing is `Notify`'s own: a
+    /// burst of sessions all noticing the same migration wakes it once.
+    fn request_refresh(&self) {
+        self.refresh.notify_one();
+    }
+
+    pub fn decryptor(self: &Arc<Self>, portals: Arc<SessionPortals>) -> RowDecryptor {
+        RowDecryptor { ctx: self.clone(), portals, described: None, warned_stale: false }
     }
 }
 
-/// Per-session state: which positions of the current result set are
-/// protected. Set by each RowDescription, used by the DataRows that follow.
+/// Per-session read state. `described` holds the positions of the most recent
+/// RowDescription, which is the authority for the *simple* protocol only; in
+/// the extended protocol the portal being executed decides, and `portals` is
+/// what knows which portal that is.
 pub struct RowDecryptor {
     ctx: Arc<RowContext>,
-    active: Vec<(usize, ReadColumn)>,
+    portals: Arc<SessionPortals>,
+    described: Option<Positions>,
+    /// Whether this session has already reported a suspect field. One line per
+    /// session is enough to act on; one per result set would be a log flood
+    /// for exactly as long as the migration goes unnoticed.
+    warned_stale: bool,
 }
 
 impl RowDecryptor {
@@ -50,60 +149,154 @@ impl RowDecryptor {
         match msg_type {
             b'T' => {
                 let fields = pgwire::parse_row_description(body)?;
-                self.active = fields
+                let resolved = self.ctx.resolved();
+                let positions: Positions = fields
                     .iter()
                     .enumerate()
                     .filter_map(|(i, f)| {
-                        self.ctx
+                        resolved
                             .columns
                             .get(&(f.table_oid, f.attnum))
                             .map(|column| (i, column.clone()))
                     })
                     .collect();
+                self.check_for_stale_mapping(&fields, &resolved, &positions)?;
+                // Whichever Describe asked for this keeps it, so every later
+                // Execute of that statement decrypts the right positions.
+                self.portals.describe_answered(&positions);
+                self.described = Some(positions);
                 Ok(None)
             }
-            b'D' if !self.active.is_empty() => {
-                let mut values: Vec<Option<Cow<'_, [u8]>>> = pgwire::parse_data_row(body)?
-                    .into_iter()
-                    .map(|v| v.map(Cow::Borrowed))
-                    .collect();
-                let mut changed = false;
-                for (position, column) in &self.active {
-                    let Some(Some(value)) = values.get_mut(*position) else { continue };
-                    let (replacement, hex_text) = {
-                        let (stored, hex_text) = match &column.transform {
-                            Some(transform) => decode_wire(transform.as_ref(), value),
-                            None => (Cow::Borrowed(&**value), false),
-                        };
-                        let opened = match &column.transform {
-                            Some(transform) => transform.open(&stored)?,
-                            None => None,
-                        };
-                        // Mask what the client would otherwise see: the opened
-                        // plaintext, or the raw value when nothing opened.
-                        let masked = column
-                            .mask
-                            .map(|mask| mask.apply(opened.as_deref().unwrap_or(&stored)));
-                        (masked.or(opened), hex_text)
-                    };
-                    if let Some(replacement) = replacement {
-                        // A value that arrived hex-encoded goes back the same
-                        // way, or the client cannot decode the column.
-                        *value = Cow::Owned(if hex_text {
-                            format!("\\x{}", hex::encode(replacement)).into_bytes()
-                        } else {
-                            replacement
-                        });
-                        changed = true;
-                    }
-                }
-                if !changed {
+            b'n' => {
+                self.portals.no_data();
+                self.described = None;
+                Ok(None)
+            }
+            b'D' => {
+                let positions = match self.portals.row_source() {
+                    RowSource::Portal(positions) => positions,
+                    RowSource::LastDescription => match &self.described {
+                        Some(positions) => positions.clone(),
+                        None => return Err(Error::UndescribedRow),
+                    },
+                    RowSource::Undescribed => return Err(Error::UndescribedRow),
+                };
+                if positions.is_empty() {
                     return Ok(None);
                 }
-                Ok(Some(pgwire::encode_data_row(&values)?))
+                self.decrypt_row(&positions, body)
+            }
+            // A result set ended. `described` is dropped with it so a later
+            // DataRow can never inherit these positions by accident.
+            b'C' | b'I' | b's' | b'E' => {
+                self.portals.execute_answered();
+                self.described = None;
+                Ok(None)
+            }
+            b'Z' => {
+                self.portals.batch_answered();
+                self.described = None;
+                Ok(None)
             }
             _ => Ok(None),
         }
+    }
+
+    /// Notices a RowDescription that a stale `(table_oid, attnum)` mapping
+    /// would silently under-match.
+    ///
+    /// A field is *suspect* when it comes from a real table (`table_oid != 0`,
+    /// so not a computed expression), its name is one of the configured column
+    /// names, and nothing in the current resolution covers its position. After
+    /// `DROP TABLE t; CREATE TABLE t (...)` or `ALTER TABLE t DROP COLUMN c,
+    /// ADD COLUMN c ...` that is exactly what the protected column looks like:
+    /// the write path still seals it by name, and the read path no longer
+    /// recognises it, so the client is handed `blind_index || envelope` bytes
+    /// with no error anywhere (CL-3).
+    ///
+    /// The name match is a heuristic, and it is the only one available: a
+    /// RowDescription names its fields but identifies their table only by OID.
+    /// An unrelated table with a same-named column therefore also trips it.
+    /// That is why it *requests a re-resolution* — which settles the question
+    /// authoritatively, and which is the actual repair — and why the
+    /// fail-closed reading is behind `on_unprotected = "reject"`, the same
+    /// switch the write path uses for "this may be unprotected, and I would
+    /// rather error than guess".
+    fn check_for_stale_mapping(
+        &mut self,
+        fields: &[pgwire::RowField<'_>],
+        resolved: &Resolved,
+        positions: &Positions,
+    ) -> Result<(), Error> {
+        let covered: HashSet<usize> = positions.iter().map(|(index, _)| *index).collect();
+        let suspect = fields.iter().enumerate().find(|(index, field)| {
+            field.table_oid != 0
+                && !covered.contains(index)
+                && std::str::from_utf8(field.name)
+                    .is_ok_and(|name| resolved.names.contains(&name.to_lowercase()))
+        });
+        let Some((_, field)) = suspect else { return Ok(()) };
+        // The refresher settles it either way: a real migration re-resolves
+        // the column, and a false positive costs one catalog round-trip.
+        self.ctx.request_refresh();
+        let column = String::from_utf8_lossy(field.name).into_owned();
+        if self.ctx.on_unprotected == OnUnprotected::Reject {
+            return Err(Error::StaleColumnMap { column, table_oid: field.table_oid });
+        }
+        if !self.warned_stale {
+            self.warned_stale = true;
+            tracing::warn!(
+                column,
+                table_oid = field.table_oid,
+                attnum = field.attnum,
+                "a result column named like a protected column is not in the resolved column map; \
+                 the table or column may have been recreated since startup, in which case writes \
+                 are still being encrypted and reads are relaying stored values — re-resolving"
+            );
+        }
+        Ok(())
+    }
+
+    fn decrypt_row(
+        &self,
+        positions: &[(usize, ReadColumn)],
+        body: &[u8],
+    ) -> Result<Option<Vec<u8>>, Error> {
+        let mut values: Vec<Option<Cow<'_, [u8]>>> =
+            pgwire::parse_data_row(body)?.into_iter().map(|v| v.map(Cow::Borrowed)).collect();
+        let mut changed = false;
+        for (position, column) in positions {
+            let Some(Some(value)) = values.get_mut(*position) else { continue };
+            let (replacement, hex_text) = {
+                let (stored, hex_text) = match &column.transform {
+                    Some(transform) => decode_wire(transform.as_ref(), value),
+                    None => (Cow::Borrowed(&**value), false),
+                };
+                let opened = match &column.transform {
+                    Some(transform) => transform.open(&stored)?,
+                    None => None,
+                };
+                // Mask what the client would otherwise see: the opened
+                // plaintext, or the raw value when nothing opened.
+                let masked =
+                    column.mask.map(|mask| mask.apply(opened.as_deref().unwrap_or(&stored)));
+                (masked.or(opened), hex_text)
+            };
+            if let Some(replacement) = replacement {
+                // A value that arrived hex-encoded goes back the same
+                // way, or the client cannot decode the column.
+                *value = Cow::Owned(if hex_text {
+                    format!("\\x{}", hex::encode(replacement)).into_bytes()
+                } else {
+                    replacement
+                });
+                changed = true;
+            }
+        }
+        if !changed {
+            return Ok(None);
+        }
+        Ok(Some(pgwire::encode_data_row(&values)?))
     }
 }
 
@@ -161,7 +354,10 @@ pub mod tests {
     fn context_with(column: ReadColumn) -> Arc<RowContext> {
         let mut columns = ColumnMap::new();
         columns.insert((1234, 2), column);
-        Arc::new(RowContext { columns })
+        Arc::new(RowContext::new(
+            Resolved { columns, names: HashSet::from(["email".to_owned()]), ..Default::default() },
+            OnUnprotected::Warn,
+        ))
     }
 
     fn context(searchable: bool) -> Arc<RowContext> {
@@ -169,9 +365,17 @@ pub mod tests {
     }
 
     fn row_description(fields: &[(u32, i16)]) -> Vec<u8> {
+        let named: Vec<_> = fields.iter().map(|(oid, attnum)| ("", *oid, *attnum)).collect();
+        named_row_description(&named)
+    }
+
+    /// A RowDescription that carries field labels, which is what the stale
+    /// mapping check has to work from — the message names no table at all.
+    fn named_row_description(fields: &[(&str, u32, i16)]) -> Vec<u8> {
         let mut body = (fields.len() as i16).to_be_bytes().to_vec();
-        for (table_oid, attnum) in fields {
-            body.push(0); // empty name
+        for (name, table_oid, attnum) in fields {
+            body.extend_from_slice(name.as_bytes());
+            body.push(0);
             body.extend_from_slice(&table_oid.to_be_bytes());
             body.extend_from_slice(&attnum.to_be_bytes());
             body.extend_from_slice(&[0u8; 12]);
@@ -184,10 +388,68 @@ pub mod tests {
         pgwire::encode_data_row(&cows).unwrap()
     }
 
+    /// Both directions of one session over the state they share, so a test
+    /// can play a whole extended-protocol conversation.
+    fn session(ctx: &Arc<RowContext>) -> (crate::encrypt::QueryRewriter, RowDecryptor) {
+        use crate::columns::ProtectedColumn;
+        let catalog = Arc::new(crate::encrypt::WriteCatalog::new(
+            &[ProtectedColumn {
+                schema: "public".into(),
+                table: "users".into(),
+                column: "email".into(),
+                transform: Some(transform(false)),
+                searchable: false,
+                readable: true,
+                mask: None,
+            }],
+            OnUnprotected::Warn,
+        ));
+        let portals = SessionPortals::new();
+        let rewriter = crate::encrypt::QueryRewriter::new(
+            catalog,
+            portals.clone(),
+            Arc::new(std::sync::atomic::AtomicU8::new(b'I')),
+            true,
+        );
+        (rewriter, ctx.decryptor(portals))
+    }
+
+    /// Parse + Describe(statement) + Sync: what a driver sends the first time
+    /// it sees a query.
+    fn prepare(rewriter: &mut crate::encrypt::QueryRewriter, statement: &[u8], sql: &[u8]) {
+        rewriter
+            .on_frame(b'P', &pgwire::encode_parse(statement, sql, &0i16.to_be_bytes()))
+            .unwrap();
+        let mut describe = vec![b'S'];
+        describe.extend_from_slice(statement);
+        describe.push(0);
+        rewriter.on_frame(b'D', &describe).unwrap();
+        rewriter.on_frame(b'S', b"").unwrap();
+    }
+
+    /// Bind + Execute + Sync: what the same driver sends on every later call,
+    /// once the statement is in its cache. No Describe, so no RowDescription.
+    fn execute(rewriter: &mut crate::encrypt::QueryRewriter, statement: &[u8]) {
+        rewriter
+            .on_frame(
+                b'B',
+                &pgwire::encode_bind(b"", statement, &[], &[], &0i16.to_be_bytes()).unwrap(),
+            )
+            .unwrap();
+        rewriter.on_frame(b'E', b"\0\0\0\0\0").unwrap();
+        rewriter.on_frame(b'S', b"").unwrap();
+    }
+
+    /// A statement's result set, from the server's side.
+    fn complete(decryptor: &mut RowDecryptor) {
+        decryptor.on_frame(b'C', b"SELECT 1\0").unwrap();
+        decryptor.on_frame(b'Z', b"I").unwrap();
+    }
+
     #[test]
     fn decrypts_matched_columns_and_passes_others_through() {
         let ctx = context(false);
-        let mut decryptor = ctx.decryptor();
+        let mut decryptor = ctx.decryptor(SessionPortals::new());
 
         let desc = row_description(&[(1234, 1), (1234, 2)]);
         assert!(decryptor.on_frame(b'T', &desc).unwrap().is_none());
@@ -219,7 +481,7 @@ pub mod tests {
     #[test]
     fn searchable_columns_lose_their_blind_index() {
         let ctx = context(true);
-        let mut decryptor = ctx.decryptor();
+        let mut decryptor = ctx.decryptor(SessionPortals::new());
         decryptor.on_frame(b'T', &row_description(&[(1234, 1), (1234, 2)])).unwrap();
 
         let ct = envelope::encrypt(&KEY, &KEY_ID, b"alice").unwrap();
@@ -233,7 +495,7 @@ pub mod tests {
     #[test]
     fn unmatched_result_sets_relay_untouched() {
         let ctx = context(false);
-        let mut decryptor = ctx.decryptor();
+        let mut decryptor = ctx.decryptor(SessionPortals::new());
         decryptor.on_frame(b'T', &row_description(&[(9999, 1)])).unwrap();
 
         let ct = envelope::encrypt(&KEY, &KEY_ID, b"secret").unwrap();
@@ -244,7 +506,7 @@ pub mod tests {
     #[test]
     fn unknown_key_fails_closed() {
         let ctx = context(false);
-        let mut decryptor = ctx.decryptor();
+        let mut decryptor = ctx.decryptor(SessionPortals::new());
         decryptor.on_frame(b'T', &row_description(&[(1234, 2)])).unwrap();
 
         let ct = envelope::encrypt(&KEY, &[9u8; KEY_ID_LEN], b"secret").unwrap();
@@ -256,7 +518,7 @@ pub mod tests {
     fn mask_applies_after_decryption_and_to_plaintext() {
         let mask = MaskSpec { keep_first: 0, keep_last: 4, mask_with: '*' };
         let ctx = context_with(ReadColumn { transform: Some(transform(false)), mask: Some(mask) });
-        let mut decryptor = ctx.decryptor();
+        let mut decryptor = ctx.decryptor(SessionPortals::new());
         decryptor.on_frame(b'T', &row_description(&[(1234, 1), (1234, 2)])).unwrap();
 
         // Decrypted value is masked before it reaches the client.
@@ -281,7 +543,7 @@ pub mod tests {
     fn text_format_bytea_keeps_its_hex_shape_through_the_mask() {
         let mask = MaskSpec { keep_first: 0, keep_last: 4, mask_with: '*' };
         let ctx = context_with(ReadColumn { transform: Some(transform(false)), mask: Some(mask) });
-        let mut decryptor = ctx.decryptor();
+        let mut decryptor = ctx.decryptor(SessionPortals::new());
         decryptor.on_frame(b'T', &row_description(&[(1234, 2)])).unwrap();
 
         let ct = envelope::encrypt(&KEY, &KEY_ID, b"4111111111111111").unwrap();
@@ -297,7 +559,7 @@ pub mod tests {
     fn mask_only_column_masks_without_any_crypto() {
         let mask = MaskSpec { keep_first: 2, keep_last: 0, mask_with: '#' };
         let ctx = context_with(ReadColumn { transform: None, mask: Some(mask) });
-        let mut decryptor = ctx.decryptor();
+        let mut decryptor = ctx.decryptor(SessionPortals::new());
         decryptor.on_frame(b'T', &row_description(&[(1234, 2)])).unwrap();
 
         let row = data_row(&[Some(b"secret")]);
@@ -305,10 +567,150 @@ pub mod tests {
         assert_eq!(pgwire::parse_data_row(&rewritten).unwrap()[0], Some(b"se####".as_slice()));
     }
 
+    /// The steady state of every driver with a prepared-statement cache: the
+    /// statement is described once, and every later execution sends only
+    /// Bind/Execute. Keying positions to the last RowDescription on the
+    /// connection decrypted those rows with *another* statement's positions —
+    /// or, as here, relayed a protected column as raw ciphertext (CL-3).
+    #[test]
+    fn a_cached_statement_decrypts_with_its_own_positions_not_the_last_described_ones() {
+        let ctx = context(false);
+        let (mut rewriter, mut decryptor) = session(&ctx);
+
+        // Statement A: `id, email`, with email protected at position 1.
+        prepare(&mut rewriter, b"a", b"SELECT id, email FROM users WHERE id = $1");
+        decryptor.on_frame(b'T', &row_description(&[(1234, 1), (1234, 2)])).unwrap();
+        decryptor.on_frame(b'Z', b"I").unwrap();
+
+        // Statement B: `id, created_at`, nothing protected. Its RowDescription
+        // is the last one the connection sees.
+        prepare(&mut rewriter, b"b", b"SELECT id, created_at FROM users WHERE id = $1");
+        decryptor.on_frame(b'T', &row_description(&[(1234, 1), (1234, 9)])).unwrap();
+        decryptor.on_frame(b'Z', b"I").unwrap();
+
+        // Re-executing A out of the driver's cache sends no Describe at all.
+        execute(&mut rewriter, b"a");
+        let ct = envelope::encrypt(&KEY, &KEY_ID, b"alice@example.com").unwrap();
+        let rewritten = decryptor
+            .on_frame(b'D', &data_row(&[Some(b"42"), Some(&ct)]))
+            .unwrap()
+            .expect("A's own positions must decrypt A's rows");
+        assert_eq!(
+            pgwire::parse_data_row(&rewritten).unwrap()[1],
+            Some(b"alice@example.com".as_slice())
+        );
+        complete(&mut decryptor);
+
+        // B's plaintext column is left alone: A's positions must not follow
+        // the connection either.
+        execute(&mut rewriter, b"b");
+        assert!(decryptor
+            .on_frame(b'D', &data_row(&[Some(b"42"), Some(b"2026-01-01")]))
+            .unwrap()
+            .is_none());
+    }
+
+    #[test]
+    fn a_data_row_no_description_covers_fails_instead_of_relaying_stored_values() {
+        let ctx = context(false);
+        let (mut rewriter, mut decryptor) = session(&ctx);
+
+        // Parse/Bind/Execute with no Describe anywhere: nothing on the
+        // connection says what these columns are.
+        rewriter
+            .on_frame(
+                b'P',
+                &pgwire::encode_parse(b"a", b"SELECT email FROM users", &0i16.to_be_bytes()),
+            )
+            .unwrap();
+        execute(&mut rewriter, b"a");
+        let ct = envelope::encrypt(&KEY, &KEY_ID, b"alice@example.com").unwrap();
+        let row = data_row(&[Some(&ct)]);
+        assert!(matches!(decryptor.on_frame(b'D', &row), Err(Error::UndescribedRow)));
+
+        // Nor does a DataRow that follows no RowDescription at all pass.
+        let mut untracked = context(false).decryptor(SessionPortals::new());
+        assert!(matches!(untracked.on_frame(b'D', &row), Err(Error::UndescribedRow)));
+    }
+
+    /// A migration that recreates the table or the column gives the protected
+    /// column a new `(table_oid, attnum)`. The write path keys on names, so it
+    /// carries on encrypting; this path keys on the old position, finds
+    /// nothing, and used to relay the stored bytes with no signal at all
+    /// (CL-3). The field's own label is the only handle the message offers.
+    #[test]
+    fn a_protected_column_at_an_unresolved_position_is_noticed_not_relayed_silently() {
+        let ctx = context(false);
+        let mut decryptor = ctx.decryptor(SessionPortals::new());
+
+        // `email` is configured, but the table was recreated: new OID.
+        let moved = named_row_description(&[("id", 5678, 1), ("email", 5678, 2)]);
+        decryptor.on_frame(b'T', &moved).expect("warn mode relays");
+        assert!(decryptor.warned_stale, "the session must report it once");
+
+        // Once is enough — the flag is what stops a per-result-set flood.
+        decryptor.warned_stale = false;
+        decryptor.on_frame(b'T', &moved).unwrap();
+        assert!(decryptor.warned_stale);
+
+        // A field the map does cover is not suspect, and neither is a computed
+        // column (table_oid 0) that happens to be labelled like one.
+        let mut fine = context(false).decryptor(SessionPortals::new());
+        fine.on_frame(b'T', &named_row_description(&[("email", 1234, 2)])).unwrap();
+        fine.on_frame(b'T', &named_row_description(&[("email", 0, 0)])).unwrap();
+        assert!(!fine.warned_stale);
+    }
+
+    /// Under `on_unprotected = "reject"` the same detection fails the session
+    /// rather than handing the client something that may be ciphertext.
+    #[test]
+    fn a_moved_protected_column_fails_the_session_in_strict_mode() {
+        let mut columns = ColumnMap::new();
+        columns.insert((1234, 2), ReadColumn { transform: Some(transform(false)), mask: None });
+        let ctx = Arc::new(RowContext::new(
+            Resolved { columns, names: HashSet::from(["email".to_owned()]), ..Default::default() },
+            OnUnprotected::Reject,
+        ));
+        let mut decryptor = ctx.decryptor(SessionPortals::new());
+        assert!(matches!(
+            decryptor.on_frame(b'T', &named_row_description(&[("email", 5678, 2)])),
+            Err(Error::StaleColumnMap { table_oid: 5678, .. })
+        ));
+    }
+
+    /// A re-resolution reaches sessions that are already open: the mapping is
+    /// read per RowDescription, not captured when the session started.
+    #[test]
+    fn a_republished_resolution_is_picked_up_by_a_live_session() {
+        let ctx = context(false);
+        let mut decryptor = ctx.decryptor(SessionPortals::new());
+
+        // Before: nothing is protected at the new position.
+        decryptor.on_frame(b'T', &row_description(&[(5678, 2)])).unwrap();
+        let ct = envelope::encrypt(&KEY, &KEY_ID, b"alice").unwrap();
+        assert!(decryptor.on_frame(b'D', &data_row(&[Some(&ct)])).unwrap().is_none());
+
+        // The refresher re-resolves the column to where it moved to.
+        let mut columns = ColumnMap::new();
+        columns.insert((5678, 2), ReadColumn { transform: Some(transform(false)), mask: None });
+        ctx.publish(Resolved {
+            columns,
+            names: HashSet::from(["email".to_owned()]),
+            ..Default::default()
+        });
+
+        decryptor.on_frame(b'T', &row_description(&[(5678, 2)])).unwrap();
+        let rewritten = decryptor
+            .on_frame(b'D', &data_row(&[Some(&ct)]))
+            .unwrap()
+            .expect("the new mapping decrypts");
+        assert_eq!(pgwire::parse_data_row(&rewritten).unwrap()[0], Some(b"alice".as_slice()));
+    }
+
     #[test]
     fn tampered_ciphertext_fails_closed() {
         let ctx = context(false);
-        let mut decryptor = ctx.decryptor();
+        let mut decryptor = ctx.decryptor(SessionPortals::new());
         decryptor.on_frame(b'T', &row_description(&[(1234, 2)])).unwrap();
 
         let mut ct = envelope::encrypt(&KEY, &KEY_ID, b"secret").unwrap();

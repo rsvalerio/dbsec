@@ -2,6 +2,10 @@
 //! then a frame-aware relay in each direction. The upstream→client relay runs
 //! the row decryptor; the client→upstream relay runs the query rewriter.
 //!
+//! The two directions share one [`SessionPortals`]: the extended protocol
+//! splits a single conversation across both of them, and the decryptor cannot
+//! tell which statement a DataRow belongs to without what the rewriter saw.
+//!
 //! Each relay can also answer the sender directly instead of forwarding a
 //! frame ([`FrameAction::Reply`]) — that is how the write path refuses a
 //! statement with an ErrorResponse without dropping the connection. Both
@@ -20,6 +24,7 @@ use tokio::sync::{watch, Mutex};
 use tokio::time::timeout;
 
 use crate::encrypt::{QueryRewriter, WriteCatalog};
+use crate::portal::SessionPortals;
 use crate::rows::RowContext;
 use crate::tls::{MaybeTls, TlsContext};
 use crate::{Error, CONNECT_TIMEOUT};
@@ -47,7 +52,9 @@ const TX_IDLE: u8 = b'I';
 /// Everything a session needs beyond its socket.
 pub struct SessionContext {
     pub upstream_addr: String,
-    pub tls: TlsContext,
+    /// Shared with the column refresher, which needs the same trust roots for
+    /// its control connection.
+    pub tls: Arc<TlsContext>,
     pub rows: Option<Arc<RowContext>>,
     pub writes: Option<Arc<WriteCatalog>>,
     /// Deadline for the whole client-controlled startup phase.
@@ -92,13 +99,17 @@ pub async fn run(
         return Ok(()); // client connected and left (health check)
     };
 
-    let mut decryptor = ctx.rows.as_ref().map(|rows| rows.decryptor());
+    // Both halves are configured together (`main::serve` builds them from the
+    // same `[[column]]` list), so the decryptor is never left reading a
+    // conversation nobody is tracking.
+    let portals = SessionPortals::new();
+    let mut decryptor = ctx.rows.as_ref().map(|rows| rows.decryptor(portals.clone()));
     let tx_status = Arc::new(AtomicU8::new(TX_IDLE));
     let seen_status = tx_status.clone();
     let mut rewriter = ctx
         .writes
         .as_ref()
-        .map(|writes| QueryRewriter::new(writes.clone(), tx_status, search_path_trusted));
+        .map(|writes| QueryRewriter::new(writes.clone(), portals, tx_status, search_path_trusted));
     let (client_r, client_w) = tokio::io::split(client);
     let (upstream_r, upstream_w) = tokio::io::split(upstream);
     let client_w = Arc::new(Mutex::new(client_w));
@@ -420,7 +431,7 @@ mod tests {
     fn plain_ctx(upstream_addr: &str) -> SessionContext {
         SessionContext {
             upstream_addr: upstream_addr.to_owned(),
-            tls: TlsContext::from_config(&Config::default()).unwrap(),
+            tls: Arc::new(TlsContext::from_config(&Config::default()).unwrap()),
             rows: None,
             writes: None,
             startup_timeout: TEST_STARTUP_TIMEOUT,
@@ -686,14 +697,14 @@ mod tests {
         let (_shutdown_tx, shutdown) = no_shutdown();
         let first_ctx = SessionContext {
             upstream_addr: "127.0.0.1:1".to_owned(),
-            tls: TlsContext::from_config(&config).unwrap(),
+            tls: Arc::new(TlsContext::from_config(&config).unwrap()),
             rows: None,
             writes: None,
             startup_timeout: TEST_STARTUP_TIMEOUT,
         };
         let second_ctx = SessionContext {
             upstream_addr,
-            tls: TlsContext::from_config(&config).unwrap(),
+            tls: Arc::new(TlsContext::from_config(&config).unwrap()),
             rows: None,
             writes: None,
             startup_timeout: TEST_STARTUP_TIMEOUT,
@@ -794,7 +805,7 @@ mod tests {
         let (_shutdown_tx, shutdown) = no_shutdown();
         let ctx = SessionContext {
             upstream_addr: config.upstream.clone(),
-            tls: TlsContext::from_config(&config).unwrap(),
+            tls: Arc::new(TlsContext::from_config(&config).unwrap()),
             rows: None,
             writes: None,
             startup_timeout: TEST_STARTUP_TIMEOUT,
@@ -833,7 +844,7 @@ mod tests {
         .unwrap();
         let ctx = SessionContext {
             upstream_addr: config.upstream.clone(),
-            tls: TlsContext::from_config(&config).unwrap(),
+            tls: Arc::new(TlsContext::from_config(&config).unwrap()),
             rows: None,
             writes: None,
             startup_timeout: TEST_STARTUP_TIMEOUT,

@@ -1,8 +1,26 @@
-//! Startup column resolution: one control connection maps every configured
+//! Column resolution: one control connection maps every configured
 //! `[[column]]` to its `(table oid, attnum)` so the decrypt path can match
 //! RowDescription fields. A column that doesn't exist is a startup error —
 //! silently protecting nothing would be worse than refusing to start.
+//!
+//! That mapping is **not** valid for the life of the process. The read path
+//! keys on `(table_oid, attnum)` while the write path keys on the column's
+//! *name*, and an ordinary migration moves the first without touching the
+//! second: `DROP TABLE t; CREATE TABLE t (...)` gives a new `pg_class.oid`,
+//! and `ALTER TABLE t DROP COLUMN c, ADD COLUMN c ...` gives a new `attnum`
+//! (PostgreSQL never reuses one). A proxy that trusted its startup snapshot
+//! would keep encrypting every write and stop decrypting every read, with no
+//! error on either side — the client receives `blind_index || envelope` bytes
+//! and stores or displays them as the value (CL-3).
+//!
+//! So [`refresh_loop`] re-resolves on a timer, and a session that sees a
+//! result column named like a configured one but absent from the current
+//! mapping wakes it immediately ([`crate::rows::RowDecryptor`]). Re-resolution
+//! is deliberately *not* fatal: the proxy is already serving traffic, and a
+//! control connection that fails at minute ten is a reason to warn and keep
+//! the last good mapping, not to drop every live session.
 
+use std::sync::Arc;
 use std::time::Duration;
 
 use tokio::time::timeout;
@@ -11,7 +29,7 @@ use tokio_postgres::Socket;
 
 use crate::columns::ProtectedColumn;
 use crate::config::Dsn;
-use crate::rows::{ColumnMap, ReadColumn};
+use crate::rows::{ColumnMap, ReadColumn, Resolved, RowContext};
 use crate::tls::TlsContext;
 use crate::Error;
 
@@ -23,6 +41,78 @@ JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
 WHERE n.nspname = $1 AND c.relname = $2 AND a.attname = $3
   AND a.attnum > 0 AND NOT a.attisdropped";
 
+/// Everything [`refresh_loop`] needs to redo what `serve` did once at startup.
+pub struct Refresher {
+    pub ctx: Arc<RowContext>,
+    pub dsn: Dsn,
+    pub tls: Arc<TlsContext>,
+    pub columns: Arc<Vec<ProtectedColumn>>,
+    /// Zero disables the timer, leaving only the on-demand path.
+    pub interval: Duration,
+    /// The same per-step network deadline startup resolution uses.
+    pub deadline: Duration,
+}
+
+/// Re-resolves the column map on a timer, and immediately whenever a session
+/// reports a RowDescription its mapping could not explain. A failed
+/// re-resolution keeps the previous mapping: it is strictly better than the
+/// alternative, which is a proxy that stops decrypting because its control
+/// connection blipped.
+///
+/// Returns when `shutdown` fires. `interval` of zero disables the timer, which
+/// leaves only the on-demand path.
+pub async fn refresh_loop(refresher: Refresher, mut shutdown: crate::session::ShutdownRx) {
+    let Refresher { ctx, dsn, tls, columns, interval, deadline } = refresher;
+    loop {
+        let tick = async {
+            if interval.is_zero() {
+                std::future::pending::<()>().await;
+            } else {
+                tokio::time::sleep(interval).await;
+            }
+        };
+        tokio::select! {
+            () = tick => {}
+            () = ctx.refresh_requested() => {}
+            _ = shutdown.changed() => return,
+        }
+        match resolve_columns(&dsn, &tls, &columns, deadline).await {
+            Ok(resolved) => {
+                report_drift(&ctx.resolved(), &resolved);
+                ctx.publish(resolved);
+            }
+            // Including a column that no longer exists: mid-migration the
+            // table may be gone for a moment, and refusing to serve because
+            // of it would turn a schema change into an outage.
+            Err(e) => tracing::warn!(error = %e, "could not re-resolve protected columns; \
+                 keeping the previous mapping"),
+        }
+    }
+}
+
+/// Logs every protected position that moved between two resolutions. This is
+/// the actionable line: between the migration and this message the read path
+/// was relaying stored values for that column while the write path kept
+/// sealing them.
+fn report_drift(previous: &Resolved, current: &Resolved) {
+    for (column, was) in &previous.positions {
+        let Some(now) = current.positions.get(column) else { continue };
+        if now == was {
+            continue;
+        }
+        tracing::warn!(
+            column,
+            previous_table_oid = was.0,
+            previous_attnum = was.1,
+            table_oid = now.0,
+            attnum = now.1,
+            "a protected column moved: the table or column was recreated since it was resolved. \
+             Writes kept being encrypted; reads between the migration and now relayed stored \
+             values to clients. Re-check any row read in that window."
+        );
+    }
+}
+
 /// Resolves every configured column over one control connection. `deadline`
 /// bounds each network step separately — the connect and each lookup — so a
 /// control endpoint that accepts TCP and then goes silent fails startup
@@ -32,10 +122,12 @@ pub async fn resolve_columns(
     tls: &TlsContext,
     columns: &[ProtectedColumn],
     deadline: Duration,
-) -> Result<ColumnMap, Error> {
+) -> Result<Resolved, Error> {
     let client = connect(dsn, tls, deadline).await?;
 
     let mut map = ColumnMap::new();
+    let mut names = std::collections::HashSet::new();
+    let mut positions = std::collections::HashMap::new();
     for column in columns {
         let row = timeout(
             deadline,
@@ -61,11 +153,17 @@ pub async fn resolve_columns(
             readable = column.readable,
             "protected column resolved"
         );
+        positions.insert(column.qualified_name(), (table_oid, attnum));
         if let Some(read) = read_column(column) {
+            // Only columns the read path actually rewrites go into `names`:
+            // a write-only column (an irreversible token, FPE without
+            // detokenize) is *meant* to reach the client in its stored form,
+            // so seeing one unmapped is not evidence of anything.
+            names.insert(column.column.to_lowercase());
             map.insert((table_oid, attnum), read);
         }
     }
-    Ok(map)
+    Ok(Resolved { columns: map, names, positions })
 }
 
 /// What the read path should do with a resolved column, or `None` when it

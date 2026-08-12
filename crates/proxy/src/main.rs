@@ -5,6 +5,7 @@
 mod columns;
 mod config;
 mod encrypt;
+mod portal;
 mod resolve;
 mod rows;
 mod session;
@@ -99,6 +100,25 @@ pub enum Error {
     ColumnNotFound { table: String, column: String },
     #[error("a rewritten statement did not re-parse to the same SQL; refusing to send it")]
     RewriteDiverged,
+    #[error("client's {what} name is {len} bytes, over the {max} byte limit")]
+    NameTooLong { what: &'static str, len: usize, max: usize },
+    #[error("session reached its limit of {limit} {what}")]
+    SessionLimit { what: &'static str, limit: usize },
+    #[error(
+        "placeholder ${placeholder} feeds two protected positions that need different values; \
+         refusing to rewrite the statement"
+    )]
+    ConflictingParameter { placeholder: usize },
+    #[error(
+        "a DataRow arrived for a portal the server never described; refusing to relay columns \
+         that may be protected"
+    )]
+    UndescribedRow,
+    #[error(
+        "result column {column} of table {table_oid} is named like a protected column but is not \
+         in the resolved column map; the table may have been recreated since startup"
+    )]
+    StaleColumnMap { column: String, table_oid: u32 },
     #[error(transparent)]
     Wire(#[from] dbsec_core::Error),
     #[error(transparent)]
@@ -162,11 +182,17 @@ fn load_config() -> Result<ValidatedConfig, Error> {
 
 async fn serve(validated: ValidatedConfig) -> Result<(), Error> {
     let ValidatedConfig { config, protected } = validated;
-    let tls = TlsContext::from_config(&config)?;
+    let tls = Arc::new(TlsContext::from_config(&config)?);
 
     // `protected` is `Some` exactly when `[[column]]` entries were configured,
     // and validation already resolved the key source and the control DSN — so
     // there is nothing left to assert here (ERR-11).
+    //
+    // The column map the read path matches on is resolved here and then kept
+    // current by `refresher`: it is keyed by `(table oid, attnum)`, which an
+    // ordinary migration invalidates without touching the names the write
+    // path uses (see `resolve`).
+    let mut refresh = None;
     let (rows, writes) = match &protected {
         None => (None, None),
         Some(protected) => {
@@ -176,12 +202,14 @@ async fn serve(validated: ValidatedConfig) -> Result<(), Error> {
                     Arc::new(vault::VaultKeySource::connect(setup).await?)
                 }
             };
-            let columns = columns::build(&config, &keys);
-            let column_map =
-                resolve::resolve_columns(&protected.control_dsn, &tls, &columns, CONNECT_TIMEOUT)
-                    .await?;
+            let columns = Arc::new(columns::build(&config, &keys));
+            let dsn = protected.control_dsn.clone();
+            let resolved =
+                resolve::resolve_columns(&dsn, &tls, &columns, CONNECT_TIMEOUT).await?;
+            let rows = Arc::new(RowContext::new(resolved, config.on_unprotected));
+            refresh = Some((rows.clone(), dsn, columns.clone()));
             (
-                Some(Arc::new(RowContext { columns: column_map })),
+                Some(rows),
                 Some(Arc::new(encrypt::WriteCatalog::new(&columns, config.on_unprotected))),
             )
         }
@@ -189,7 +217,7 @@ async fn serve(validated: ValidatedConfig) -> Result<(), Error> {
 
     let ctx = Arc::new(SessionContext {
         upstream_addr: config.upstream.clone(),
-        tls,
+        tls: tls.clone(),
         rows,
         writes,
         startup_timeout: Duration::from_secs(config.startup_timeout_secs),
@@ -207,6 +235,7 @@ async fn serve(validated: ValidatedConfig) -> Result<(), Error> {
         protected_columns = config.columns.len(),
         max_sessions = config.max_sessions,
         startup_timeout_secs = config.startup_timeout_secs,
+        column_refresh_secs = config.column_refresh_secs,
         "dbsec listening"
     );
 
@@ -214,6 +243,19 @@ async fn serve(validated: ValidatedConfig) -> Result<(), Error> {
     // shutdown can wait for them instead of dropping the runtime out from
     // under a half-written frame (CONC-6).
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
+    let refresher = refresh.map(|(rows, dsn, columns)| {
+        tokio::spawn(resolve::refresh_loop(
+            resolve::Refresher {
+                ctx: rows,
+                dsn,
+                tls,
+                columns,
+                interval: Duration::from_secs(config.column_refresh_secs),
+                deadline: CONNECT_TIMEOUT,
+            },
+            shutdown_rx.clone(),
+        ))
+    });
     let mut sessions = JoinSet::new();
     let outcome = tokio::select! {
         result = accept_loop(listener, &ctx, config.max_sessions, &mut sessions, &shutdown_rx) => {
@@ -225,6 +267,14 @@ async fn serve(validated: ValidatedConfig) -> Result<(), Error> {
         }
     };
     let _ = shutdown_tx.send(true);
+    if let Some(refresher) = refresher {
+        // It only ever waits on a timer or the shutdown signal, so it is
+        // already on its way out; the timeout is a backstop for a
+        // re-resolution in flight against an unresponsive control connection.
+        if tokio::time::timeout(SHUTDOWN_DRAIN_TIMEOUT, refresher).await.is_err() {
+            tracing::warn!("column refresher did not stop within the drain timeout");
+        }
+    }
     drain_sessions(&mut sessions, SHUTDOWN_DRAIN_TIMEOUT).await;
     outcome
 }
@@ -438,7 +488,7 @@ mod tests {
         Arc::new(SessionContext {
             // Never dialled: these tests stop at the SSLRequest answer.
             upstream_addr: "127.0.0.1:1".to_owned(),
-            tls: TlsContext::from_config(&config).unwrap(),
+            tls: Arc::new(TlsContext::from_config(&config).unwrap()),
             rows: None,
             writes: None,
             startup_timeout: Duration::from_secs(10),
