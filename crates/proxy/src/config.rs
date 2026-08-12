@@ -25,6 +25,18 @@ pub struct Config {
     /// columns to table OID + attnum. Required when any `[[column]]` is
     /// configured, e.g. `postgres://dbsec:secret@127.0.0.1:5432/app`.
     pub control_dsn: Option<String>,
+    /// Deadline for the client-controlled startup phase: the first read, the
+    /// downstream TLS handshake, the upstream connection, and forwarding the
+    /// startup message. A client that stalls any of them is dropped here
+    /// rather than holding a task and two sockets indefinitely.
+    #[serde(default = "default_startup_timeout_secs")]
+    pub startup_timeout_secs: u64,
+    /// Maximum number of concurrent client sessions. Connections arriving
+    /// while the limit is reached are refused immediately; the default keeps
+    /// worst-case descriptor use (two sockets per session plus one upstream
+    /// backend connection) well inside a 1024 `ulimit -n`.
+    #[serde(default = "default_max_sessions")]
+    pub max_sessions: usize,
     #[serde(default)]
     pub tls: TlsSection,
     #[serde(default, rename = "column")]
@@ -172,6 +184,14 @@ fn default_upstream() -> String {
     "127.0.0.1:5432".to_owned()
 }
 
+fn default_startup_timeout_secs() -> u64 {
+    30
+}
+
+fn default_max_sessions() -> usize {
+    256
+}
+
 impl Default for Config {
     fn default() -> Self {
         Self {
@@ -180,6 +200,8 @@ impl Default for Config {
             keys_file: None,
             vault: None,
             control_dsn: None,
+            startup_timeout_secs: default_startup_timeout_secs(),
+            max_sessions: default_max_sessions(),
             tls: TlsSection::default(),
             columns: Vec::new(),
         }
@@ -197,6 +219,12 @@ impl Config {
     }
 
     fn validate(&self) -> Result<(), Error> {
+        if self.startup_timeout_secs == 0 {
+            return Err(Error::InvalidConfig("startup_timeout_secs must be greater than 0".into()));
+        }
+        if self.max_sessions == 0 {
+            return Err(Error::InvalidConfig("max_sessions must be greater than 0".into()));
+        }
         if !self.columns.is_empty() {
             match (&self.keys_file, &self.vault) {
                 (Some(_), None) | (None, Some(_)) => {}
@@ -254,6 +282,22 @@ mod tests {
         let cfg: Config = toml::from_str("").unwrap();
         assert_eq!(cfg.listen, "127.0.0.1:6432");
         assert_eq!(cfg.upstream, "127.0.0.1:5432");
+        assert_eq!(cfg.startup_timeout_secs, 30);
+        assert_eq!(cfg.max_sessions, 256);
+        cfg.validate().unwrap();
+    }
+
+    #[test]
+    fn limits_parse_and_reject_zero() {
+        let cfg: Config = toml::from_str("startup_timeout_secs = 5\nmax_sessions = 8\n").unwrap();
+        cfg.validate().unwrap();
+        assert_eq!(cfg.startup_timeout_secs, 5);
+        assert_eq!(cfg.max_sessions, 8);
+
+        let no_startup: Config = toml::from_str("startup_timeout_secs = 0").unwrap();
+        assert!(matches!(no_startup.validate(), Err(Error::InvalidConfig(_))));
+        let no_sessions: Config = toml::from_str("max_sessions = 0").unwrap();
+        assert!(matches!(no_sessions.validate(), Err(Error::InvalidConfig(_))));
     }
 
     #[test]
