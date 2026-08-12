@@ -52,9 +52,9 @@ struct KeyFile {
 impl FileKeySource {
     pub fn load(path: &Path) -> Result<Self, Error> {
         let raw = std::fs::read_to_string(path)
-            .map_err(|e| Error::KeySource(format!("reading {}: {e}", path.display())))?;
+            .map_err(|source| Error::KeyFileRead { path: path.to_path_buf(), source })?;
         let parsed: KeyFile = toml::from_str(&raw)
-            .map_err(|e| Error::KeySource(format!("parsing {}: {e}", path.display())))?;
+            .map_err(|source| Error::KeyFileParse { path: path.to_path_buf(), source })?;
 
         let mut keys = HashMap::new();
         for (id_hex, key_hex) in &parsed.keys {
@@ -94,9 +94,9 @@ impl FileKeySource {
         std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
         let mut file = options
             .open(path)
-            .map_err(|e| Error::KeySource(format!("creating {}: {e}", path.display())))?;
+            .map_err(|source| Error::KeyFileWrite { path: path.to_path_buf(), source })?;
         std::io::Write::write_all(&mut file, contents.as_bytes())
-            .map_err(|e| Error::KeySource(format!("writing {}: {e}", path.display())))?;
+            .map_err(|source| Error::KeyFileWrite { path: path.to_path_buf(), source })?;
         Ok(())
     }
 }
@@ -181,6 +181,35 @@ email = \"0303030303030303030303030303030303030303030303030303030303030303\"
             FileKeySource::load(&dir.path().join("keys.toml")),
             Err(Error::KeySource(_))
         ));
+    }
+
+    #[test]
+    fn missing_keyfile_keeps_the_io_error_as_a_cause() {
+        let dir = tempfile::tempdir().unwrap();
+        let Err(err) = FileKeySource::load(&dir.path().join("absent.toml")) else {
+            panic!("loading a missing keyfile must fail");
+        };
+        let Error::KeyFileRead { path, source } = &err else {
+            panic!("expected KeyFileRead, got {err:?}");
+        };
+        // The operator needs "missing" told apart from "unreadable".
+        assert_eq!(source.kind(), std::io::ErrorKind::NotFound);
+        assert!(path.ends_with("absent.toml"));
+        assert!(std::error::Error::source(&err).is_some());
+    }
+
+    #[test]
+    fn malformed_keyfile_keeps_the_toml_error_as_a_cause() {
+        let dir = write_keyfile("active = \n");
+        let Err(err) = FileKeySource::load(&dir.path().join("keys.toml")) else {
+            panic!("loading a malformed keyfile must fail");
+        };
+        let Error::KeyFileParse { source, .. } = &err else {
+            panic!("expected KeyFileParse, got {err:?}");
+        };
+        // toml's span survives, so a caller can point at the offending line.
+        assert!(source.span().is_some());
+        assert!(std::error::Error::source(&err).is_some());
     }
 
     #[test]
