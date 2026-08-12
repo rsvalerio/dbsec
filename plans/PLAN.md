@@ -83,8 +83,9 @@ TLS: `MaybeTls` stream enum both hops. Downstream handles `SSLRequest` from clie
    demand and cached. Index keys live in one KV secret, minted on first use.
    Needs live-server integration coverage in milestone 10)*
 10. **Hardening** — cargo-fuzz on the frame parser; driver integration suite (sqlx,
-    psycopg) over TLS against dockerized Postgres. *(done; `fuzz/` has `pgwire` and
-    `envelope` targets (`make fuzz`; smoke-ran millions of execs clean). `make e2e`
+    psycopg) over TLS against dockerized Postgres. *(done; `fuzz/` has `pgwire`,
+    `envelope` and `transform` targets — the last covering masking and the read path over
+    arbitrary stored bytes (`make fuzz`; smoke-ran millions of execs clean). `make e2e`
     runs the real binary between dockerized Postgres 17 and three driver families
     over the TLS client hop — tokio-postgres (both protocols), sqlx (cached named
     statements, binary results, text-format BYTEA decoding) and psycopg 2/3 (unnamed
@@ -107,6 +108,15 @@ TLS: `MaybeTls` stream enum both hops. Downstream handles `SSLRequest` from clie
   is not encrypted; warn or reject on protected tables.
 - FF1 on tiny domains (<6 digits) is brute-forceable — refuse in config validation.
 - Rotating the blind-index/FPE/token keys breaks determinism; only DEKs rotate freely.
+- AES-GCM nonces are random 96-bit, so a DEK has a finite safe lifetime: NIST SP 800-38D
+  §8.3 caps a random-IV key at 2^32 invocations (nonce-collision probability under 2^-32;
+  a repeat leaks the XOR of two plaintexts and the GHASH subkey, retroactively over every
+  row stored under that key). `envelope::MAX_ENCRYPTIONS_PER_KEY` enforces that budget per
+  DEK across the whole process — the write path goes through one shared `envelope::Ciphers`
+  cache, which rolls to a fresh DEK when the key source offers one (Vault mints one per
+  start) and otherwise fails closed with `Error::KeyExhausted` rather than reusing a spent
+  key. A counter-based nonce would remove the birthday bound but needs durable counter
+  state across restarts; that trade is not taken.
 - Masking is enforced only for traffic through this proxy.
 
 ## Infra
