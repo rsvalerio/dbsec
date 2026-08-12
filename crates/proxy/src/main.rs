@@ -12,7 +12,7 @@ mod tls;
 mod vault;
 
 use std::future::Future;
-use std::io::ErrorKind;
+use std::io::{ErrorKind, IsTerminal};
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
@@ -24,7 +24,7 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{watch, Semaphore};
 use tokio::task::JoinSet;
 
-use crate::config::Config;
+use crate::config::{Config, KeySourceConfig, ValidatedConfig};
 use crate::rows::RowContext;
 use crate::session::{SessionContext, ShutdownRx};
 use crate::tls::TlsContext;
@@ -32,6 +32,13 @@ use crate::tls::TlsContext;
 /// How long shutdown waits for live sessions to reach a frame boundary before
 /// the remainder are aborted.
 const SHUTDOWN_DRAIN_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Deadline for a single network step the proxy initiates itself: the data
+/// path's upstream connect ([`session`]) and the startup control
+/// connection's connect and per-column lookup ([`resolve`]). One constant so
+/// no proxy-initiated call can end up unbounded because its module happened
+/// not to define one (ASYNC-6).
+pub(crate) const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Pause after an `accept()` failure that is not per-connection, so the loop
 /// cannot spin at 100% CPU re-failing while descriptors are unavailable.
@@ -76,10 +83,18 @@ pub enum Error {
     UpstreamTlsRefused { addr: String },
     #[error("invalid config: {0}")]
     InvalidConfig(String),
+    #[error("binding listen address {addr}: {source}")]
+    Listen {
+        addr: String,
+        #[source]
+        source: std::io::Error,
+    },
     #[error("vault: {0}")]
     Vault(String),
     #[error("control connection: {0}")]
     Control(String),
+    #[error("control connection to {host}: no response within {timeout:?}")]
+    ControlTimeout { host: String, timeout: Duration },
     #[error("configured column {table}.{column} does not exist")]
     ColumnNotFound { table: String, column: String },
     #[error("a rewritten statement did not re-parse to the same SQL; refusing to send it")]
@@ -91,7 +106,16 @@ pub enum Error {
 }
 
 fn main() -> ExitCode {
+    // Diagnostics go to stderr, deliberately — `tracing_subscriber::fmt()`
+    // would otherwise default to stdout. A long-running proxy's stdout
+    // belongs to whatever the operator pipes it into, and `dbsec 2>/dev/null`
+    // has to be able to silence the logs without silencing anything else.
+    // `tests/cli.rs` pins the choice (TEST-31). Colour follows the same
+    // reasoning: escape sequences are for a terminal, not for the journal or
+    // log file a redirected stderr usually is.
     tracing_subscriber::fmt()
+        .with_writer(std::io::stderr)
+        .with_ansi(std::io::stderr().is_terminal())
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()),
         )
@@ -122,7 +146,7 @@ fn main() -> ExitCode {
 }
 
 /// `dbsec [config.toml]` — a missing default file just means defaults.
-fn load_config() -> Result<Config, Error> {
+fn load_config() -> Result<ValidatedConfig, Error> {
     match std::env::args_os().nth(1) {
         Some(path) => Config::load(Path::new(&path)),
         None => {
@@ -130,32 +154,37 @@ fn load_config() -> Result<Config, Error> {
             if default.exists() {
                 Config::load(default)
             } else {
-                Ok(Config::default())
+                Config::default().validated()
             }
         }
     }
 }
 
-async fn serve(config: Config) -> Result<(), Error> {
+async fn serve(validated: ValidatedConfig) -> Result<(), Error> {
+    let ValidatedConfig { config, protected } = validated;
     let tls = TlsContext::from_config(&config)?;
 
-    let (rows, writes) = if config.columns.is_empty() {
-        (None, None)
-    } else {
-        let keys: Arc<dyn dbsec_core::keys::KeySource> = match (&config.keys_file, &config.vault) {
-            (Some(keys_file), None) => Arc::new(FileKeySource::load(keys_file)?),
-            (None, Some(vault_config)) => {
-                Arc::new(vault::VaultKeySource::connect(vault_config).await?)
-            }
-            _ => unreachable!("validated: columns require exactly one key source"),
-        };
-        let protected = columns::build(&config, &keys);
-        let dsn = config.control_dsn.as_deref().expect("validated: columns require control_dsn");
-        let column_map = resolve::resolve_columns(dsn, &tls, &protected).await?;
-        (
-            Some(Arc::new(RowContext { columns: column_map })),
-            Some(Arc::new(encrypt::WriteCatalog::new(&protected, config.on_unprotected))),
-        )
+    // `protected` is `Some` exactly when `[[column]]` entries were configured,
+    // and validation already resolved the key source and the control DSN — so
+    // there is nothing left to assert here (ERR-11).
+    let (rows, writes) = match &protected {
+        None => (None, None),
+        Some(protected) => {
+            let keys: Arc<dyn dbsec_core::keys::KeySource> = match &protected.keys {
+                KeySourceConfig::File(keys_file) => Arc::new(FileKeySource::load(keys_file)?),
+                KeySourceConfig::Vault(vault_config) => {
+                    Arc::new(vault::VaultKeySource::connect(vault_config).await?)
+                }
+            };
+            let columns = columns::build(&config, &keys);
+            let column_map =
+                resolve::resolve_columns(&protected.control_dsn, &tls, &columns, CONNECT_TIMEOUT)
+                    .await?;
+            (
+                Some(Arc::new(RowContext { columns: column_map })),
+                Some(Arc::new(encrypt::WriteCatalog::new(&columns, config.on_unprotected))),
+            )
+        }
     };
 
     let ctx = Arc::new(SessionContext {
@@ -165,7 +194,11 @@ async fn serve(config: Config) -> Result<(), Error> {
         writes,
         startup_timeout: Duration::from_secs(config.startup_timeout_secs),
     });
-    let listener = TcpListener::bind(&config.listen).await?;
+    // Named rather than left as a bare `Io`: "Address already in use" without
+    // the address is the least useful startup failure there is.
+    let listener = TcpListener::bind(&config.listen)
+        .await
+        .map_err(|source| Error::Listen { addr: config.listen.clone(), source })?;
     tracing::info!(
         listen = %config.listen,
         upstream = %config.upstream,

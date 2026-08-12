@@ -265,26 +265,69 @@ impl Default for Config {
     }
 }
 
+/// The key source protected columns are opened with. Validation resolves the
+/// `keys_file`/`[vault]` pair into exactly one of these once, so no later
+/// stage has to restate the invariant with a panic (ERR-11).
+#[derive(Debug, Clone)]
+pub enum KeySourceConfig {
+    /// TOML keyfile for `dbsec_core::keys::FileKeySource`.
+    File(PathBuf),
+    /// OpenBao/Vault Transit + KV.
+    Vault(VaultConfig),
+}
+
+/// What the protected-column path needs, proved present by validation:
+/// exactly one key source and a control DSN. Constructed only by
+/// [`Config::validated`], and only when at least one `[[column]]` is
+/// configured — a config with no columns cannot produce one, so the proxy's
+/// plain-relay mode never reaches this state at all.
+#[derive(Debug)]
+pub struct ProtectedConfig {
+    pub keys: KeySourceConfig,
+    pub control_dsn: String,
+}
+
+/// A [`Config`] that has passed [`Config::validate`], carrying what
+/// validation proved rather than expecting the use site to re-derive it.
+#[derive(Debug)]
+pub struct ValidatedConfig {
+    pub config: Config,
+    /// `None` when no `[[column]]` is configured: the proxy is then a plain
+    /// relay and needs neither keys nor a control connection.
+    pub protected: Option<ProtectedConfig>,
+}
+
 impl Config {
-    pub fn load(path: &Path) -> Result<Self, Error> {
+    pub fn load(path: &Path) -> Result<ValidatedConfig, Error> {
         let raw = std::fs::read_to_string(path)
             .map_err(|source| Error::ConfigRead { path: path.to_owned(), source })?;
         let config: Self = toml::from_str(&raw)
             .map_err(|source| Error::ConfigParse { path: path.to_owned(), source })?;
-        config.validate()?;
-        Ok(config)
+        config.validated()
     }
 
-    fn validate(&self) -> Result<(), Error> {
+    /// Validates and hands back the resolved form. The only way to obtain a
+    /// [`ValidatedConfig`], including for a programmatically built config.
+    pub fn validated(self) -> Result<ValidatedConfig, Error> {
+        let protected = self.validate()?;
+        Ok(ValidatedConfig { config: self, protected })
+    }
+
+    /// Checks every config invariant and returns the resolved protected-column
+    /// setup, `None` when no `[[column]]` is configured.
+    fn validate(&self) -> Result<Option<ProtectedConfig>, Error> {
         if self.startup_timeout_secs == 0 {
             return Err(Error::InvalidConfig("startup_timeout_secs must be greater than 0".into()));
         }
         if self.max_sessions == 0 {
             return Err(Error::InvalidConfig("max_sessions must be greater than 0".into()));
         }
-        if !self.columns.is_empty() {
-            match (&self.keys_file, &self.vault) {
-                (Some(_), None) | (None, Some(_)) => {}
+        let protected = if self.columns.is_empty() {
+            None
+        } else {
+            let keys = match (&self.keys_file, &self.vault) {
+                (Some(keys_file), None) => KeySourceConfig::File(keys_file.clone()),
+                (None, Some(vault)) => KeySourceConfig::Vault(vault.clone()),
                 (None, None) => {
                     return Err(Error::InvalidConfig(
                         "[[column]] entries require keys_file or [vault]".into(),
@@ -295,11 +338,12 @@ impl Config {
                         "keys_file and [vault] are mutually exclusive".into(),
                     ))
                 }
-            }
-            if self.control_dsn.is_none() {
-                return Err(Error::InvalidConfig("[[column]] entries require control_dsn".into()));
-            }
-        }
+            };
+            let control_dsn = self.control_dsn.clone().ok_or_else(|| {
+                Error::InvalidConfig("[[column]] entries require control_dsn".into())
+            })?;
+            Some(ProtectedConfig { keys, control_dsn })
+        };
         if let Some(vault) = &self.vault {
             vault.token()?;
             if vault.timeout_secs == 0 {
@@ -331,7 +375,7 @@ impl Config {
                 )));
             }
         }
-        Ok(())
+        Ok(protected)
     }
 }
 

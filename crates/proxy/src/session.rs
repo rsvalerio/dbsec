@@ -22,9 +22,7 @@ use tokio::time::timeout;
 use crate::encrypt::{QueryRewriter, WriteCatalog};
 use crate::rows::RowContext;
 use crate::tls::{MaybeTls, TlsContext};
-use crate::Error;
-
-const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+use crate::{Error, CONNECT_TIMEOUT};
 
 /// Deadline for the downstream TLS handshake on its own. It sits inside the
 /// session's overall startup deadline so a peer that opens a connection and
