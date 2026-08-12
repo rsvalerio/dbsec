@@ -11,6 +11,44 @@ a thin tokio TCP wrapper around it.
 
 Status: scaffold. Roadmap and design in [plans/PLAN.md](plans/PLAN.md).
 
+## Operating the proxy
+
+Two settings decide how much of the "a protected column is never at rest in
+plaintext" invariant the proxy can actually enforce. Both are documented in full
+in `crates/proxy/src/config.rs`; the short version:
+
+**`on_unprotected`** — what happens to a statement the SQL rewrite cannot cover,
+so a protected column would take a plaintext write (or a searchable predicate
+would match nothing). The sites are non-UTF-8 and unparseable SQL, `INSERT`
+without a column list, `INSERT ... SELECT`, `COPY`, `MERGE`, `PREPARE` of a
+write, a non-literal expression assigned to a protected column, an unqualified
+name under a changed `search_path`, and a predicate over a searchable column
+that no blind-index match can express.
+
+```toml
+on_unprotected = "warn"    # default: log and relay — fail *open*
+on_unprotected = "reject"  # answer the client with an ErrorResponse instead
+```
+
+`reject` is statement-level, not connection-level: the client gets a PostgreSQL
+`ERROR` (SQLSTATE 42501) and the session carries on. It is not the default
+because it refuses statements that work today — including any SQL sqlparser
+cannot parse but PostgreSQL can, whether or not it touches a protected table.
+Run on `warn`, collect the warnings, fix them, then switch.
+
+**`search_path`** — a `[[column]]` entry without a schema means `public`, and
+the write path resolves an unqualified SQL name the same way. A session that
+points `search_path` elsewhere breaks that equivalence in both directions, so
+the proxy watches the startup packet and `SET search_path` and stops resolving
+bare names once the default no longer holds (an `on_unprotected` site).
+Schema-qualifying either the config or the SQL avoids the question entirely.
+
+`COPY` is never encrypted. `COPY ... FROM` carries its payload in `CopyData`
+frames rather than SQL, and `COPY ... TO` bypasses the read path — so a
+protected column leaves as its stored form, which for a mask-only column is the
+*unmasked* value. Both are `on_unprotected` sites; bulk-load through `INSERT`,
+or seal the data before it reaches the proxy.
+
 ## Develop
 
 ```

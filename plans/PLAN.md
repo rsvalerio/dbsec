@@ -38,7 +38,28 @@ blind-index and mask-on-read are read/write-path decorators. Everything else is 
 
 Client→DB: `Query` → sqlparser rewrite of INSERT/UPDATE literals and searchable WHERE
 equality; `Parse` → remember param positions per statement; `Bind` → transform bound
-params. Unparseable SQL passes through (logged loudly). Crypto errors fail closed.
+params.
+
+Two kinds of failure, and they fail in opposite directions:
+
+- **Crypto failures always fail closed**, under every setting: a seal or open that errors,
+  a key that cannot be fetched, a blind index that cannot be computed. The session is
+  dropped rather than relaying a value the proxy could not protect.
+- **Routing failures obey `on_unprotected`.** These are the statements the rewrite cannot
+  cover, so a protected column would take a plaintext write (or a searchable predicate
+  would match nothing): non-UTF-8 or unparseable SQL, `INSERT` without a column list,
+  `INSERT ... SELECT`, `COPY`, `MERGE`, `PREPARE` of a write, a non-literal expression
+  assigned to a protected column, an unqualified name in a session that moved
+  `search_path`, and a predicate over a searchable column that no blind-index match can
+  express. `on_unprotected = "warn"` (the default) logs and relays; `on_unprotected =
+  "reject"` answers the client with a PostgreSQL ErrorResponse and never forwards the
+  statement. The refusal is statement-level — the connection stays open and the session
+  recovers at the next `ReadyForQuery`.
+
+The default is `warn` because `reject` refuses statements that work today, including any
+SQL sqlparser cannot parse but PostgreSQL can, whether or not it touches a protected
+table. A deployment that needs the "never at rest in plaintext" invariant enforced runs
+on `warn` long enough to collect the warnings, fixes them, then switches to `reject`.
 
 DB→Client: `RowDescription` → match configured columns by table OID + attnum (resolved at
 startup via a control connection); `DataRow` → strip blind index, check magic, decrypt /
@@ -60,9 +81,11 @@ TLS: `MaybeTls` stream enum both hops. Downstream handles `SSLRequest` from clie
    detection, so Bind-time result formats don't need tracking yet)*
 5. **Encrypt path** — sqlparser rewrite (Query) + Parse/Bind; `FieldTransform` trait born here.
    *(done; searchable columns already get their blind index prepended on write, so
-   milestone 8 only adds the WHERE equality rewrite. INSERT without a column list,
-   INSERT...SELECT, and non-literal expressions pass through with loud warnings;
-   COPY on protected tables warns)*
+   milestone 8 only adds the WHERE equality rewrite. `INSERT ... ON CONFLICT DO UPDATE`
+   seals its conflict action through the same path as `UPDATE`. Everything the rewrite
+   cannot cover — INSERT without a column list, INSERT...SELECT, COPY, MERGE, PREPARE of
+   a write, non-literal expressions — is an `on_unprotected` site: warned about by
+   default, refused with an ErrorResponse under `on_unprotected = "reject"`)*
 6. **Pseudonymization** — FPE + HMAC token transforms; optional detokenize-on-read.
    *(done; `transform = "fpe" | "token"` per column, FF1 over decimal digits with
    separators preserved (<6 digits refused at seal time), tokens are irreversible
@@ -109,8 +132,29 @@ TLS: `MaybeTls` stream enum both hops. Downstream handles `SSLRequest` from clie
 - Deterministic blind index / tokens leak equality and frequency patterns.
 - sqlparser-rs won't parse all exotic PG syntax; those queries pass through unencrypted —
   log loudly. Literals wrapped in casts (`'\x…'::bytea`, as psycopg's client-side binding
-  emits) are understood, but function calls and other computed values are not. `COPY FROM`
-  is not encrypted; warn or reject on protected tables.
+  emits) are understood, but function calls and other computed values are not. All of
+  these are `on_unprotected` sites, so a deployment can turn them into refusals.
+- **`COPY` is refused, not encrypted** (decided; the two options were rejecting the
+  statement under `on_unprotected = "reject"` or parsing and transforming the `CopyData`
+  stream). `COPY ... FROM` carries its payload in `CopyData` frames rather than SQL, so
+  encrypting it means implementing the text, CSV and binary copy formats and refusing the
+  ones that are left — a second, format-specific rewrite engine for a path that is a bulk
+  load, i.e. exactly where a parsing bug is most expensive. `COPY ... TO` is the same hole
+  in the read direction: it bypasses `DataRow` interception entirely, so a protected
+  column leaves as its stored form — ciphertext for encrypted columns (fail-safe) but the
+  *unmasked* stored value for a mask-only column, which silently defeats masking. Both
+  directions are `on_unprotected` sites: warned about by default, refused under `reject`.
+  Bulk-loading a protected table means going through `INSERT`, or sealing the data before
+  it reaches the proxy.
+- **Unqualified table names assume `search_path` is the default.** A `[[column]]` entry
+  without a schema means `public`, and the write path resolves a bare SQL name the same
+  way. A session that moves `search_path` breaks that in both directions — a bare write
+  can miss the catalog (plaintext at rest) or match the wrong table (sealed for a table
+  the read path, which resolves by OID, never looks at, so it reads back as ciphertext
+  forever). The proxy therefore watches the startup packet's `search_path`/`options`
+  parameters and `SET search_path`, and once the default no longer holds it stops
+  resolving unqualified names at all; that is an `on_unprotected` site too. Qualifying
+  either the config or the SQL removes the question.
 - FF1 on tiny domains (<6 digits) is brute-forceable — refuse in config validation.
 - Rotating the blind-index/FPE/token keys breaks determinism; only DEKs rotate freely.
   Rotation is an operator re-index, not a proxy feature — see below.
