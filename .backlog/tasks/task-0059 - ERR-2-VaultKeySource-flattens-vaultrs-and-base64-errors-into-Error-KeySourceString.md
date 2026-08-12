@@ -3,9 +3,11 @@ id: TASK-0059
 title: >-
   ERR-2: VaultKeySource flattens vaultrs and base64 errors into
   Error::KeySource(String)
-status: Triage
-assignee: []
+status: To Do
+assignee:
+  - TASK-0065
 created_date: '2026-08-12 11:03'
+updated_date: '2026-08-12 18:42'
 labels:
   - code-review-rust
   - errors

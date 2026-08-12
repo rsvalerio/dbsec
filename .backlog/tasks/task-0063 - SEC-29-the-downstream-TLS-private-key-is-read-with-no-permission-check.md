@@ -1,9 +1,11 @@
 ---
 id: TASK-0063
 title: 'SEC-29: the downstream TLS private key is read with no permission check'
-status: Triage
-assignee: []
+status: To Do
+assignee:
+  - TASK-0067
 created_date: '2026-08-12 16:50'
+updated_date: '2026-08-12 18:42'
 labels:
   - code-review-rust
   - security

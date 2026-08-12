@@ -1,9 +1,11 @@
 ---
 id: TASK-0062
 title: 'SEC-31: `= ANY($1)` over a searchable column is signalled but never rewritten'
-status: Triage
-assignee: []
+status: To Do
+assignee:
+  - TASK-0066
 created_date: '2026-08-12 16:14'
+updated_date: '2026-08-12 18:42'
 labels:
   - code-review-rust
   - security

@@ -1,9 +1,11 @@
 ---
 id: TASK-0061
 title: Migrated shared-map index keys are left in Vault with no cleanup step
-status: Triage
-assignee: []
+status: To Do
+assignee:
+  - TASK-0065
 created_date: '2026-08-12 16:14'
+updated_date: '2026-08-12 18:42'
 labels:
   - code-review-rust
   - security

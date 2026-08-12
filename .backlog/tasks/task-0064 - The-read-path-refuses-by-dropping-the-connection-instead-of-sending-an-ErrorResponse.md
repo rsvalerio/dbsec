@@ -3,9 +3,11 @@ id: TASK-0064
 title: >-
   The read path refuses by dropping the connection instead of sending an
   ErrorResponse
-status: Triage
-assignee: []
+status: To Do
+assignee:
+  - TASK-0066
 created_date: '2026-08-12 17:01'
+updated_date: '2026-08-12 18:42'
 labels:
   - code-review-rust
   - read-path

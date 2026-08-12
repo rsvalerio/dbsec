@@ -3,9 +3,11 @@ id: TASK-0058
 title: >-
   CONTRIBUTING.md is still the unfilled forge template ({{REPO}} placeholders,
   empty sections)
-status: Triage
-assignee: []
+status: To Do
+assignee:
+  - TASK-0068
 created_date: '2026-08-12 10:40'
+updated_date: '2026-08-12 18:42'
 labels:
   - code-review-rust
   - docs
