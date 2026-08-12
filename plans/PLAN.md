@@ -112,7 +112,12 @@ TLS: `MaybeTls` stream enum both hops. Downstream handles `SSLRequest` from clie
 ## Infra
 
 - CI/release via forge (`rsvalerio/forge`): `ci.yml` and `bump.yml` are thin wrappers;
-  deny/clippy/rustfmt configs copied from `forge/config` (keep in sync).
+  deny/clippy/rustfmt configs copied from `forge/config`, `CONTRIBUTING.md` from
+  `forge/templates`. Staying in sync is enforced, not remembered: `.forge-sync/manifest`
+  lists the copies and `scripts/forge-sync-check.sh` (the `forge-sync` CI job,
+  `make forge-sync`) diffs each one against the forge tag the workflows pin. Deliberate
+  divergence is recorded as a waiver patch under `.forge-sync/waivers/` with a reason,
+  so the exemption is the diff itself and a later forge-side change still fails.
 - `e2e.yml` is repo-local rather than a forge wrapper: the forge gates run `cargo test`,
   which skips both e2e suites (they are `#[ignore]`d without a database). It supplies
   Postgres and a dev-mode OpenBao as job services and points the suites at them with

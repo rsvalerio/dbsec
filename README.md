@@ -31,6 +31,14 @@ and psycopg 2/3; the Python cases are skipped unless
 services you already run when `DBSEC_E2E_DSN` / `DBSEC_E2E_VAULT_ADDR` are set,
 and start throwaway containers otherwise.
 
+Each suite listens on its own port from a block starting at 16432. Set
+`DBSEC_E2E_PORT_BASE` to move the block when something else on the machine — a
+second checkout, another CI job on the same runner — already holds it.
+
 CI and release run through [forge](https://github.com/rsvalerio/forge) reusable
-workflows; lint configs (`deny.toml`, `clippy.toml`, `rustfmt.toml`) are copies
-of forge's canonical versions.
+workflows; lint configs (`deny.toml`, `clippy.toml`, `rustfmt.toml`) and
+`CONTRIBUTING.md` are copies of forge's canonical versions. `make forge-sync`
+(also a CI job) diffs them against the forge tag the workflows are pinned to, so
+a copy going stale fails the build instead of going unnoticed. Divergence that
+is deliberate is recorded as a waiver under `.forge-sync/waivers/`, which pins
+the expected diff — a later change on the forge side still fails.
