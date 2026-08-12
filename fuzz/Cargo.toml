@@ -10,6 +10,8 @@ cargo-fuzz = true
 [dependencies]
 libfuzzer-sys = "0.4"
 dbsec-core = { path = "../crates/core" }
+hex = "0.4"
+zeroize = "1"
 
 [[bin]]
 name = "pgwire"
@@ -21,6 +23,13 @@ bench = false
 [[bin]]
 name = "envelope"
 path = "fuzz_targets/envelope.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "transform"
+path = "fuzz_targets/transform.rs"
 test = false
 doc = false
 bench = false

@@ -79,6 +79,7 @@ e2e-vault: ## Vault/OpenBao key source against a live dev-mode OpenBao
 fuzz: ## Smoke-run each fuzz target for 30s (needs nightly + cargo-fuzz)
 	cd fuzz && cargo +nightly fuzz run pgwire -- -max_total_time=30
 	cd fuzz && cargo +nightly fuzz run envelope -- -max_total_time=30
+	cd fuzz && cargo +nightly fuzz run transform -- -max_total_time=30
 
 fmt: ## Format all crates
 	cargo fmt --all
