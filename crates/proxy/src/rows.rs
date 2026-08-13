@@ -31,11 +31,12 @@
 //! This path has two of them: a DataRow no described statement covers
 //! ([`Error::UndescribedRow`]) and a result column a stale mapping would
 //! under-match under `on_unprotected = "reject"`
-//! ([`Error::StaleColumnMap`]). Both are statement-level, not
-//! connection-level: the client gets a PostgreSQL ErrorResponse (SQLSTATE
-//! 42501, the same one a refused write carries), the rest of the result set is
-//! discarded, and the backend's own ReadyForQuery ends the batch — see
-//! [`RowDecryptor::on_frame`]. Crypto failures are not refusals and still fail
+//! ([`Error::StaleColumnMap`]). Both hand the client a PostgreSQL
+//! ErrorResponse (SQLSTATE 42501, the same one a refused write carries) and
+//! then end the session — see [`RowDecryptor::on_frame`] for why the read path
+//! cannot refuse at statement level the way the write path does: its statement
+//! has already run, and only closing the connection stops what the backend is
+//! still executing behind it. Crypto failures are not refusals and still fail
 //! the session.
 //!
 //! Whether the second one deserves a knob of its own, separate from
@@ -149,13 +150,7 @@ impl RowContext {
     }
 
     pub fn decryptor(self: &Arc<Self>, portals: Arc<SessionPortals>) -> RowDecryptor {
-        RowDecryptor {
-            ctx: self.clone(),
-            portals,
-            described: None,
-            warned_stale: false,
-            refusing: false,
-        }
+        RowDecryptor { ctx: self.clone(), portals, described: None, warned_stale: false }
     }
 }
 
@@ -171,9 +166,6 @@ pub struct RowDecryptor {
     /// session is enough to act on; one per result set would be a log flood
     /// for exactly as long as the migration goes unnoticed.
     warned_stale: bool,
-    /// Set after refusing a result set: the client has its ErrorResponse and
-    /// everything the backend sends up to its ReadyForQuery is dropped.
-    refusing: bool,
 }
 
 /// Whether an error is a refusal the client can be told about, rather than a
@@ -192,21 +184,30 @@ impl RowDecryptor {
     ///
     /// A *refusal* — a DataRow no described statement covers, or a result
     /// column a stale mapping would under-match under
-    /// `on_unprotected = "reject"` — is answered the way the write path
-    /// answers one: the client gets a PostgreSQL ErrorResponse in place of the
-    /// frame, the rest of the result set is discarded, and the backend's own
-    /// ReadyForQuery resynchronises the session. Dropping the connection
-    /// instead (the previous behaviour) gave the client `Closed` rather than a
+    /// `on_unprotected = "reject"` — hands the client the same PostgreSQL
+    /// ErrorResponse a refused write carries, and then ends the session.
+    ///
+    /// The error is the point: dropping the socket silently (the behaviour
+    /// before this path had one) gave the client `Closed` rather than a
     /// `DbError`, so a policy refusal read as a network fault and the proxy's
     /// reason stayed in its log.
+    ///
+    /// Ending the session is equally the point, and is why this is not the
+    /// statement-level refusal the write path performs. A refused *write* never
+    /// reaches the backend. A refused *read* is the result of a statement that
+    /// has already run, and the backend is still working through whatever
+    /// followed it in the batch. Answering the client and resynchronising on
+    /// the backend's own ReadyForQuery leaves `SELECT protected; UPDATE …` to
+    /// commit its UPDATE behind an error that told the client nothing
+    /// happened — and the relayed ReadyForQuery even carries the backend's
+    /// real `I` status to confirm it. Nothing the proxy can send in-band stops
+    /// a batch already executing, so the connection closes and the backend
+    /// rolls the implicit transaction back.
     ///
     /// Every *other* error is still fatal to the session: a decrypt failure
     /// means the bytes in flight are not what they claim to be, and there is
     /// no state to resynchronise to.
     pub fn on_frame(&mut self, msg_type: u8, body: &[u8]) -> Result<FrameAction, Error> {
-        if self.refusing {
-            return Ok(self.discard_until_ready(msg_type));
-        }
         match self.inspect(msg_type, body) {
             Ok(None) => Ok(FrameAction::Relay),
             Ok(Some(body)) => Ok(FrameAction::Replace(body)),
@@ -215,33 +216,16 @@ impl RowDecryptor {
         }
     }
 
-    /// Answers the client with an ErrorResponse and takes ownership of the
-    /// rest of the batch, which the backend is still sending.
+    /// Answers the client with an ErrorResponse and ends the session, which is
+    /// what stops the rest of the batch upstream.
     fn refuse(&mut self, error: &Error) -> FrameAction {
-        self.refusing = true;
         tracing::error!(
             error = %error,
-            "refusing this result set; answering the client with an ErrorResponse"
+            "refusing this result set; answering the client and closing the session"
         );
-        FrameAction::Substitute(crate::encrypt::error_response(&format!(
+        FrameAction::RefuseAndClose(crate::encrypt::error_response(&format!(
             "dbsec refused to relay this result: {error}"
         )))
-    }
-
-    /// After a refusal the backend is still sending the result set the proxy
-    /// will not relay, so everything up to its ReadyForQuery is dropped — the
-    /// same thing the backend itself does to a batch it has errored on, and
-    /// the point [`crate::portal`] resynchronises on. The ReadyForQuery is
-    /// relayed rather than synthesized: it is the backend's, carrying the
-    /// backend's real transaction status.
-    fn discard_until_ready(&mut self, msg_type: u8) -> FrameAction {
-        if msg_type != b'Z' {
-            return FrameAction::Substitute(Vec::new());
-        }
-        self.refusing = false;
-        self.portals.batch_answered();
-        self.described = None;
-        FrameAction::Relay
     }
 
     /// One frame's decryption: a replacement body, or `None` to relay it
@@ -485,7 +469,7 @@ pub mod tests {
 
     /// The replacement body of a frame the decryptor rewrote, or `None` when
     /// it was relayed untouched. Tests that expect a refusal match on
-    /// [`FrameAction::Substitute`] themselves.
+    /// [`FrameAction::RefuseAndClose`] themselves.
     trait Rewritten {
         fn body(self) -> Option<Vec<u8>>;
     }
@@ -731,7 +715,7 @@ pub mod tests {
 
     /// The frames a refusal put on the wire, as one buffer.
     fn refused(action: FrameAction) -> Vec<u8> {
-        let FrameAction::Substitute(frames) = action else {
+        let FrameAction::RefuseAndClose(frames) = action else {
             panic!("expected a refusal, got {action:?}")
         };
         assert_eq!(frames[0], b'E', "a refusal is an ErrorResponse");
@@ -764,13 +748,16 @@ pub mod tests {
         refused(untracked.on_frame(b'D', &row).unwrap());
     }
 
-    /// A refusal is statement-level, exactly as it is on the write path: the
-    /// rest of the result set is withheld, the backend's own ReadyForQuery
-    /// closes the batch, and the session goes on to serve the next statement.
-    /// Dropping the socket instead handed the client a network fault where the
-    /// write path would have handed it an error it can act on.
+    /// A read-path refusal tells the client why *and* ends the session. It
+    /// cannot do only the first: the refused statement has already run, and the
+    /// backend is still executing whatever the client sent after it. Relaying
+    /// an error and then resynchronising on the backend's ReadyForQuery would
+    /// let `SELECT protected; UPDATE …` commit its UPDATE behind an error
+    /// saying the statement failed — and the relayed ReadyForQuery would carry
+    /// the backend's real `I` status, telling the client no transaction is even
+    /// open. Only closing the connection makes the backend roll that back.
     #[test]
-    fn the_session_survives_a_read_path_refusal_and_resynchronises() {
+    fn a_read_path_refusal_answers_the_client_and_ends_the_session() {
         let ctx = context(false);
         let (mut rewriter, mut decryptor) = session(&ctx);
         rewriter
@@ -783,36 +770,14 @@ pub mod tests {
 
         let ct = envelope::encrypt(&KEY, &KEY_ID, b"alice@example.com").unwrap();
         let row = data_row(&[Some(&ct)]);
-        refused(decryptor.on_frame(b'D', &row).unwrap());
+        let action = decryptor.on_frame(b'D', &row).unwrap();
 
-        // Everything the backend is still sending for this batch is withheld:
-        // the client has already been told the statement failed.
-        for (msg_type, body) in [(b'D', row.as_slice()), (b'C', b"SELECT 1\0".as_slice())] {
-            assert_eq!(
-                decryptor.on_frame(msg_type, body).unwrap(),
-                FrameAction::Substitute(Vec::new()),
-                "{} must not reach the client",
-                msg_type as char
-            );
-        }
-        // The backend's own ReadyForQuery is relayed — it carries the real
-        // transaction status — and ends the refusal.
-        assert_eq!(decryptor.on_frame(b'Z', b"E").unwrap(), FrameAction::Relay);
-
-        // The next statement is served normally.
-        prepare(&mut rewriter, b"b", b"SELECT id, email FROM users");
-        decryptor.on_frame(b'T', &row_description(&[(1234, 1), (1234, 2)])).unwrap();
-        decryptor.on_frame(b'Z', b"I").unwrap();
-        execute(&mut rewriter, b"b");
-        let rewritten = decryptor
-            .on_frame(b'D', &data_row(&[Some(b"42"), Some(&ct)]))
-            .unwrap()
-            .body()
-            .expect("the session decrypts again after the refusal");
-        assert_eq!(
-            pgwire::parse_data_row(&rewritten).unwrap()[1],
-            Some(b"alice@example.com".as_slice())
-        );
+        // The action itself is what ends the session, so the client is answered
+        // and nothing after it is relayed. Anything short of RefuseAndClose
+        // here would leave the batch running upstream.
+        let frames = refused(action);
+        let text = String::from_utf8_lossy(&frames);
+        assert!(text.contains("42501"), "the client gets a SQLSTATE: {text}");
     }
 
     /// A migration that recreates the table or the column gives the protected
@@ -861,13 +826,6 @@ pub mod tests {
         );
         let text = String::from_utf8_lossy(&error);
         assert!(text.contains("42501") && text.contains("email"), "{text}");
-        // The DataRows behind the refused RowDescription are withheld, and the
-        // batch ends at the backend's ReadyForQuery.
-        assert_eq!(
-            decryptor.on_frame(b'D', &data_row(&[Some(b"whatever")])).unwrap(),
-            FrameAction::Substitute(Vec::new())
-        );
-        assert_eq!(decryptor.on_frame(b'Z', b"I").unwrap(), FrameAction::Relay);
     }
 
     /// A re-resolution reaches sessions that are already open: the mapping is

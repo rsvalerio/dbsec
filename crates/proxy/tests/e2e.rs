@@ -345,14 +345,21 @@ async fn a_recreated_table_is_re_resolved_and_refused_in_strict_mode() {
         .query(&select, &[])
         .await
         .expect_err("strict mode must refuse a result column it cannot prove is unprotected");
-    // The refusal is a statement-level error, not a dropped connection: the
-    // client gets the same SQLSTATE a refused write carries, and the session
-    // survives it the way it does on the write path ([[task-0064]]).
+    // The client is told *why* — the same SQLSTATE a refused write carries,
+    // not a bare connection reset it would read as a network fault
+    // ([[task-0064]]).
     assert_eq!(
         refusal.code(),
         Some(&tokio_postgres::error::SqlState::INSUFFICIENT_PRIVILEGE),
         "the client must see a database error, not a connection reset: {refusal}"
     );
-    let alive: i32 = client.query_one("SELECT 1", &[]).await.unwrap().get(0);
-    assert_eq!(alive, 1, "the session resynchronises after a read-path refusal");
+    // But the session does not survive, and that is deliberate. The refused
+    // SELECT has already run upstream; anything the client pipelined behind it
+    // is still executing, and closing the connection is the only thing that
+    // makes the backend roll that back rather than commit it behind an error
+    // saying nothing happened ([[task-0071]]).
+    assert!(
+        client.query_one("SELECT 1", &[]).await.is_err(),
+        "a read-path refusal must end the session, not resynchronise it"
+    );
 }

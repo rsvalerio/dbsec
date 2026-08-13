@@ -1901,7 +1901,9 @@ mod tests {
             FrameAction::Replace(body) => {
                 Some(String::from_utf8(body[..body.len() - 1].to_vec()).unwrap())
             }
-            FrameAction::Reply(_) | FrameAction::Substitute(_) => panic!("refused: {sql}"),
+            FrameAction::Reply(_) | FrameAction::RefuseAndClose(_) => {
+                panic!("refused: {sql}")
+            }
         }
     }
 
@@ -2710,7 +2712,9 @@ mod tests {
             FrameAction::Replace(body) => {
                 Some(String::from_utf8(pgwire::parse_parse(&body).unwrap().query.to_vec()).unwrap())
             }
-            FrameAction::Reply(_) | FrameAction::Substitute(_) => panic!("refused: {sql}"),
+            FrameAction::Reply(_) | FrameAction::RefuseAndClose(_) => {
+                panic!("refused: {sql}")
+            }
         }
     }
 
@@ -2793,7 +2797,7 @@ mod tests {
                 FrameAction::Replace(body) => {
                     pgwire::parse_bind(&body).unwrap().params[0].unwrap().to_vec()
                 }
-                FrameAction::Reply(_) | FrameAction::Substitute(_) => {
+                FrameAction::Reply(_) | FrameAction::RefuseAndClose(_) => {
                     panic!("warn must not refuse: {param:?}")
                 }
             };

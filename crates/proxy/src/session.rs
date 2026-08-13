@@ -13,11 +13,11 @@
 //! refusal, the other one. Whole frames are written under the lock, so the
 //! two directions never interleave inside a message.
 //!
-//! The read path refuses the same way but in the other direction
-//! ([`FrameAction::Substitute`]): there the client is the *receiver*, so a
-//! result set the decryptor will not relay is replaced by an ErrorResponse
-//! travelling forward, and the frames behind it are dropped until the
-//! backend's ReadyForQuery.
+//! The read path refuses in the other direction, and does not stop there
+//! ([`FrameAction::RefuseAndClose`]): the client is the *receiver*, so the
+//! ErrorResponse replacing a result set the decryptor will not relay travels
+//! forward — and then the session ends, because a refused read's statement has
+//! already run and only closing the connection stops the rest of its batch.
 
 use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::Arc;
@@ -79,14 +79,31 @@ pub enum FrameAction {
     /// what the backend does to the rest of a batch it has errored on.
     Reply(Vec<u8>),
     /// Do not forward it; write these already-framed bytes on to the receiver
-    /// in its place. Empty drops the frame silently.
+    /// in its place, then end the session in both directions.
     ///
     /// [`Replace`](Self::Replace) cannot express this: it keeps the original
     /// message type, and a refusal has to change one (a DataRow becomes an
-    /// ErrorResponse). It is the read path's counterpart to `Reply` — there
-    /// the client is the *receiver*, so the frames that tell it why its
-    /// statement was refused travel forward rather than back.
-    Substitute(Vec<u8>),
+    /// ErrorResponse). It is the read path's counterpart to
+    /// [`Reply`](Self::Reply) — there the client is the *receiver*, so the
+    /// frames that tell it why its statement was refused travel forward rather
+    /// than back.
+    ///
+    /// Closing is the other half, and is what makes this different from its
+    /// write-path sibling rather than a mirror of it. A refused write is
+    /// withheld before it reaches the backend, so the backend never runs it and
+    /// answering the client is the whole story. A refused read is the opposite:
+    /// the statement has already run upstream, and the frames being refused are
+    /// its *results*. Answering the client without stopping the backend leaves
+    /// the rest of an implicit-transaction batch — `SELECT protected;
+    /// UPDATE …` — to execute and commit behind an error the client was told
+    /// means nothing happened.
+    ///
+    /// There is no in-band way to abort a batch the backend is already
+    /// executing; closing the connection is what makes it roll back. So the
+    /// client is told *why* (the ErrorResponse it would otherwise never see)
+    /// and the connection ends — strictly more than the bare socket drop this
+    /// path used to do, and strictly safer than resynchronising.
+    RefuseAndClose(Vec<u8>),
 }
 
 /// What the startup phase hands the relay.
@@ -401,16 +418,25 @@ where
                     back.lock().await.write_all(&frames).await?;
                 }
             }
-            FrameAction::Substitute(frames) => {
+            FrameAction::RefuseAndClose(frames) => {
                 tracing::debug!(
                     direction,
                     msg_type = %(msg_type as char),
-                    answered = !frames.is_empty(),
-                    "frame withheld from the receiver"
+                    "result refused; answering the receiver and closing the session"
                 );
-                if !frames.is_empty() {
-                    forward.lock().await.write_all(&frames).await?;
+                // The answer goes out and is flushed before either half is shut
+                // down: the client has to still be able to read it.
+                {
+                    let mut writer = forward.lock().await;
+                    writer.write_all(&frames).await?;
+                    writer.flush().await?;
+                    writer.shutdown().await.ok();
                 }
+                // Closing the peer's half is what aborts the batch upstream —
+                // the backend rolls back the implicit transaction rather than
+                // committing statements behind the error just sent.
+                back.lock().await.shutdown().await.ok();
+                return Ok(());
             }
         }
         // Give a one-off large frame's buffer back instead of reserving it for
@@ -560,13 +586,16 @@ mod tests {
     }
 
     /// The read path's refusal: the offending frame is withheld from the
-    /// receiver and answered in its place, in the same direction, and the
-    /// relay stays in sync for what follows.
+    /// receiver and answered in its place, in the same direction — and then the
+    /// relay stops, because everything queued behind it upstream has to stop
+    /// too.
     #[tokio::test]
-    async fn relay_substitutes_a_frame_for_the_receiver() {
+    async fn relay_answers_a_refused_frame_and_then_closes() {
         let (_shutdown_tx, shutdown) = no_shutdown();
         let mut input = frame(b'D', b"refuse me");
-        input.extend_from_slice(&frame(b'D', b"drop me"));
+        // Whatever the backend was still sending for this batch. None of it may
+        // reach the client, and the relay must not resume to read it.
+        input.extend_from_slice(&frame(b'D', b"more rows"));
         input.extend_from_slice(&frame(b'Z', b"I"));
         let (output, back) = (sink(), sink());
         relay(
@@ -575,8 +604,7 @@ mod tests {
             "test",
             |_, body| {
                 Ok(match body {
-                    b"refuse me" => FrameAction::Substitute(frame(b'E', b"nope")),
-                    b"drop me" => FrameAction::Substitute(Vec::new()),
+                    b"refuse me" => FrameAction::RefuseAndClose(frame(b'E', b"nope")),
                     _ => FrameAction::Relay,
                 })
             },
@@ -585,9 +613,11 @@ mod tests {
         .await
         .unwrap();
 
-        let mut expected = frame(b'E', b"nope");
-        expected.extend_from_slice(&frame(b'Z', b"I"));
-        assert_eq!(*output.lock().await, expected);
+        assert_eq!(
+            *output.lock().await,
+            frame(b'E', b"nope"),
+            "the client gets the refusal and nothing that followed it"
+        );
         assert!(back.lock().await.is_empty(), "nothing goes back to the sender");
     }
 
