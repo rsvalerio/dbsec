@@ -1,11 +1,11 @@
 ---
 id: TASK-0061
 title: Migrated shared-map index keys are left in Vault with no cleanup step
-status: To Do
+status: Done
 assignee:
   - TASK-0065
 created_date: '2026-08-12 16:14'
-updated_date: '2026-08-12 18:42'
+updated_date: '2026-08-12 19:16'
 labels:
   - code-review-rust
   - security
@@ -36,6 +36,12 @@ Deliberately out of scope for TASK-0052: deleting key material as a side effect 
 
 ## Acceptance Criteria
 <!-- AC:BEGIN -->
-- [ ] #1 A documented or automated path removes the shared-map secret once every name is migrated
-- [ ] #2 The migration is observable — an operator can tell which names came from the legacy layout
+- [x] #1 A documented or automated path removes the shared-map secret once every name is migrated
+- [x] #2 The migration is observable — an operator can tell which names came from the legacy layout
 <!-- AC:END -->
+
+## Implementation Notes
+
+<!-- SECTION:NOTES:BEGIN -->
+Took option (a): plans/PLAN.md gains a "Retiring the shared-map layout" procedure (verify every name migrated, delete the shared secret metadata so version history goes too, narrow the policy, and the safe fallback when a name cannot be verified). Observability: adopt_legacy_index_key now logs at WARN naming the migrated key and pointing at that procedure, pinned by a log-capturing unit test in vault.rs.
+<!-- SECTION:NOTES:END -->

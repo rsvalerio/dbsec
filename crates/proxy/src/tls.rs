@@ -166,6 +166,13 @@ fn load_certs(path: &Path) -> Result<Vec<CertificateDer<'static>>, Error> {
     Ok(certs)
 }
 
+/// Reads the downstream private key.
+///
+/// The key's *permissions* are not checked here: `Config::validate` refuses a
+/// `[tls.downstream] key` readable beyond its owner (SEC-29), so by the time a
+/// `TlsContext` is built from a loaded config the mode has already been proved
+/// safe, and doing it here as well would stat the file twice and put the same
+/// policy in two places.
 fn load_key(path: &Path) -> Result<PrivateKeyDer<'static>, Error> {
     PrivateKeyDer::from_pem_file(path)
         .map_err(|e| Error::TlsConfig(format!("reading {}: {e}", path.display())))

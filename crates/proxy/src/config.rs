@@ -210,13 +210,26 @@ fn mask_password_parameters(input: &str, out: &mut String) {
 
 /// Refuses a secret file that anyone but its owner can read.
 ///
-/// `keys_file` is every master key in plaintext hex and `[vault] token_file`
-/// is the credential that unwraps them, so a `0644` on either defeats the
-/// product outright — and `0644` is what `cp`, a Docker `COPY`, an editor that
-/// recreates the file on save, or a config-management template with no
-/// explicit mode all produce silently. `ssh` refuses a private key on the same
-/// grounds (SEC-29). Refusing rather than warning is deliberate: a startup
-/// warning scrolls past, and the failure mode this prevents is permanent.
+/// `keys_file` is every master key in plaintext hex, `[vault] token_file`
+/// is the credential that unwraps them, and `[tls.downstream] key` is the
+/// private key the proxy authenticates itself with — so a `0644` on any of
+/// them defeats the product outright, and `0644` is what `cp`, a Docker
+/// `COPY`, an editor that recreates the file on save, or a config-management
+/// template with no explicit mode all produce silently. `ssh` refuses a
+/// private key on the same grounds (SEC-29). Refusing rather than warning is
+/// deliberate: a startup warning scrolls past, and the failure mode this
+/// prevents is permanent.
+///
+/// The TLS key gets the same refusal as the other two rather than a warning,
+/// even though a service group sharing a key is a real deployment shape. The
+/// group-readable case is not a safe exception here: this proxy is a single
+/// process that reads the key itself at startup, so nothing else in the group
+/// needs it, and a group-readable copy hands every local member the ability
+/// to impersonate the proxy to its clients and to decrypt any captured
+/// session that did not negotiate forward secrecy. A deployment that must
+/// share the key with another service should give that service its own
+/// `0600` copy — or, if the sharing is genuinely required, say so in config
+/// rather than have the proxy infer consent from a permission bit.
 ///
 /// A file that cannot be stat'ed is left alone. The read that follows reports
 /// the real I/O error with its path (ERR-13), which is a better message than
@@ -312,6 +325,14 @@ pub struct Config {
 /// at rest in plaintext" invariant actually enforced sets
 /// `on_unprotected = "reject"` and treats the warnings it sees first as the
 /// list of statements to fix.
+///
+/// It governs the read path's one fail-closed reading too — a result column
+/// named like a protected column that the resolved map does not cover
+/// ([`crate::rows`]) — rather than that having a switch of its own. Both paths
+/// are asking the same question about the same columns, and a deployment that
+/// is strict about writing plaintext but lax about handing back stored bytes
+/// enforces neither half of the invariant. Refusals on either path are
+/// statement-level: ErrorResponse, then the session carries on.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum OnUnprotected {
@@ -594,6 +615,13 @@ impl Config {
         }
         if self.max_sessions == 0 {
             return Err(Error::InvalidConfig("max_sessions must be greater than 0".into()));
+        }
+        // Checked whether or not any `[[column]]` is configured: the proxy
+        // presents this key to every client even in plain-relay mode, so it is
+        // a secret on the same footing as `keys_file` (SEC-29). The cert beside
+        // it is public and is deliberately not checked.
+        if let Some(downstream) = &self.tls.downstream {
+            check_secret_file_mode(&downstream.key)?;
         }
         // Resolved before the `[[column]]` branch below, and only here: a
         // `[vault]` section is validated whether or not a column uses it, and
@@ -888,6 +916,37 @@ mod tests {
         let cfg: Config =
             toml::from_str(&format!("[vault]\naddr = \"a\"\ntoken_file = {token:?}\n")).unwrap();
         assert!(matches!(cfg.validate(), Err(Error::InvalidConfig(_))));
+    }
+
+    /// SEC-29 for the third secret in the config. A group-readable key is
+    /// refused just like a world-readable one: the proxy is the only reader,
+    /// so a service group sharing it buys nothing and lets every local member
+    /// impersonate the proxy to its clients.
+    #[cfg(unix)]
+    #[test]
+    fn the_downstream_tls_key_must_be_readable_only_by_its_owner() {
+        let dir = tempfile::tempdir().unwrap();
+        let cert = write_mode(dir.path(), "cert.pem", "cert\n", 0o644);
+        let config_for = |key: &Path| format!("[tls.downstream]\ncert = {cert:?}\nkey = {key:?}\n");
+
+        // Checked with no `[[column]]` configured: the key is presented to
+        // clients in plain-relay mode too. This case also pins that the
+        // certificate beside it is public — it is `0644` above and validation
+        // still succeeds.
+        let tight = write_mode(dir.path(), "tight.pem", "key\n", 0o600);
+        toml::from_str::<Config>(&config_for(&tight)).unwrap().validate().unwrap();
+
+        for (name, mode) in [("group.pem", 0o640), ("world.pem", 0o644)] {
+            let loose = write_mode(dir.path(), name, "key\n", mode);
+            let Err(err) = toml::from_str::<Config>(&config_for(&loose)).unwrap().validate() else {
+                panic!("a {mode:04o} TLS key must not be accepted");
+            };
+            assert!(matches!(err, Error::InvalidConfig(_)), "got {err:?}");
+            assert!(
+                err.to_string().contains(&format!("{mode:04o}")),
+                "the mode must be named: {err}"
+            );
+        }
     }
 
     /// TASK-0019: the token file is read once per startup, not once to prove

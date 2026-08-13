@@ -1,0 +1,81 @@
+# reason: dbsec fills the template in, as the template asks: {{REPO}} is resolved, the copy-me comment is gone, and the two project-specific sections (development setup, project layout) describe this repo. The shared sections are unchanged and stay under exact-match drift detection.
+--- forge/templates/CONTRIBUTING.md
++++ CONTRIBUTING.md
+@@ -1,24 +1,41 @@
+-# Contributing to {{REPO}}
+-
+-<!--
+-Shared template. Copy into the consuming repository, replace {{REPO}}, and fill in the
+-"Development setup" and "Project layout" sections — those are the parts that cannot be
+-shared. Everything else is common across these repos and should be kept in sync with
+-forge/templates/CONTRIBUTING.md rather than edited in place.
+--->
++# Contributing to dbsec
+
+ Thanks for your interest in contributing! Contributions of all kinds are welcome: bug
+ reports, fixes, docs, and features.
+
+ ## Development setup
+
+-<!-- Project-specific. Include the toolchain requirement and the shortest path to a
+-     running build. -->
++A stable Rust toolchain on the 2021 edition is all the build needs — no pinned version,
++no nightly, except for `make fuzz`, which needs nightly plus `cargo-fuzz`.
++
++```bash
++git clone https://github.com/rsvalerio/dbsec
++cd dbsec
++cargo build --all --all-features
++```
++
++`make help` lists every target. The two worth knowing up front:
++
++```bash
++make check   # every QA gate, via `ops verify qa` (fmt, clippy, check, test)
++make e2e     # the driver matrix against a dockerized Postgres
++```
++
++`make check` is the gate that has to be green before a PR; it runs the same fmt, clippy
++and test commands listed under "Before you open a PR". The e2e targets need docker and are
++not part of `make check`, so run `make e2e` yourself when you touch the wire protocol, the
++SQL rewrite or the read path — it drives the real binary from tokio-postgres, sqlx and
++psycopg 2/3, and it is the only suite that catches a change that breaks one driver's use
++of the extended query protocol. `make e2e-vault` does the same for Vault/OpenBao-backed
++keys against a dev-mode server.
++
++Two more gates are not in `make check` but do run in CI: `make deny` (licenses and
++advisories) and `make forge-sync`, which diffs the files this repo copies from
++[forge](https://github.com/rsvalerio/forge) against the tag the workflows pin. If you
++change one of those copies on purpose, record the divergence instead of reverting it:
+
+ ```bash
+-git clone https://github.com/rsvalerio/{{REPO}}
+-cd {{REPO}}
+-cargo build
++FORGE_SYNC_REASON='why this repo differs' ./scripts/forge-sync-check.sh --update
+ ```
+
+ ## Before you open a PR
+@@ -74,4 +91,21 @@
+
+ ## Project layout
+
+-<!-- Project-specific. A short table of the crates/directories and what each owns. -->
++The split is deliberate: everything that touches key material or ciphertext lives in the
++library, and the binary is a relay that calls into it. A change that needs the network to
++be tested usually belongs on the proxy side; a change that does not usually belongs in
++core, where it can be property-tested and fuzzed.
++
++| Path | What it owns |
++|---|---|
++| `crates/core` | `dbsec-core`: the AES-256-GCM envelope, key ids and key sources, the HMAC blind index, FPE/token pseudonymization, masking, and PostgreSQL wire framing. No I/O. |
++| `crates/proxy` | The `dbsec` binary: TOML config, TLS on both hops, the session relay, the write-path SQL rewrite, portal/`RowDescription` tracking, the read path, and column resolution. |
++| `crates/*/tests` | Integration tests, including the property tests (`core/tests/props.rs`) and the driver matrix (`proxy/tests/e2e*.rs`, `#[ignore]`d — `make e2e` runs them). |
++| `fuzz` | `cargo-fuzz` targets for the wire parser, the envelope and the transforms. Excluded from the workspace, so it has its own `Cargo.toml`. |
++| `scripts`, `.forge-sync` | The forge drift check and the manifest/waivers it reads. |
++| `plans` | Design notes and the roadmap (`plans/PLAN.md`). |
++
++Workspace-wide lint policy lives in `[workspace.lints]` in the root `Cargo.toml`, not in
++CI flags, so a local `cargo clippy` enables exactly what CI enables. `unsafe_code` is
++`forbid`den across both crates; if you need it, that is a design discussion, not a
++`#[allow]`.

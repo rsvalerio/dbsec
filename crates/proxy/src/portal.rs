@@ -73,6 +73,13 @@ pub enum ParamAction {
     /// replace it with the blind index (the SQL was rewritten to match the
     /// index prefix).
     SearchIndex(Arc<dyn FieldTransform>),
+    /// The parameter is the bound array of a `col = ANY($n)` over a searchable
+    /// column: every element is replaced by its blind index and the array
+    /// re-encoded as `bytea[]`. The column name travels with it because the
+    /// fallback for an array Bind cannot decode is the same
+    /// `Unprotected::Predicate` signal the SQL rewrite would have raised, and
+    /// that signal names the column.
+    SearchIndexArray { transform: Arc<dyn FieldTransform>, column: Arc<str> },
 }
 
 impl ParamAction {
@@ -83,6 +90,10 @@ impl ParamAction {
             (Self::Seal(a), Self::Seal(b)) | (Self::SearchIndex(a), Self::SearchIndex(b)) => {
                 Arc::ptr_eq(a, b)
             }
+            (
+                Self::SearchIndexArray { transform: a, column: left },
+                Self::SearchIndexArray { transform: b, column: right },
+            ) => Arc::ptr_eq(a, b) && left == right,
             _ => false,
         }
     }

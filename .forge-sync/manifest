@@ -2,6 +2,13 @@
 # `scripts/forge-sync-check.sh` (see `make forge-sync`) against the tag
 # `.github/workflows/` pins forge at.
 #
+# CONTRIBUTING.md stays listed even though it is a template meant to be filled
+# in per repo: its permanently divergent parts are pinned by the waiver, so a
+# forge-side edit to the *shared* sections still fails the check. Dropping it
+# would trade a one-time waiver for a copy that silently goes stale. Editing
+# this repo's copy therefore means re-recording the waiver
+# (`./scripts/forge-sync-check.sh --update`), which is the intended cost.
+#
 # <path in this repo>   <path in rsvalerio/forge>
 clippy.toml             config/clippy.toml
 deny.toml               config/deny.toml

@@ -341,8 +341,18 @@ async fn a_recreated_table_is_re_resolved_and_refused_in_strict_mode() {
 
     common::create_table(&direct, RECREATE_TABLE).await;
     client.execute(&insert, &[&&b"dave@example.com"[..]]).await.unwrap();
-    assert!(
-        client.query(&select, &[]).await.is_err(),
-        "strict mode must refuse a result column it cannot prove is unprotected"
+    let refusal = client
+        .query(&select, &[])
+        .await
+        .expect_err("strict mode must refuse a result column it cannot prove is unprotected");
+    // The refusal is a statement-level error, not a dropped connection: the
+    // client gets the same SQLSTATE a refused write carries, and the session
+    // survives it the way it does on the write path ([[task-0064]]).
+    assert_eq!(
+        refusal.code(),
+        Some(&tokio_postgres::error::SqlState::INSUFFICIENT_PRIVILEGE),
+        "the client must see a database error, not a connection reset: {refusal}"
     );
+    let alive: i32 = client.query_one("SELECT 1", &[]).await.unwrap().get(0);
+    assert_eq!(alive, 1, "the session resynchronises after a read-path refusal");
 }

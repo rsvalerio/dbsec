@@ -34,7 +34,10 @@
 //!
 //! Deployments written by an earlier version stored every key in one map at
 //! `{path}/index_keys`. That layout is still read: a name found there is
-//! migrated into its own versioned secret rather than re-minted.
+//! migrated into its own versioned secret rather than re-minted. The old copy
+//! is left in place — the proxy does not delete key material from a read path
+//! — so each migration warns, and retiring the shared map is an operator
+//! procedure documented in `plans/PLAN.md`.
 //!
 //! # Runtime requirements
 //!
@@ -191,7 +194,7 @@ impl KeyStore for VaultStore {
         match vaultrs::kv2::read(&self.client, &self.config.mount, &path).await {
             Ok(record) => Ok(Some(record)),
             Err(e) if is_not_found(&e) => Ok(None),
-            Err(e) => Err(CoreError::KeySource(format!("reading index key {name}: {e}"))),
+            Err(e) => Err(backend_error(format!("reading index key {name}"), e)),
         }
     }
 
@@ -214,7 +217,7 @@ impl KeyStore for VaultStore {
         {
             Ok(_) => Ok(true),
             Err(e) if is_cas_conflict(&e) => Ok(false),
-            Err(e) => Err(CoreError::KeySource(format!("storing index key {name}: {e}"))),
+            Err(e) => Err(backend_error(format!("storing index key {name}"), e)),
         }
     }
 
@@ -223,7 +226,7 @@ impl KeyStore for VaultStore {
         match vaultrs::kv2::read(&self.client, &self.config.mount, &path).await {
             Ok(keys) => Ok(Some(keys)),
             Err(e) if is_not_found(&e) => Ok(None),
-            Err(e) => Err(CoreError::KeySource(format!("reading {path}: {e}"))),
+            Err(e) => Err(backend_error(format!("reading {path}"), e)),
         }
     }
 
@@ -234,9 +237,7 @@ impl KeyStore for VaultStore {
             match vaultrs::kv2::read(&self.client, &self.config.mount, &path).await {
                 Ok(record) => record,
                 Err(e) if is_not_found(&e) => return Ok(None),
-                Err(e) => {
-                    return Err(CoreError::KeySource(format!("reading wrapped DEK {id_hex}: {e}")))
-                }
+                Err(e) => return Err(backend_error(format!("reading wrapped DEK {id_hex}"), e)),
             };
 
         let unwrapped = vaultrs::transit::data::decrypt(
@@ -247,11 +248,20 @@ impl KeyStore for VaultStore {
             None,
         )
         .await
-        .map_err(|e| CoreError::KeySource(format!("transit unwrap of DEK {id_hex}: {e}")))?;
-        decode_key_b64(&unwrapped.plaintext)
-            .map(Some)
-            .map_err(|e| CoreError::KeySource(e.to_string()))
+        .map_err(|e| backend_error(format!("transit unwrap of DEK {id_hex}"), e))?;
+        decode_key_b64(&unwrapped.plaintext).map(Some)
     }
+}
+
+/// A backend failure that keeps its cause reachable through
+/// `std::error::Error::source()` (ERR-9): the `vaultrs` error behind a
+/// message is what tells a 403 apart from a connection refused, and
+/// `format!`ing it into a String destroys that at construction.
+fn backend_error(
+    context: String,
+    source: impl std::error::Error + Send + Sync + 'static,
+) -> CoreError {
+    CoreError::KeyBackend { context, source: Box::new(source) }
 }
 
 /// A missing KV secret, as distinct from every other way a read can fail.
@@ -299,8 +309,9 @@ impl VaultKeySource<VaultStore> {
             // so leaving it unset means every roundtrip below is unbounded.
             .timeout(Some(timeout))
             .build()
-            .map_err(|e| Error::Vault(e.to_string()))?;
-        let client = VaultClient::new(settings).map_err(|e| Error::Vault(e.to_string()))?;
+            .map_err(|e| backend_error("building the vault client settings".to_owned(), e))?;
+        let client = VaultClient::new(settings)
+            .map_err(|e| backend_error("connecting to vault".to_owned(), e))?;
 
         let datakey = vaultrs::transit::generate::data_key(
             &client,
@@ -310,10 +321,10 @@ impl VaultKeySource<VaultStore> {
             None,
         )
         .await
-        .map_err(|e| Error::Vault(format!("transit data key: {e}")))?;
+        .map_err(|e| backend_error("transit data key".to_owned(), e))?;
         let plaintext = datakey
             .plaintext
-            .ok_or_else(|| Error::Vault("transit returned no plaintext data key".into()))?;
+            .ok_or_else(|| CoreError::KeySource("transit returned no plaintext data key".into()))?;
         let key = decode_key_b64(&plaintext)?;
 
         // The OS entropy source rather than `thread_rng` (SEC-10): this id is
@@ -330,7 +341,7 @@ impl VaultKeySource<VaultStore> {
             &WrappedDek { wrapped: datakey.ciphertext },
         )
         .await
-        .map_err(|e| Error::Vault(format!("storing wrapped DEK: {e}")))?;
+        .map_err(|e| backend_error("storing wrapped DEK".to_owned(), e))?;
 
         Ok(Self::new(VaultStore { client, config: config.clone() }, timeout, (key_id, key)))
     }
@@ -416,6 +427,14 @@ impl<S: KeyStore> VaultKeySource<S> {
     /// Migrates a key stored under the pre-versioning shared-map layout into
     /// its own versioned secret. A conflict on the way in is benign: another
     /// proxy migrated the same material first.
+    ///
+    /// The copy is deliberately not deleted from the shared map here: deleting
+    /// key material as a side effect of a read path is not something a proxy
+    /// should do unprompted, and at this point the destination write is not
+    /// confirmed durable. The consequence is that the same key lives at two
+    /// paths until an operator retires the old one, which is a standing
+    /// exposure — so this logs at WARN, naming the migrated key, and
+    /// `plans/PLAN.md` carries the cleanup procedure the warning refers to.
     async fn adopt_legacy_index_key(&self, name: &str) -> Result<Option<Key>, CoreError> {
         let Some(legacy) = self.store.read_legacy_index_keys().await? else {
             return Ok(None);
@@ -426,7 +445,12 @@ impl<S: KeyStore> VaultKeySource<S> {
         let key = decode_key_hex(hex_key)?;
         let record = IndexKeyRecord::first(hex::encode(key.as_slice()));
         self.store.create_index_key(name, &record).await?;
-        tracing::info!(name, "migrated index key out of the shared-map layout");
+        tracing::warn!(
+            name,
+            "migrated index key out of the shared-map layout; the same key material is now \
+             stored at both paths — retire the shared map once every name has migrated (see \
+             the \"Retiring the shared-map layout\" procedure in plans/PLAN.md)"
+        );
         Ok(Some(key))
     }
 
@@ -480,20 +504,24 @@ impl<S: KeyStore> KeySource for VaultKeySource<S> {
     }
 }
 
-fn decode_key_b64(encoded: &str) -> Result<Key, Error> {
+/// `CoreError` rather than the proxy's own `Error` so the transit decode
+/// failure keeps one shape wherever it is raised — `connect` converts it
+/// through `Error::Wire`, and `fetch_dek` propagates it unchanged instead of
+/// flattening it back into a String.
+fn decode_key_b64(encoded: &str) -> Result<Key, CoreError> {
     let mut raw = base64::engine::general_purpose::STANDARD
         .decode(encoded)
-        .map_err(|_| Error::Vault("data key is not valid base64".into()))?;
+        .map_err(|e| backend_error("data key is not valid base64".to_owned(), e))?;
     let result = <[u8; 32]>::try_from(raw.as_slice())
-        .map(Zeroizing::new)
-        .map_err(|_| Error::Vault(format!("data key must be 32 bytes, got {}", raw.len())));
+        .map_err(|_| CoreError::KeySource(format!("data key must be 32 bytes, got {}", raw.len())))
+        .map(Zeroizing::new);
     raw.zeroize();
     result
 }
 
 fn decode_key_hex(encoded: &str) -> Result<Key, CoreError> {
     let mut raw = hex::decode(encoded)
-        .map_err(|_| CoreError::KeySource("stored index key is not valid hex".into()))?;
+        .map_err(|e| backend_error("stored index key is not valid hex".to_owned(), e))?;
     let result = <[u8; 32]>::try_from(raw.as_slice())
         .map(Zeroizing::new)
         .map_err(|_| CoreError::KeySource("stored index key must be 32 bytes".into()));
@@ -688,6 +716,64 @@ mod tests {
         );
     }
 
+    /// Collects the level and fields of every event, so a log line an operator
+    /// is told to look for is pinned like any other output.
+    #[derive(Clone, Default)]
+    struct CapturedLogs(std::sync::Arc<Mutex<Vec<(tracing::Level, String)>>>);
+
+    impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for CapturedLogs {
+        fn on_event(
+            &self,
+            event: &tracing::Event<'_>,
+            _ctx: tracing_subscriber::layer::Context<'_, S>,
+        ) {
+            struct Fields(String);
+            impl tracing::field::Visit for Fields {
+                fn record_debug(
+                    &mut self,
+                    field: &tracing::field::Field,
+                    value: &dyn std::fmt::Debug,
+                ) {
+                    self.0.push_str(&format!(" {}={value:?}", field.name()));
+                }
+            }
+            let mut fields = Fields(String::new());
+            event.record(&mut fields);
+            self.0.lock().expect("lock").push((*event.metadata().level(), fields.0));
+        }
+    }
+
+    /// The migrated key stays readable at the old path too, so the operator
+    /// who has to retire it must be able to see which names moved.
+    #[tokio::test]
+    async fn migrating_out_of_the_shared_map_warns_and_names_the_key() {
+        use tracing_subscriber::layer::SubscriberExt as _;
+
+        let store = FakeStore::default();
+        *store.legacy.lock().expect("lock") =
+            Some(HashMap::from([(NAME.to_owned(), hex::encode(STORED))]));
+        let keys = source(store);
+
+        let logs = CapturedLogs::default();
+        let guard =
+            tracing::subscriber::set_default(tracing_subscriber::registry().with(logs.clone()));
+        keys.resolve_index_key(NAME).await.expect("adopts");
+        drop(guard);
+
+        let captured = logs.0.lock().expect("lock");
+        let (level, fields) = captured
+            .iter()
+            .find(|(_, f)| f.contains("shared-map"))
+            .unwrap_or_else(|| panic!("the migration must announce itself: {captured:?}"));
+        assert_eq!(
+            *level,
+            tracing::Level::WARN,
+            "an unretired duplicate of key material is a warning"
+        );
+        assert!(fields.contains(NAME), "the migrated name is named: {fields}");
+        assert!(fields.contains("PLAN.md"), "and points at the cleanup procedure: {fields}");
+    }
+
     #[test]
     fn record_naming_a_version_it_does_not_carry_is_an_error() {
         let record =
@@ -766,7 +852,7 @@ mod tests {
     #[test]
     fn decode_key_hex_accepts_32_bytes_and_rejects_everything_else() {
         assert_eq!(*decode_key_hex(&hex::encode(STORED)).expect("decodes"), STORED);
-        assert!(matches!(decode_key_hex("not hex"), Err(CoreError::KeySource(_))));
+        assert!(matches!(decode_key_hex("not hex"), Err(CoreError::KeyBackend { .. })));
         assert!(matches!(decode_key_hex(&hex::encode([3u8; 16])), Err(CoreError::KeySource(_))));
         assert!(matches!(decode_key_hex(""), Err(CoreError::KeySource(_))));
     }
@@ -775,9 +861,40 @@ mod tests {
     fn decode_key_b64_accepts_32_bytes_and_rejects_everything_else() {
         let engine = base64::engine::general_purpose::STANDARD;
         assert_eq!(*decode_key_b64(&engine.encode(STORED)).expect("decodes"), STORED);
-        assert!(matches!(decode_key_b64("not base64!"), Err(Error::Vault(_))));
-        assert!(matches!(decode_key_b64(&engine.encode([3u8; 16])), Err(Error::Vault(_))));
-        assert!(matches!(decode_key_b64(""), Err(Error::Vault(_))));
+        assert!(matches!(decode_key_b64("not base64!"), Err(CoreError::KeyBackend { .. })));
+        assert!(matches!(decode_key_b64(&engine.encode([3u8; 16])), Err(CoreError::KeySource(_))));
+        assert!(matches!(decode_key_b64(""), Err(CoreError::KeySource(_))));
+    }
+
+    #[test]
+    fn a_vault_failure_keeps_its_client_error_reachable() {
+        let error = backend_error(
+            "reading index key public.users.email".to_owned(),
+            ClientError::APIError { code: 403, errors: vec!["permission denied".to_owned()] },
+        );
+
+        let source = std::error::Error::source(&error).expect("the cause is reachable");
+        assert!(
+            source.downcast_ref::<ClientError>().is_some(),
+            "the vaultrs error must survive, not be formatted away: {source}"
+        );
+        assert!(
+            error.to_string().contains("reading index key public.users.email"),
+            "the proxy's own context stays on the top-level message: {error}"
+        );
+    }
+
+    #[test]
+    fn a_decode_failure_keeps_its_cause_reachable() {
+        let hex_error = decode_key_hex("not hex").expect_err("rejects non-hex");
+        assert!(std::error::Error::source(&hex_error)
+            .and_then(|e| e.downcast_ref::<hex::FromHexError>())
+            .is_some());
+
+        let b64_error = decode_key_b64("not base64!").expect_err("rejects non-base64");
+        assert!(std::error::Error::source(&b64_error)
+            .and_then(|e| e.downcast_ref::<base64::DecodeError>())
+            .is_some());
     }
 
     #[test]

@@ -54,6 +54,26 @@ const MAX_CONSECUTIVE_ACCEPT_ERRORS: u32 = 32;
 /// is exactly the case where per-connection logging would itself be the load.
 const REFUSAL_LOG_INTERVAL: Duration = Duration::from_secs(5);
 
+/// Subscriber filter used when `RUST_LOG` says nothing.
+///
+/// `vaultrs`/`rustify` log every non-2xx response at ERROR from inside the
+/// client, and resolving a deterministic index key for the first time
+/// deliberately probes two paths that are *expected* to be absent —
+/// `{path}/index_keys/{name}` and the pre-versioning shared map — before
+/// minting. A cold start of a working deployment therefore produced a handful
+/// of ERROR lines for the proxy doing exactly what it is designed to do,
+/// which makes a clean startup look like a failing one and buries the ERROR
+/// lines that do matter.
+///
+/// Those targets are turned off rather than lowered, because the noise is
+/// emitted at ERROR itself. Nothing is lost: the proxy attaches its own
+/// context at the site that *handles* the failure (`main`'s startup path and
+/// [`log_session_error`]), and since the `vaultrs` error is carried as a
+/// `#[source]` rather than formatted away, the library's view of it is still
+/// reachable through the error chain. An operator who sets `RUST_LOG` owns the
+/// filter completely and can put `vaultrs=debug` back in.
+const DEFAULT_LOG_FILTER: &str = "info,vaultrs=off,rustify=off";
+
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
     #[error("reading config {path}: {source}")]
@@ -137,7 +157,8 @@ fn main() -> ExitCode {
         .with_writer(std::io::stderr)
         .with_ansi(std::io::stderr().is_terminal())
         .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()),
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| DEFAULT_LOG_FILTER.into()),
         )
         .init();
 
@@ -461,12 +482,38 @@ async fn accept_loop<A: Accept>(
             let _permit = permit; // released when the session ends
             tracing::debug!(%peer, "client connected");
             if let Err(e) = session::run(socket, &ctx, shutdown).await {
-                tracing::warn!(%peer, error = %e, "session ended with error");
+                log_session_error(&peer, &e);
             } else {
                 tracing::debug!(%peer, "client disconnected");
             }
         });
     }
+}
+
+/// Logs a failed session at the level its cause deserves.
+///
+/// A session that ends because the key backend failed — Vault unreachable, a
+/// revoked token, a permission denial — is a fault of the deployment, not of
+/// this connection: every session after it fails the same way until an
+/// operator acts. That is the case [`DEFAULT_LOG_FILTER`] silences the
+/// `vaultrs`/`rustify` targets for, so it is reported here at ERROR instead,
+/// with the proxy's own context and the backend error still reachable through
+/// `source()`.
+///
+/// Everything else stays a WARN: a malformed frame, a rejected rewrite or an
+/// envelope written under a DEK this deployment no longer has
+/// (`UnknownKey`) is driven by the connection or the stored data, and a
+/// client that retries it must not be able to fill the log with ERRORs.
+fn log_session_error(peer: &SocketAddr, e: &Error) {
+    if is_key_backend_failure(e) {
+        tracing::error!(%peer, error = %e, "session ended: the key source is not usable");
+    } else {
+        tracing::warn!(%peer, error = %e, "session ended with error");
+    }
+}
+
+fn is_key_backend_failure(e: &Error) -> bool {
+    matches!(e, Error::Wire(dbsec_core::Error::KeyBackend { .. } | dbsec_core::Error::KeySource(_)))
 }
 
 #[cfg(test)]
@@ -611,5 +658,56 @@ mod tests {
         assert!(sessions.is_empty());
 
         assert_eq!(drain_sessions(&mut sessions, Duration::from_millis(100)).await, (0, 0));
+    }
+
+    /// The expected-absence probes the index-key path makes are logged at
+    /// ERROR by the Vault client itself, so a working cold start looked like a
+    /// failing one until those targets were quieted.
+    #[test]
+    fn the_default_filter_quiets_the_vault_client_without_quieting_the_proxy() {
+        use tracing_subscriber::layer::SubscriberExt as _;
+
+        let subscriber = tracing_subscriber::registry()
+            .with(tracing_subscriber::EnvFilter::new(DEFAULT_LOG_FILTER));
+
+        tracing::subscriber::with_default(subscriber, || {
+            assert!(
+                !tracing::event_enabled!(target: "vaultrs::api", tracing::Level::ERROR),
+                "an expected 404 probe must not surface as an ERROR line"
+            );
+            assert!(
+                !tracing::event_enabled!(target: "rustify::client", tracing::Level::ERROR),
+                "nor must the HTTP layer underneath it"
+            );
+            assert!(
+                tracing::event_enabled!(target: "dbsec::vault", tracing::Level::ERROR),
+                "the proxy's own errors stay visible"
+            );
+            assert!(
+                tracing::event_enabled!(target: "dbsec::vault", tracing::Level::INFO),
+                "and so does the mint line the probes precede"
+            );
+        });
+    }
+
+    /// The other half of quieting the client: a genuine Vault failure must
+    /// still reach the log at ERROR, from the site that handles it.
+    #[test]
+    fn a_key_backend_failure_is_the_one_session_error_logged_at_error() {
+        let revoked = Error::Wire(dbsec_core::Error::KeyBackend {
+            context: "reading index key public.users.email".to_owned(),
+            source: Box::new(std::io::Error::from(ErrorKind::PermissionDenied)),
+        });
+        assert!(is_key_backend_failure(&revoked));
+        assert!(is_key_backend_failure(&Error::Wire(dbsec_core::Error::KeySource(
+            "resolving index key: vault did not answer within 5s".to_owned()
+        ))));
+
+        assert!(
+            !is_key_backend_failure(&Error::Wire(dbsec_core::Error::UnknownKey("ab".to_owned()))),
+            "stored data written under a lost DEK is not an operator-actionable backend fault"
+        );
+        assert!(!is_key_backend_failure(&Error::UndescribedRow));
+        assert!(!is_key_backend_failure(&Error::Io(std::io::Error::from(ErrorKind::BrokenPipe))));
     }
 }

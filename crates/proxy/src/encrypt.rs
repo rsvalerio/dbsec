@@ -48,14 +48,19 @@
 //!
 //! `col = <value>` and `col IN (<values>)` over a searchable column become a
 //! blind-index prefix match, as does `col = ANY(ARRAY[...])` with a literal
-//! array. They are rewritten wherever they appear in a `SELECT`/`UPDATE`/
-//! `DELETE`: `WHERE` and `HAVING`, `JOIN ... ON` constraints, CTE bodies,
-//! both branches of a `UNION`/`INTERSECT`/`EXCEPT`, and derived-table
-//! subqueries. Anything else that mentions a searchable column — `LIKE`,
-//! ordering comparisons, `IN (SELECT ...)`, `= ANY($1)` over a bound array —
-//! is an [`Unprotected`] site rather than a silent no-op, because comparing a
-//! client's plaintext against the stored form matches no row and reads as an
-//! empty result rather than an error.
+//! array. `col = ANY($1)` — the whole list bound as one array parameter, which
+//! is how sqlx and asyncpg express a multi-value lookup — is rewritten the
+//! same way, with the array decoded, indexed element by element and re-encoded
+//! as `bytea[]` at Bind time ([`index_array`]). They are rewritten wherever
+//! they appear in a `SELECT`/`UPDATE`/`DELETE`: `WHERE` and `HAVING`,
+//! `JOIN ... ON` constraints, CTE bodies, both branches of a
+//! `UNION`/`INTERSECT`/`EXCEPT`, and derived-table subqueries. Anything else
+//! that mentions a searchable column — `LIKE`, ordering comparisons,
+//! `IN (SELECT ...)`, `= ANY(SELECT ...)` — is an [`Unprotected`] site rather
+//! than a silent no-op, because comparing a client's plaintext against the
+//! stored form matches no row and reads as an empty result rather than an
+//! error. So is an array parameter the codec cannot decode faithfully: the
+//! signal moves to Bind time, but it is the same signal.
 //!
 //! # SQL text fidelity
 //!
@@ -332,29 +337,58 @@ impl QueryRewriter {
         }
         let mut values: Vec<Option<Cow<'_, [u8]>>> =
             bind.params.iter().map(|p| p.map(Cow::Borrowed)).collect();
+        let mut refusal = None;
         for (index, action) in params.iter() {
+            let binary = bind.param_format(*index) == 1;
             let Some(Some(value)) = values.get_mut(*index) else { continue };
-            let (replacement, wire) = match action {
-                ParamAction::Seal(transform) => (transform.seal(value)?, transform.wire()),
+            let replacement = match action {
+                ParamAction::Seal(transform) => {
+                    encode_param(transform.seal(value)?, transform.wire(), binary)
+                }
                 ParamAction::SearchIndex(transform) => {
                     let Some(token) = transform.search_index(value)? else {
                         return Err(Error::Wire(dbsec_core::Error::Malformed));
                     };
                     // The index prefix is BYTEA regardless of the transform's
                     // own stored form.
-                    (token, WireForm::Bytea)
+                    encode_param(token, WireForm::Bytea, binary)
+                }
+                // The array is already in the parameter's own format: the
+                // codec re-encodes it in the shape it decoded.
+                ParamAction::SearchIndexArray { transform, column } => {
+                    match index_array(value, binary, transform)? {
+                        Some(indexed) => indexed,
+                        // Nothing about this array can be indexed faithfully.
+                        // The SQL already matches the blind index, so leaving
+                        // the plaintext array is the "matches no rows" outcome
+                        // the warn path describes; strict mode refuses it.
+                        None => {
+                            refusal = Some(Unprotected::Predicate {
+                                column: column.to_string(),
+                                shape: "= ANY bound array",
+                            });
+                            continue;
+                        }
+                    }
                 }
             };
-            *value = match wire {
-                // Text-shaped stored forms (FPE digits, hex tokens) are the
-                // same bytes in either parameter format.
-                WireForm::Text => Cow::Owned(replacement),
-                WireForm::Bytea if bind.param_format(*index) == 1 => Cow::Owned(replacement),
-                // Text-format parameter for a BYTEA column: hex form.
-                WireForm::Bytea => {
-                    Cow::Owned(format!("\\x{}", hex::encode(replacement)).into_bytes())
+            *value = Cow::Owned(replacement);
+        }
+        // Every other parameter of this Bind is still transformed on the warn
+        // path: a sealed parameter relayed as plaintext because some *other*
+        // parameter could not be indexed would write the very thing this proxy
+        // exists to prevent.
+        if let Some(site) = refusal {
+            match self.unprotected(&site) {
+                Ok(()) => {}
+                Err(Rejection::Refused(message)) => {
+                    // Same shape as a refused Parse: the backend never sees
+                    // the Bind, so the proxy owns the batch until Sync.
+                    self.awaiting_sync = true;
+                    return Ok(FrameAction::Reply(error_response(&message)));
                 }
-            };
+                Err(Rejection::Fatal(error)) => return Err(*error),
+            }
         }
         Ok(FrameAction::Replace(pgwire::encode_bind(
             bind.portal,
@@ -762,14 +796,19 @@ impl QueryRewriter {
                 self.rewrite_in_list(column, list, scope, params)
             }
             Expr::AnyOp { left, compare_op: BinaryOperator::Eq, right, .. } => {
-                match right.as_mut() {
-                    Expr::Array(array) => {
-                        self.rewrite_in_list(left, &mut array.elem, scope, params)
-                    }
-                    // `= ANY($1)` is one bound array parameter, not a list of
-                    // values the rewrite can index element by element.
-                    _ => self.unsupported_predicate(expr, scope),
+                if let Expr::Array(array) = right.as_mut() {
+                    return self.rewrite_in_list(left, &mut array.elem, scope, params);
                 }
+                // `= ANY($1)` is one bound array parameter: the elements only
+                // exist at Bind time, so the index is applied there.
+                if let Some((index, transform)) = array_parameter(left, right, scope) {
+                    let column: Arc<str> = column_name(left).unwrap_or_default().into();
+                    params.record(index, ParamAction::SearchIndexArray { transform, column })?;
+                    let operand = std::mem::replace(left.as_mut(), Expr::Value(Value::Null));
+                    *left.as_mut() = index_prefix(operand);
+                    return Ok(true);
+                }
+                self.unsupported_predicate(expr, scope)
             }
             _ => self.unsupported_predicate(expr, scope),
         }
@@ -1123,6 +1162,275 @@ fn index_value(
     Ok(())
 }
 
+/// One transformed Bind parameter, in the format the parameter arrived in.
+/// Text-shaped stored forms (FPE digits, hex tokens) are the same bytes in
+/// either format; a BYTEA form in a text-format parameter is `\x` hex.
+fn encode_param(value: Vec<u8>, wire: WireForm, binary: bool) -> Vec<u8> {
+    match wire {
+        WireForm::Text => value,
+        WireForm::Bytea if binary => value,
+        WireForm::Bytea => format!("\\x{}", hex::encode(value)).into_bytes(),
+    }
+}
+
+/// PostgreSQL's `bytea` type OID. The blind index prefix is BYTEA whatever the
+/// column's own stored form is, so a re-encoded `= ANY($n)` array is a
+/// `bytea[]` — the same element type the `ARRAY[...]` rewrite produces.
+const BYTEA_OID: i32 = 17;
+
+/// Element type OIDs whose binary form *is* the plaintext bytes, and which can
+/// therefore be blind-indexed element by element: bytea, and the string types.
+/// Anything else — an int, a timestamp, a composite — is not a value this
+/// proxy ever sealed, so its array is left alone rather than turned into a
+/// query that matches the wrong rows.
+const INDEXABLE_ELEMENT_OIDS: [i32; 6] = [
+    BYTEA_OID, // bytea
+    19,        // name
+    25,        // text
+    705,       // unknown
+    1042,      // bpchar
+    1043,      // varchar
+];
+
+/// Most elements one `= ANY($n)` array may carry. A Bind body is bounded at
+/// 1 GiB, which is room for hundreds of millions of empty elements and one
+/// HMAC each; this caps the work a single parameter can ask for (SEC-33).
+/// Real multi-value lookups are orders of magnitude below it, and an array
+/// over the cap falls back to the refusal rather than being indexed.
+const MAX_ARRAY_ELEMENTS: usize = 65_536;
+
+/// One decoded `= ANY($n)` array parameter.
+struct BoundArray {
+    /// Element plaintexts, `None` for a NULL element.
+    elements: Vec<Option<Vec<u8>>>,
+    /// The array's lower bound, preserved so the re-encoded array is the same
+    /// array with different values in it.
+    lower_bound: i32,
+}
+
+/// Replaces every element of a bound `= ANY($n)` array with its blind index
+/// and re-encodes it as `bytea[]` in the parameter's own format, which is what
+/// makes `substring(col from 1 for 32) = ANY($n)` match the stored rows.
+///
+/// `Ok(None)` is the fallback for anything this cannot do faithfully — a
+/// parameter that is not a one-dimensional array, an element type that is not
+/// a plaintext the proxy seals, an array over [`MAX_ARRAY_ELEMENTS`] — and the
+/// caller turns it into the same [`Unprotected::Predicate`] signal the SQL
+/// rewrite raises. Nothing partially indexed is ever produced: half the
+/// elements matching the index and half the stored form is a *valid* query
+/// that silently returns the wrong rows.
+///
+/// A NULL element stays NULL: `x = ANY(...)` is never true for one, so it
+/// changes no row either way.
+fn index_array(
+    value: &[u8],
+    binary: bool,
+    transform: &Arc<dyn FieldTransform>,
+) -> Result<Option<Vec<u8>>, Error> {
+    let decoded = if binary {
+        decode_binary_array(value)
+    } else {
+        decode_text_array(value, transform.wire())
+    };
+    let Some(array) = decoded else { return Ok(None) };
+    let mut indexed = Vec::with_capacity(array.elements.len());
+    for element in &array.elements {
+        let Some(plaintext) = element else {
+            indexed.push(None);
+            continue;
+        };
+        let Some(token) = transform.search_index(plaintext)? else { return Ok(None) };
+        indexed.push(Some(token));
+    }
+    Ok(if binary {
+        encode_binary_array(&indexed, array.lower_bound)
+    } else {
+        Some(encode_text_array(&indexed))
+    })
+}
+
+/// Decodes the binary array format: `ndim | flags | element oid`, then one
+/// `length | lower bound` pair per dimension, then each element as
+/// `length | bytes` with `-1` for NULL. Every field is checked against what is
+/// actually there — this is client-supplied and the only thing that has
+/// validated it so far is nothing (SEC-11).
+fn decode_binary_array(mut raw: &[u8]) -> Option<BoundArray> {
+    let ndim = take_i32(&mut raw)?;
+    let _flags = take_i32(&mut raw)?;
+    let element_oid = take_i32(&mut raw)?;
+    if !INDEXABLE_ELEMENT_OIDS.contains(&element_oid) {
+        return None;
+    }
+    match ndim {
+        // No dimensions at all is the canonical empty array.
+        0 => return raw.is_empty().then(|| BoundArray { elements: Vec::new(), lower_bound: 1 }),
+        1 => {}
+        _ => return None,
+    }
+    let count = take_i32(&mut raw)?;
+    let lower_bound = take_i32(&mut raw)?;
+    let count = usize::try_from(count).ok().filter(|count| *count <= MAX_ARRAY_ELEMENTS)?;
+    let mut elements = Vec::new();
+    for _ in 0..count {
+        let size = take_i32(&mut raw)?;
+        if size == -1 {
+            elements.push(None);
+            continue;
+        }
+        let size = usize::try_from(size).ok()?;
+        if raw.len() < size {
+            return None;
+        }
+        let (element, rest) = raw.split_at(size);
+        elements.push(Some(element.to_vec()));
+        raw = rest;
+    }
+    // Trailing bytes mean the message was not the array it claimed to be.
+    raw.is_empty().then_some(BoundArray { elements, lower_bound })
+}
+
+/// Takes one big-endian `i32`, or `None` when fewer than four bytes are left.
+fn take_i32(buf: &mut &[u8]) -> Option<i32> {
+    if buf.len() < 4 {
+        return None;
+    }
+    let (head, rest) = buf.split_at(4);
+    *buf = rest;
+    Some(i32::from_be_bytes(head.try_into().ok()?))
+}
+
+/// Decodes the text array format: `{a,"b c",NULL}`, where an element may be
+/// double-quoted and a quoted element escapes `"` and `\` with a backslash.
+/// Only a flat, one-dimensional array is accepted — a nested array or an
+/// explicit `[1:2]=` dimension prefix falls back rather than being guessed at.
+fn decode_text_array(raw: &[u8], wire: WireForm) -> Option<BoundArray> {
+    let text = std::str::from_utf8(raw).ok()?.trim();
+    let body = text.strip_prefix('{')?.strip_suffix('}')?;
+    let mut elements: Vec<Option<Vec<u8>>> = Vec::new();
+    if body.trim().is_empty() {
+        return Some(BoundArray { elements, lower_bound: 1 });
+    }
+    let bytes = body.as_bytes();
+    let mut at = 0;
+    loop {
+        while bytes.get(at).is_some_and(u8::is_ascii_whitespace) {
+            at += 1;
+        }
+        let element = if bytes.get(at) == Some(&b'"') {
+            at += 1;
+            let mut value = Vec::new();
+            loop {
+                match *bytes.get(at)? {
+                    b'\\' => {
+                        value.push(*bytes.get(at + 1)?);
+                        at += 2;
+                    }
+                    b'"' => {
+                        at += 1;
+                        break;
+                    }
+                    byte => {
+                        value.push(byte);
+                        at += 1;
+                    }
+                }
+            }
+            Some(String::from_utf8(value).ok()?)
+        } else {
+            let start = at;
+            while bytes.get(at).is_some_and(|byte| *byte != b',') {
+                at += 1;
+            }
+            let unquoted = body.get(start..at)?.trim_end();
+            // A brace here is a nested array, which this does not handle.
+            if unquoted.contains(['{', '}']) {
+                return None;
+            }
+            (!unquoted.eq_ignore_ascii_case("null")).then(|| unquoted.to_owned())
+        };
+        elements.push(element.map(|text| text_plaintext(&text, wire)));
+        if elements.len() > MAX_ARRAY_ELEMENTS {
+            return None;
+        }
+        while bytes.get(at).is_some_and(u8::is_ascii_whitespace) {
+            at += 1;
+        }
+        match bytes.get(at) {
+            None => break,
+            Some(b',') => at += 1,
+            Some(_) => return None,
+        }
+    }
+    Some(BoundArray { elements, lower_bound: 1 })
+}
+
+/// Re-encodes indexed elements in the binary array format. `None` only when
+/// the element count does not fit the protocol's `i32` — impossible under
+/// [`MAX_ARRAY_ELEMENTS`], and checked rather than cast so it stays impossible
+/// if that cap ever moves (SEC-15).
+fn encode_binary_array(elements: &[Option<Vec<u8>>], lower_bound: i32) -> Option<Vec<u8>> {
+    let count = i32::try_from(elements.len()).ok()?;
+    let has_null = elements.iter().any(Option::is_none);
+    let payload: usize = elements.iter().flatten().map(Vec::len).sum();
+    let mut out = Vec::with_capacity(20 + elements.len() * 4 + payload);
+    out.extend_from_slice(&if elements.is_empty() { 0i32 } else { 1i32 }.to_be_bytes());
+    out.extend_from_slice(&i32::from(has_null).to_be_bytes());
+    out.extend_from_slice(&BYTEA_OID.to_be_bytes());
+    if elements.is_empty() {
+        return Some(out);
+    }
+    out.extend_from_slice(&count.to_be_bytes());
+    out.extend_from_slice(&lower_bound.to_be_bytes());
+    for element in elements {
+        match element {
+            None => out.extend_from_slice(&(-1i32).to_be_bytes()),
+            Some(token) => {
+                let size = i32::try_from(token.len()).ok()?;
+                out.extend_from_slice(&size.to_be_bytes());
+                out.extend_from_slice(token);
+            }
+        }
+    }
+    Some(out)
+}
+
+/// Re-encodes indexed elements as an array literal. Each element is bytea's
+/// `\x` hex input syntax, quoted — and inside a quoted array element the
+/// backslash itself has to be escaped, or the array parser eats it.
+fn encode_text_array(elements: &[Option<Vec<u8>>]) -> Vec<u8> {
+    let mut out = String::from("{");
+    for (position, element) in elements.iter().enumerate() {
+        if position > 0 {
+            out.push(',');
+        }
+        match element {
+            None => out.push_str("NULL"),
+            Some(token) => {
+                out.push_str("\"\\\\x");
+                out.push_str(&hex::encode(token));
+                out.push('"');
+            }
+        }
+    }
+    out.push('}');
+    out.into_bytes()
+}
+
+/// The parameter index and transform behind `col = ANY($n)`, when `col` is a
+/// searchable column and the right operand is one bound array parameter.
+/// `None` for every other shape — `= ANY(SELECT ...)`, an array expression, a
+/// non-searchable column — which the caller signals as an unsupported
+/// predicate exactly as before.
+fn array_parameter(
+    column: &Expr,
+    array: &Expr,
+    scope: &TableScope<'_>,
+) -> Option<(usize, Arc<dyn FieldTransform>)> {
+    let transform = column_ref(scope, column).filter(|t| t.supports_search())?.clone();
+    let Expr::Value(Value::Placeholder(placeholder)) = unwrap_casts(array) else { return None };
+    Some((placeholder_index(placeholder)?, transform))
+}
+
 /// Splits a Describe or Close body into its target and name — both messages
 /// share the shape `u8 kind | cstr name`. A kind byte that is neither `'S'`
 /// (statement) nor `'P'` (portal) is a protocol violation the relay must not
@@ -1170,15 +1478,21 @@ fn unwrap_casts(expr: &Expr) -> &Expr {
 /// its own characters — sealing it verbatim would round-trip the hex text.
 fn literal_plaintext(expr: &Expr, wire: WireForm) -> Option<Vec<u8>> {
     match unwrap_casts(expr) {
-        Expr::Value(Value::SingleQuotedString(s)) => Some(match wire {
-            WireForm::Bytea => s
-                .strip_prefix("\\x")
-                .and_then(|hex| hex::decode(hex).ok())
-                .unwrap_or_else(|| s.as_bytes().to_vec()),
-            WireForm::Text => s.as_bytes().to_vec(),
-        }),
+        Expr::Value(Value::SingleQuotedString(s)) => Some(text_plaintext(s, wire)),
         Expr::Value(Value::Number(n, _)) => Some(n.as_bytes().to_vec()),
         _ => None,
+    }
+}
+
+/// The plaintext a piece of text stands for — shared by SQL literals and text
+/// format array elements, which read `\x` the same way.
+fn text_plaintext(text: &str, wire: WireForm) -> Vec<u8> {
+    match wire {
+        WireForm::Bytea => text
+            .strip_prefix("\\x")
+            .and_then(|hex| hex::decode(hex).ok())
+            .unwrap_or_else(|| text.as_bytes().to_vec()),
+        WireForm::Text => text.as_bytes().to_vec(),
     }
 }
 
@@ -1499,7 +1813,13 @@ const MAX_ERROR_MESSAGE: usize = 512;
 
 /// A PostgreSQL ErrorResponse ('E') frame. Recoverable at the statement
 /// level: the session stays open and the client can carry on.
-fn error_response(message: &str) -> Vec<u8> {
+///
+/// Shared with the read path ([`crate::rows`]), which refuses a result set it
+/// cannot safely relay with the same frame and the same SQLSTATE: both are the
+/// proxy's policy declining one statement, and a client that knows what 42501
+/// means from a refused write should not have to learn a second code for a
+/// refused read.
+pub(crate) fn error_response(message: &str) -> Vec<u8> {
     let mut end = MAX_ERROR_MESSAGE.min(message.len());
     while !message.is_char_boundary(end) {
         end -= 1;
@@ -1580,7 +1900,7 @@ mod tests {
             FrameAction::Replace(body) => {
                 Some(String::from_utf8(body[..body.len() - 1].to_vec()).unwrap())
             }
-            FrameAction::Reply(_) => panic!("refused: {sql}"),
+            FrameAction::Reply(_) | FrameAction::Substitute(_) => panic!("refused: {sql}"),
         }
     }
 
@@ -2357,6 +2677,205 @@ mod tests {
         assert_eq!(bound.params[0].unwrap(), format!("\\x{}", hex::encode(expected)).as_bytes());
     }
 
+    /// A binary-format array parameter: `ndim | flags | element oid`, one
+    /// `length | lower bound` pair, then `length | bytes` per element.
+    fn binary_array(element_oid: i32, elements: &[Option<&[u8]>]) -> Vec<u8> {
+        let mut out = 1i32.to_be_bytes().to_vec();
+        out.extend_from_slice(&i32::from(elements.iter().any(Option::is_none)).to_be_bytes());
+        out.extend_from_slice(&element_oid.to_be_bytes());
+        out.extend_from_slice(&(elements.len() as i32).to_be_bytes());
+        out.extend_from_slice(&1i32.to_be_bytes());
+        for element in elements {
+            match element {
+                None => out.extend_from_slice(&(-1i32).to_be_bytes()),
+                Some(bytes) => {
+                    out.extend_from_slice(&(bytes.len() as i32).to_be_bytes());
+                    out.extend_from_slice(bytes);
+                }
+            }
+        }
+        out
+    }
+
+    /// Parses a statement and returns the rewritten SQL text.
+    fn rewritten_parse(
+        rewriter: &mut QueryRewriter,
+        statement: &[u8],
+        sql: &str,
+    ) -> Option<String> {
+        let parse = pgwire::encode_parse(statement, sql.as_bytes(), &0i16.to_be_bytes());
+        match rewriter.on_frame(b'P', &parse).unwrap() {
+            FrameAction::Relay => None,
+            FrameAction::Replace(body) => {
+                Some(String::from_utf8(pgwire::parse_parse(&body).unwrap().query.to_vec()).unwrap())
+            }
+            FrameAction::Reply(_) | FrameAction::Substitute(_) => panic!("refused: {sql}"),
+        }
+    }
+
+    fn bind_frame(statement: &[u8], formats: &[i16], params: &[Option<&[u8]>]) -> Vec<u8> {
+        let params: Vec<_> = params.iter().map(|p| p.map(Cow::Borrowed)).collect();
+        pgwire::encode_bind(b"", statement, formats, &params, &0i16.to_be_bytes()).unwrap()
+    }
+
+    /// `= ANY($1)` is the shape sqlx and asyncpg give a multi-value lookup:
+    /// one bound array, not a list of placeholders. The SQL is the same
+    /// index-prefix match `ARRAY[...]` produces; the array itself is decoded,
+    /// indexed and re-encoded as `bytea[]` at Bind time.
+    #[test]
+    fn a_bound_any_array_is_indexed_element_by_element_at_bind_time() {
+        use crate::rows::tests::INDEX_KEY;
+
+        let indexed = |value: &[u8]| blind_index::compute(&INDEX_KEY, value);
+        let mut rewriter = rewriter(catalog(true));
+        let sql =
+            rewritten_parse(&mut rewriter, b"any", "SELECT id FROM users WHERE email = ANY($1)")
+                .expect("rewritten");
+        assert!(sql.contains("SUBSTRING(email FROM 1 FOR 32) = ANY($1)"), "{sql}");
+
+        // Binary format: bytea[] in, bytea[] out, NULL elements preserved.
+        let array = binary_array(17, &[Some(b"a@b.io"), None, Some(b"c@d.io")]);
+        let FrameAction::Replace(rewritten) =
+            rewriter.on_frame(b'B', &bind_frame(b"any", &[1], &[Some(&array)])).unwrap()
+        else {
+            panic!("bind not rewritten")
+        };
+        let bound = pgwire::parse_bind(&rewritten).unwrap();
+        assert_eq!(
+            bound.params[0].unwrap(),
+            binary_array(17, &[Some(&indexed(b"a@b.io")), None, Some(&indexed(b"c@d.io"))]),
+        );
+
+        // Text format: an array literal of `\x` hex, with the backslash
+        // escaped the way a quoted array element needs it.
+        let FrameAction::Replace(rewritten) = rewriter
+            .on_frame(b'B', &bind_frame(b"any", &[0], &[Some(b"{a@b.io,NULL,\"c@d.io\"}")]))
+            .unwrap()
+        else {
+            panic!("bind not rewritten")
+        };
+        let bound = pgwire::parse_bind(&rewritten).unwrap();
+        assert_eq!(
+            bound.params[0].unwrap(),
+            format!(
+                "{{\"\\\\x{}\",NULL,\"\\\\x{}\"}}",
+                hex::encode(indexed(b"a@b.io")),
+                hex::encode(indexed(b"c@d.io"))
+            )
+            .as_bytes(),
+        );
+    }
+
+    /// An array the codec cannot index faithfully must not go on the wire
+    /// half-indexed: that is a *valid* query returning the wrong rows. It
+    /// falls back to the same signal the SQL rewrite raises, one message
+    /// later.
+    #[test]
+    fn an_undecodable_any_array_falls_back_to_the_predicate_signal() {
+        // An int4 element type: not a value this proxy ever sealed.
+        let ints = binary_array(23, &[Some(&1i32.to_be_bytes())]);
+        // Truncated, and a nested array literal.
+        let truncated = binary_array(17, &[Some(b"a@b.io")]);
+        let truncated = truncated[..truncated.len() - 2].to_vec();
+        for (format, param) in [
+            (1i16, ints),
+            (1, truncated),
+            (0, b"{{a@b.io},{c@d.io}}".to_vec()),
+            (0, b"[1:2]={a@b.io,c@d.io}".to_vec()),
+        ] {
+            let mut permissive = rewriter(catalog(true));
+            rewritten_parse(&mut permissive, b"any", "SELECT id FROM users WHERE email = ANY($1)")
+                .expect("rewritten");
+            let bind = bind_frame(b"any", &[format], &[Some(&param)]);
+            let relayed = match permissive.on_frame(b'B', &bind).unwrap() {
+                FrameAction::Relay => param.clone(),
+                FrameAction::Replace(body) => {
+                    pgwire::parse_bind(&body).unwrap().params[0].unwrap().to_vec()
+                }
+                FrameAction::Reply(_) | FrameAction::Substitute(_) => {
+                    panic!("warn must not refuse: {param:?}")
+                }
+            };
+            assert_eq!(relayed, param, "warn relays the array untouched");
+
+            let mut strict = rewriter(strict_catalog(true));
+            rewritten_parse(&mut strict, b"any", "SELECT id FROM users WHERE email = ANY($1)")
+                .expect("rewritten");
+            let action = strict.on_frame(b'B', &bind).unwrap();
+            assert!(refusal(&action).contains("searchable column email"), "{param:?}");
+            // The refusal owns the batch until Sync, exactly like a refused
+            // Parse: the backend never saw the Bind.
+            assert_eq!(
+                strict.on_frame(b'E', b"\0\0\0\0\0").unwrap(),
+                FrameAction::Reply(Vec::new())
+            );
+            let FrameAction::Reply(ready) = strict.on_frame(b'S', b"").unwrap() else {
+                panic!("Sync answers with ReadyForQuery")
+            };
+            assert_eq!(ready[0], b'Z');
+        }
+    }
+
+    /// The other parameters of a Bind are still transformed when one array
+    /// cannot be indexed — a sealed parameter relayed as plaintext because
+    /// some *other* parameter was undecodable would write the plaintext this
+    /// proxy exists to keep out of the database.
+    #[test]
+    fn a_fallback_array_does_not_drop_the_other_parameters_of_its_bind() {
+        let mut rewriter = rewriter(catalog(true));
+        let sql = rewritten_parse(
+            &mut rewriter,
+            b"mixed",
+            "UPDATE users SET email = $1 WHERE email = ANY($2)",
+        );
+        assert!(sql.is_some());
+        let ints = binary_array(23, &[Some(&1i32.to_be_bytes())]);
+        let bind = bind_frame(b"mixed", &[1], &[Some(b"new@b.io"), Some(&ints)]);
+        let FrameAction::Replace(rewritten) = rewriter.on_frame(b'B', &bind).unwrap() else {
+            panic!("the sealed parameter must still be sealed")
+        };
+        let bound = pgwire::parse_bind(&rewritten).unwrap();
+        assert_ne!(bound.params[0].unwrap(), b"new@b.io");
+        assert_eq!(bound.params[1].unwrap(), ints, "the array is relayed as it came");
+    }
+
+    #[test]
+    fn the_array_codec_reads_what_postgres_writes_and_refuses_the_rest() {
+        let elements = |array: BoundArray| array.elements;
+        // Quoted elements escape `"` and `\`; unquoted NULL is a NULL element.
+        let text = decode_text_array(br#"{ "a,b" , plain , NULL , "q\"\\x" }"#, WireForm::Text)
+            .expect("a flat array");
+        assert_eq!(
+            elements(text),
+            [Some(b"a,b".to_vec()), Some(b"plain".to_vec()), None, Some(b"q\"\\x".to_vec()),]
+        );
+        // A BYTEA-form column reads `\x` as hex input, the same as a literal.
+        assert_eq!(
+            elements(decode_text_array(b"{\\x616263}", WireForm::Bytea).unwrap()),
+            [Some(b"abc".to_vec())]
+        );
+        assert!(decode_text_array(b"{}", WireForm::Text).unwrap().elements.is_empty());
+        for refused in [&b"{a,b"[..], b"a,b}", b"{{a},{b}}", b"[1:1]={a}", b"{a} trailing"] {
+            assert!(decode_text_array(refused, WireForm::Text).is_none(), "{refused:?}");
+        }
+
+        // Binary: only element types whose bytes are the plaintext.
+        let array = decode_binary_array(&binary_array(25, &[Some(b"a"), None])).expect("a text[]");
+        assert_eq!(array.lower_bound, 1);
+        assert_eq!(elements(array), [Some(b"a".to_vec()), None]);
+        assert!(decode_binary_array(&binary_array(23, &[Some(b"\0\0\0\x01")])).is_none());
+        assert!(decode_binary_array(b"").is_none());
+        // Trailing bytes mean it was not the array it claimed to be.
+        let mut trailing = binary_array(17, &[Some(b"a")]);
+        trailing.push(0);
+        assert!(decode_binary_array(&trailing).is_none());
+        // An element length past the end of the message.
+        let mut lying = binary_array(17, &[Some(b"a")]);
+        let last = lying.len() - 5;
+        lying[last..last + 4].copy_from_slice(&99i32.to_be_bytes());
+        assert!(decode_binary_array(&lying).is_none());
+    }
+
     #[test]
     fn join_cte_and_set_operations_are_traversed() {
         let mut rewriter = rewriter(catalog(true));
@@ -2381,7 +2900,7 @@ mod tests {
             "SELECT id FROM users WHERE email LIKE 'a%'",
             "SELECT id FROM users WHERE email > 'a@b.io'",
             "SELECT id FROM users WHERE email IN (SELECT email FROM other)",
-            "SELECT id FROM users WHERE email = ANY($1)",
+            "SELECT id FROM users WHERE email = ANY(SELECT email FROM other)",
             "SELECT id FROM users WHERE email IN ('a@b.io', lower('c@d.io'))",
             "DELETE FROM users WHERE email = lower('a@b.io')",
         ] {

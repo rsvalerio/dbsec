@@ -200,7 +200,12 @@ pub fn cert_path(dir: &Path) -> PathBuf {
 pub async fn spawn_proxy(dir: &Path, opts: &ProxyOpts<'_>) -> Proxy {
     let cert = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
     std::fs::write(cert_path(dir), cert.cert.pem()).unwrap();
-    std::fs::write(dir.join("key.pem"), cert.key_pair.serialize_pem()).unwrap();
+    let key = dir.join("key.pem");
+    std::fs::write(&key, cert.key_pair.serialize_pem()).unwrap();
+    // The downstream TLS key is a secret file the proxy refuses when anyone
+    // but its owner can read it (SEC-29), and `fs::write` inherits the umask.
+    #[cfg(unix)]
+    std::fs::set_permissions(&key, std::os::unix::fs::PermissionsExt::from_mode(0o600)).unwrap();
 
     let key_source = match &opts.keys {
         Keys::File => {
@@ -217,13 +222,17 @@ pub async fn spawn_proxy(dir: &Path, opts: &ProxyOpts<'_>) -> Proxy {
         Keys::Vault(section) => section.clone(),
     };
 
+    // `key_source` goes last of the top-level keys: in Vault mode it is a
+    // whole `[vault]` table, so any bare key written after it would land
+    // inside that table rather than at the document root and be rejected as
+    // an unknown `[vault]` field.
     let config = format!(
         r#"
 listen = "127.0.0.1:{port}"
 upstream = "{upstream}"
 control_dsn = "{dsn}"
-{key_source}
 {on_unprotected}
+{key_source}
 
 [tls.downstream]
 cert = {cert:?}

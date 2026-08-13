@@ -1,11 +1,11 @@
 ---
 id: TASK-0065
 title: code-review-plan-wave9
-status: To Do
+status: Done
 assignee:
   - code-review-wave
 created_date: '2026-08-12 18:42'
-updated_date: '2026-08-12 18:42'
+updated_date: '2026-08-12 19:22'
 labels:
   - code-review-wave
 dependencies:
@@ -29,4 +29,6 @@ Vault key source follow-ups: the three threads wave3 and wave5 left behind — u
 
 <!-- SECTION:NOTES:BEGIN -->
 Overlaps: none
+
+Branch: code-review/TASK-0065
 <!-- SECTION:NOTES:END -->

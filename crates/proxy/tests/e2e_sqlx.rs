@@ -122,6 +122,26 @@ async fn sqlx_driver_end_to_end() {
         .unwrap();
     assert!(misses.is_empty());
 
+    // `= ANY($1)`: sqlx's multi-value lookup binds the whole list as one
+    // bytea[] parameter, so the proxy has to index it element by element at
+    // Bind time rather than rewriting a list of placeholders.
+    let hits = sqlx::query(concat!("SELECT email FROM ", table!(), " WHERE email = ANY($1)"))
+        .bind(vec![b"erin@example.com".to_vec(), b"frank@example.com".to_vec()])
+        .fetch_all(&mut conn)
+        .await
+        .unwrap();
+    let found: Vec<Vec<u8>> = hits.iter().map(|row| row.get::<Vec<u8>, _>(0)).collect();
+    assert_eq!(found.len(), 2, "both bound values match");
+    assert!(found.contains(&b"erin@example.com".to_vec()), "{found:?}");
+    assert!(found.contains(&b"frank@example.com".to_vec()), "{found:?}");
+    // A value nobody has matches nothing, rather than everything.
+    let misses = sqlx::query(concat!("SELECT id FROM ", table!(), " WHERE email = ANY($1)"))
+        .bind(vec![b"nobody@example.com".to_vec()])
+        .fetch_all(&mut conn)
+        .await
+        .unwrap();
+    assert!(misses.is_empty());
+
     // UPDATE: the assignment is sealed and the WHERE equality indexed in one
     // statement, both through bound parameters.
     let updated = sqlx::query(concat!("UPDATE ", table!(), " SET phone = $1 WHERE email = $2"))
