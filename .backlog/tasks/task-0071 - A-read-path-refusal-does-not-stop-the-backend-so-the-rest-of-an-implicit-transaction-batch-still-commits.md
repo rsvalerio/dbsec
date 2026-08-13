@@ -3,9 +3,10 @@ id: TASK-0071
 title: >-
   A read-path refusal does not stop the backend, so the rest of an
   implicit-transaction batch still commits
-status: Triage
+status: Done
 assignee: []
 created_date: '2026-08-13 20:19'
+updated_date: '2026-08-13 21:29'
 labels:
   - code-review-rust
   - correctness
@@ -48,3 +49,9 @@ verified by hand against session.rs:145.
 - [ ] #1 A refused batch cannot leave a committed write the client was told did not happen
 - [ ] #2 The doc comment no longer claims parity with the backend's own error handling unless that parity is actually achieved
 <!-- AC:END -->
+
+## Implementation Notes
+
+<!-- SECTION:NOTES:BEGIN -->
+Fixed in a3515d7. FrameAction::RefuseAndClose replaces Substitute: the client gets the 42501 ErrorResponse, both halves are shut down, and the backend rolls back the implicit transaction instead of committing behind the error. Verified by the full e2e driver matrix against dockerized Postgres (a_recreated_table_is_re_resolved_and_refused_in_strict_mode now asserts the session does NOT survive).
+<!-- SECTION:NOTES:END -->

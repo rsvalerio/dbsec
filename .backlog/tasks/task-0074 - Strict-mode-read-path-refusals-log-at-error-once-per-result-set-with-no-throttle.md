@@ -3,9 +3,10 @@ id: TASK-0074
 title: >-
   Strict-mode read-path refusals log at error! once per result set with no
   throttle
-status: Triage
+status: Done
 assignee: []
 created_date: '2026-08-13 20:19'
+updated_date: '2026-08-13 21:29'
 labels:
   - code-review-rust
   - observability
@@ -37,3 +38,9 @@ previously emitted at most one line per session because the session ended.
 <!-- AC:BEGIN -->
 - [ ] #1 A client retrying a refused statement in a loop does not emit one error line per attempt
 <!-- AC:END -->
+
+## Implementation Notes
+
+<!-- SECTION:NOTES:BEGIN -->
+Dissolved by TASK-0071 (a3515d7). The unthrottled error! was unbounded only because the session survived each refusal and a client could retry in a loop. The session now ends at the first refusal, so the site emits at most one line per session — the same bound warned_stale gives the warn path. Verified: refuse() holds the only error! in the module and returns RefuseAndClose.
+<!-- SECTION:NOTES:END -->

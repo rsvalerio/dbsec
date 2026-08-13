@@ -3,9 +3,10 @@ id: TASK-0072
 title: >-
   A read-path refusal discards a following batch's results when the refused
   batch ended in Flush
-status: Triage
+status: Done
 assignee: []
 created_date: '2026-08-13 20:19'
+updated_date: '2026-08-13 21:29'
 labels:
   - code-review-rust
   - correctness
@@ -39,3 +40,9 @@ unintended.
 <!-- AC:BEGIN -->
 - [ ] #1 A refusal inside a Flush-terminated batch does not consume a following batch's results
 <!-- AC:END -->
+
+## Implementation Notes
+
+<!-- SECTION:NOTES:BEGIN -->
+Dissolved by TASK-0071 (a3515d7) rather than fixed on its own terms. The finding was a defect in discard_until_ready, which consumed frames up to the next ReadyForQuery; a refusal now closes the session instead, so that loop is deleted and there is nothing left to consume a following Flush-terminated batch. Verified: no discard state remains in rows.rs.
+<!-- SECTION:NOTES:END -->
