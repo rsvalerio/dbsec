@@ -54,7 +54,10 @@ Two kinds of failure, and they fail in opposite directions:
   express. `on_unprotected = "warn"` (the default) logs and relays; `on_unprotected =
   "reject"` answers the client with a PostgreSQL ErrorResponse and never forwards the
   statement. The refusal is statement-level — the connection stays open and the session
-  recovers at the next `ReadyForQuery`.
+  recovers at the next `ReadyForQuery` — because the statement never reached the backend.
+  A *read*-path refusal carries the same ErrorResponse but then closes the connection:
+  its statement has already run, and only closing makes the backend roll back the rest of
+  the batch instead of committing it behind the error.
 
 The default is `warn` because `reject` refuses statements that work today, including any
 SQL sqlparser cannot parse but PostgreSQL can, whether or not it touches a protected

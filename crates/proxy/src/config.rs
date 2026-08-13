@@ -331,8 +331,11 @@ pub struct Config {
 /// ([`crate::rows`]) — rather than that having a switch of its own. Both paths
 /// are asking the same question about the same columns, and a deployment that
 /// is strict about writing plaintext but lax about handing back stored bytes
-/// enforces neither half of the invariant. Refusals on either path are
-/// statement-level: ErrorResponse, then the session carries on.
+/// enforces neither half of the invariant. Both paths answer a refusal with the
+/// same ErrorResponse, but only the write path's is statement-level: a refused
+/// write is withheld before the backend sees it, while a refused read is the
+/// result of a statement that already ran, so the session ends to stop the rest
+/// of the batch committing behind it (see [`crate::rows`]).
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum OnUnprotected {

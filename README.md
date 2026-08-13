@@ -71,11 +71,19 @@ on, and relaying those rows is exactly the silent passthrough of ciphertext this
 path exists to prevent. Every driver the e2e matrix covers describes its
 statements.
 
-Read-path refusals are statement-level, like the write path's: the client gets a
-PostgreSQL `ERROR` (SQLSTATE 42501), the rest of that result set is withheld,
-and the session resynchronises at the backend's next `ReadyForQuery` — not a
-dropped connection, which application retry logic would read as a network fault
-rather than a policy refusal.
+Read-path refusals are *not* statement-level, and the asymmetry with the write
+path is deliberate. The client gets the same PostgreSQL `ERROR` (SQLSTATE
+42501) — a refusal should never reach an application as a bare connection reset
+it would retry as a network fault — and then the connection closes.
+
+It closes because a refused read is a result, so its statement has already run.
+Whatever the client sent behind it in the same batch is still executing
+upstream, and PostgreSQL offers no in-band way to abort a batch already in
+flight: answering the client and carrying on would let `SELECT protected;
+UPDATE …` commit its `UPDATE` behind an error saying the statement failed.
+Closing the connection is what makes the backend roll that implicit transaction
+back. A refused *write*, by contrast, never reaches the backend at all, so
+there is nothing to stop and the session continues.
 
 `COPY` is never encrypted. `COPY ... FROM` carries its payload in `CopyData`
 frames rather than SQL, and `COPY ... TO` bypasses the read path — so a
