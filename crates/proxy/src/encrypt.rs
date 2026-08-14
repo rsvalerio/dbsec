@@ -337,7 +337,10 @@ impl QueryRewriter {
         }
         let mut values: Vec<Option<Cow<'_, [u8]>>> =
             bind.params.iter().map(|p| p.map(Cow::Borrowed)).collect();
-        let mut refusal = None;
+        // Every column whose array could not be indexed, not just the last one:
+        // an operator handed one name out of two fixes that site and hits the
+        // other on the next run.
+        let mut unindexed: Vec<String> = Vec::new();
         for (index, action) in params.iter() {
             let binary = bind.param_format(*index) == 1;
             let Some(Some(value)) = values.get_mut(*index) else { continue };
@@ -363,10 +366,7 @@ impl QueryRewriter {
                         // the plaintext array is the "matches no rows" outcome
                         // the warn path describes; strict mode refuses it.
                         None => {
-                            refusal = Some(Unprotected::Predicate {
-                                column: column.to_string(),
-                                shape: "= ANY bound array",
-                            });
+                            unindexed.push(column.to_string());
                             continue;
                         }
                     }
@@ -378,7 +378,9 @@ impl QueryRewriter {
         // path: a sealed parameter relayed as plaintext because some *other*
         // parameter could not be indexed would write the very thing this proxy
         // exists to prevent.
-        if let Some(site) = refusal {
+        if !unindexed.is_empty() {
+            let site =
+                Unprotected::Predicate { column: unindexed.join(", "), shape: "= ANY bound array" };
             match self.unprotected(&site) {
                 Ok(()) => {}
                 Err(Rejection::Refused(message)) => {
@@ -1300,9 +1302,18 @@ fn take_i32(buf: &mut &[u8]) -> Option<i32> {
 }
 
 /// Decodes the text array format: `{a,"b c",NULL}`, where an element may be
-/// double-quoted and a quoted element escapes `"` and `\` with a backslash.
-/// Only a flat, one-dimensional array is accepted — a nested array or an
-/// explicit `[1:2]=` dimension prefix falls back rather than being guessed at.
+/// double-quoted and a backslash escapes the character after it — in a quoted
+/// element *and* in a bare one, which is what `array_in` does and what makes
+/// `{a\,b}` one element rather than two. Only a flat, one-dimensional array is
+/// accepted — a nested array or an explicit `[1:2]=` dimension prefix falls
+/// back rather than being guessed at.
+///
+/// Getting the escaping wrong here is not a parse failure that shows up as
+/// one: a mis-split element re-encodes into a perfectly well-formed `bytea[]`
+/// of blind indexes for values nobody ever stored, so the statement quietly
+/// returns the wrong rows. That is the outcome [`index_array`] exists to make
+/// impossible, so anything this cannot decode faithfully returns `None` and
+/// takes the `on_unprotected` path instead of guessing.
 fn decode_text_array(raw: &[u8], wire: WireForm) -> Option<BoundArray> {
     let text = std::str::from_utf8(raw).ok()?.trim();
     let body = text.strip_prefix('{')?.strip_suffix('}')?;
@@ -1337,16 +1348,44 @@ fn decode_text_array(raw: &[u8], wire: WireForm) -> Option<BoundArray> {
             }
             Some(String::from_utf8(value).ok()?)
         } else {
-            let start = at;
-            while bytes.get(at).is_some_and(|byte| *byte != b',') {
-                at += 1;
+            // An unquoted element escapes with a backslash exactly as a quoted
+            // one does — `array_in` does not restrict escaping to quotes — so
+            // `{a\,b}` is the single element `a,b` and not two elements. Scanning
+            // to the next raw comma instead would split it there and hand both
+            // halves to the blind index, which matches nothing anyone stored.
+            let mut value = Vec::new();
+            let mut escaped = false;
+            // Only *unescaped* trailing whitespace is insignificant; `a\ ` ends
+            // in a space that is part of the value.
+            let mut trailing_space = 0;
+            loop {
+                match bytes.get(at) {
+                    None | Some(b',') => break,
+                    Some(b'\\') => {
+                        value.push(*bytes.get(at + 1)?);
+                        at += 2;
+                        escaped = true;
+                        trailing_space = 0;
+                    }
+                    // An unescaped brace is a nested array, which this does not
+                    // handle; an escaped one is just a character.
+                    Some(b'{' | b'}') => return None,
+                    Some(&byte) => {
+                        value.push(byte);
+                        at += 1;
+                        if byte.is_ascii_whitespace() {
+                            trailing_space += 1;
+                        } else {
+                            trailing_space = 0;
+                        }
+                    }
+                }
             }
-            let unquoted = body.get(start..at)?.trim_end();
-            // A brace here is a nested array, which this does not handle.
-            if unquoted.contains(['{', '}']) {
-                return None;
-            }
-            (!unquoted.eq_ignore_ascii_case("null")).then(|| unquoted.to_owned())
+            value.truncate(value.len() - trailing_space);
+            let unquoted = String::from_utf8(value).ok()?;
+            // `NULL` is the null element only unquoted and unescaped: `\N ULL`
+            // and `"NULL"` are both the four-character string.
+            (escaped || !unquoted.eq_ignore_ascii_case("null")).then_some(unquoted)
         };
         elements.push(element.map(|text| text_plaintext(&text, wire)));
         if elements.len() > MAX_ARRAY_ELEMENTS {
@@ -2844,6 +2883,32 @@ mod tests {
         assert_eq!(bound.params[1].unwrap(), ints, "the array is relayed as it came");
     }
 
+    /// One Bind can carry more than one array that cannot be indexed, and the
+    /// operator has to be told about all of them: naming only the last one
+    /// sends them to fix one site and meet the other on the next run.
+    #[test]
+    fn every_un_indexable_array_of_a_bind_is_named_not_only_the_last() {
+        let catalog = Arc::new(WriteCatalog::new(
+            &[column("email", transform(true), true), column("phone", transform(true), true)],
+            OnUnprotected::Reject,
+        ));
+        let mut strict = rewriter(catalog);
+        rewritten_parse(
+            &mut strict,
+            b"two",
+            "SELECT id FROM users WHERE email = ANY($1) OR phone = ANY($2)",
+        )
+        .expect("rewritten");
+        // int4 elements: nothing this proxy ever sealed, so both fall back.
+        let ints = binary_array(23, &[Some(&1i32.to_be_bytes())]);
+        let bind = bind_frame(b"two", &[1, 1], &[Some(&ints), Some(&ints)]);
+        let FrameAction::Reply(frames) = strict.on_frame(b'B', &bind).unwrap() else {
+            panic!("strict mode must refuse a Bind it cannot index")
+        };
+        let message = String::from_utf8_lossy(&frames);
+        assert!(message.contains("email") && message.contains("phone"), "{message}");
+    }
+
     #[test]
     fn the_array_codec_reads_what_postgres_writes_and_refuses_the_rest() {
         let elements = |array: BoundArray| array.elements;
@@ -2854,10 +2919,30 @@ mod tests {
             elements(text),
             [Some(b"a,b".to_vec()), Some(b"plain".to_vec()), None, Some(b"q\"\\x".to_vec()),]
         );
-        // A BYTEA-form column reads `\x` as hex input, the same as a literal.
+        // A backslash escapes the next character in a *bare* element too, so
+        // `{a\,b}` is one element and not two. Splitting on the raw comma would
+        // index two values nobody stored and quietly return the wrong rows.
         assert_eq!(
-            elements(decode_text_array(b"{\\x616263}", WireForm::Bytea).unwrap()),
+            elements(decode_text_array(br"{a\,b}", WireForm::Text).unwrap()),
+            [Some(b"a,b".to_vec())]
+        );
+        // Escaping also decides what is NULL and what is the string "NULL",
+        // and keeps whitespace a bare element would otherwise have trimmed.
+        assert_eq!(
+            elements(decode_text_array(br"{\NULL,NULL,a\ }", WireForm::Text).unwrap()),
+            [Some(b"NULL".to_vec()), None, Some(b"a ".to_vec())]
+        );
+        // A BYTEA-form column reads `\x` as hex input, the same as a literal —
+        // which on the wire needs the backslash escaped, exactly as PostgreSQL
+        // writes it back out. One backslash escapes the `x` instead, leaving a
+        // bare `x616263` that is not hex input at all.
+        assert_eq!(
+            elements(decode_text_array(br"{\\x616263}", WireForm::Bytea).unwrap()),
             [Some(b"abc".to_vec())]
+        );
+        assert_eq!(
+            elements(decode_text_array(br"{\x616263}", WireForm::Bytea).unwrap()),
+            [Some(b"x616263".to_vec())]
         );
         assert!(decode_text_array(b"{}", WireForm::Text).unwrap().elements.is_empty());
         for refused in [&b"{a,b"[..], b"a,b}", b"{{a},{b}}", b"[1:1]={a}", b"{a} trailing"] {
