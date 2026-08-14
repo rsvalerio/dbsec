@@ -78,7 +78,7 @@ use crate::Error;
 /// written under a lost DEK issues one Vault roundtrip *per value*
 /// (PERF-16, SEC-33). Only "no such secret" is cached — a transport failure
 /// or a permission denial is never remembered as an absent key.
-const MISSING_DEK_CACHE_TTL: Duration = Duration::from_secs(60);
+const MISSING_DEK_CACHE_TTL: Duration = Duration::from_mins(1);
 const MISSING_DEK_CACHE_MAX: usize = 4096;
 
 /// Wrapped-DEK record stored at `{path}/deks/{key_id_hex}`.

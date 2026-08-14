@@ -285,7 +285,7 @@ impl RowDecryptor {
                 if positions.is_empty() {
                     return Ok(None);
                 }
-                self.decrypt_row(&positions, body)
+                Self::decrypt_row(&positions, body)
             }
             // A result set ended. `described` is dropped with it so a later
             // DataRow can never inherit these positions by accident.
@@ -359,7 +359,6 @@ impl RowDecryptor {
     }
 
     fn decrypt_row(
-        &self,
         positions: &[(usize, ReadColumn)],
         body: &[u8],
     ) -> Result<Option<Vec<u8>>, Error> {
