@@ -55,19 +55,30 @@
 //! they appear in a `SELECT`/`UPDATE`/`DELETE`: `WHERE` and `HAVING`,
 //! `JOIN ... ON` constraints, CTE bodies, both branches of a
 //! `UNION`/`INTERSECT`/`EXCEPT`, and derived-table subqueries. Anything else
-//! that mentions a searchable column — `LIKE`, ordering comparisons,
+//! that mentions a protected column — `LIKE`, ordering comparisons,
 //! `IN (SELECT ...)`, `= ANY(SELECT ...)` — is an [`Unprotected`] site rather
 //! than a silent no-op, because comparing a client's plaintext against the
 //! stored form matches no row and reads as an empty result rather than an
 //! error. So is an array parameter the codec cannot decode faithfully: the
 //! signal moves to Bind time, but it is the same signal.
 //!
+//! The test is *protected*, not *searchable*. What makes an unrewritten
+//! predicate wrong is that the stored form is not the plaintext, which holds
+//! for `encrypt` without `searchable`, for `fpe` and for `token` exactly as it
+//! does for a searchable column — those are merely the subset the rewriter can
+//! also *fix*. So `WHERE email = '…'` on a non-searchable column is
+//! [`Unprotected::UnindexedPredicate`], reported separately from
+//! [`Unprotected::Predicate`] because the remedy differs: one is a query to
+//! rewrite, the other a column to reconfigure. Mask-only columns are outside
+//! all of this — [`WriteCatalog::new`] skips columns with no transform, so
+//! they store the plaintext and their predicates are correct as written.
+//!
 //! `IS NULL` and `IS NOT NULL` are the one exception, and they are exempt for
 //! the same reason the rest are not: nullness is the one property sealing
 //! preserves exactly, so those two match the rows the client meant and there
 //! is nothing to signal. Reporting them would refuse working SQL under
 //! `reject` and dilute the warning stream under `warn` — a signal that fires
-//! on correct queries stops being read. See [`searchable_operand`].
+//! on correct queries stops being read. See [`protected_operand`].
 //!
 //! # SQL text fidelity
 //!
@@ -836,6 +847,10 @@ impl QueryRewriter {
     ) -> Result<bool, Rejection> {
         let Some(transform) = column_ref(scope, column).cloned() else { return Ok(false) };
         if !transform.supports_search() {
+            // Same as `rewrite_equality`: no index to compare against, so
+            // every element would be tested against the stored form.
+            let column = column_name(column).unwrap_or_default();
+            self.unprotected(&Unprotected::UnindexedPredicate { column, shape: "IN list" })?;
             return Ok(false);
         }
         let indexable = !list.is_empty()
@@ -867,6 +882,15 @@ impl QueryRewriter {
         params: &mut ParamTransforms,
     ) -> Result<bool, Rejection> {
         if !transform.supports_search() {
+            // The column is protected but carries no equality index, so this
+            // comparison would run against the stored form and match nothing.
+            // Relaying it silently is the failure `Unprotected` exists to
+            // prevent: "no rows" reads as "no such user".
+            let column = column_name(column).unwrap_or_default();
+            self.unprotected(&Unprotected::UnindexedPredicate {
+                column,
+                shape: expr_shape(value),
+            })?;
             return Ok(false);
         }
         let indexable = match unwrap_casts(value) {
@@ -886,15 +910,20 @@ impl QueryRewriter {
     }
 
     /// A predicate the rewriter cannot turn into an index match. Only worth a
-    /// signal when it actually mentions a searchable column — otherwise it is
+    /// signal when it actually mentions a protected column — otherwise it is
     /// ordinary SQL the proxy has no business commenting on.
     fn unsupported_predicate(
         &self,
         expr: &Expr,
         scope: &TableScope<'_>,
     ) -> Result<bool, Rejection> {
-        let Some(column) = searchable_operand(expr, scope) else { return Ok(false) };
-        self.unprotected(&Unprotected::Predicate { column, shape: expr_shape(expr) })?;
+        let Some((column, searchable)) = protected_operand(expr, scope) else { return Ok(false) };
+        let shape = expr_shape(expr);
+        self.unprotected(&if searchable {
+            Unprotected::Predicate { column, shape }
+        } else {
+            Unprotected::UnindexedPredicate { column, shape }
+        })?;
         Ok(false)
     }
 
@@ -1082,9 +1111,19 @@ fn column_name(expr: &Expr) -> Option<String> {
     }
 }
 
-/// The searchable column an unhandled predicate is about, if any. Only the
-/// operands of the predicate are inspected — a searchable column buried in a
-/// subquery belongs to that subquery's own traversal.
+/// The protected column an unhandled predicate is about and whether it is
+/// searchable, if any. Only the operands of the predicate are inspected — a
+/// protected column buried in a subquery belongs to that subquery's own
+/// traversal.
+///
+/// Every protected column qualifies, not only the searchable ones. What makes
+/// an unrewritten predicate wrong is that the *stored form is not the
+/// plaintext*, which is true of `encrypt` without `searchable`, of `fpe` and
+/// of `token` just as much as of a searchable column — the searchable ones
+/// are merely the subset the rewriter can also *fix*. Mask-only columns are
+/// not protected here at all: [`WriteCatalog::new`] skips columns with no
+/// transform, so they never enter the scope and their predicates are correct
+/// as written.
 ///
 /// `IS NULL` and `IS NOT NULL` are deliberately absent: nullness survives
 /// sealing exactly. [`QueryRewriter::seal_expr`] returns early on a NULL
@@ -1095,7 +1134,7 @@ fn column_name(expr: &Expr) -> Option<String> {
 /// an [`Unprotected`] site would refuse working SQL under `reject` and dilute
 /// the warning stream under `warn`. `IS DISTINCT FROM` is *not* exempt: it
 /// compares against the stored form like any other operator.
-fn searchable_operand(expr: &Expr, scope: &TableScope<'_>) -> Option<String> {
+fn protected_operand(expr: &Expr, scope: &TableScope<'_>) -> Option<(String, bool)> {
     let operands: [&Expr; 2] = match expr {
         Expr::BinaryOp { left, right, .. } => [left, right],
         Expr::AnyOp { left, right, .. } | Expr::AllOp { left, right, .. } => [left, right],
@@ -1109,10 +1148,10 @@ fn searchable_operand(expr: &Expr, scope: &TableScope<'_>) -> Option<String> {
         | Expr::IsNotDistinctFrom(expr, _) => [expr, expr],
         _ => return None,
     };
-    operands
-        .into_iter()
-        .find(|operand| column_ref(scope, operand).is_some_and(|t| t.supports_search()))
-        .and_then(column_name)
+    operands.into_iter().find_map(|operand| {
+        let transform = column_ref(scope, operand)?;
+        Some((column_name(operand)?, transform.supports_search()))
+    })
 }
 
 /// The AST discriminant of an expression — its *shape*, never its value.
@@ -1739,6 +1778,11 @@ enum Unprotected<'a> {
     UnsupportedValue { column: &'a str, shape: &'static str },
     /// A predicate over a searchable column that no index match can express.
     Predicate { column: String, shape: &'static str },
+    /// A predicate over a protected column that has no equality index at all,
+    /// so no rewrite could express it. Kept apart from [`Self::Predicate`]
+    /// because the remedy differs: that one is a query to rewrite, this one is
+    /// a column to reconfigure.
+    UnindexedPredicate { column: String, shape: &'static str },
     /// `SET search_path` moved off the schema the catalog resolves against.
     SearchPathChanged,
     /// An unqualified name that may be a protected table, in a session whose
@@ -1790,6 +1834,13 @@ impl Unprotected<'_> {
                 shape,
                 "unsupported predicate for a searchable column; it will match no rows"
             ),
+            Self::UnindexedPredicate { column, shape } => tracing::warn!(
+                column,
+                shape,
+                "predicate over a protected column with no equality index; it will match no rows \
+                 because the stored form is not the plaintext. Set searchable = true on this \
+                 column to make equality searchable"
+            ),
             Self::SearchPathChanged => tracing::warn!(
                 "session changed search_path; unqualified names no longer resolve to the \
                  configured schema"
@@ -1833,6 +1884,11 @@ impl Unprotected<'_> {
             Self::Predicate { column, shape } => format!(
                 "searchable column {column} was used in a {shape}, which cannot be matched \
                  against its blind index"
+            ),
+            Self::UnindexedPredicate { column, shape } => format!(
+                "protected column {column} was used in a {shape}, but it has no equality index, \
+                 so the comparison would match no rows; set searchable = true on this column to \
+                 make equality searchable"
             ),
             Self::SearchPathChanged => {
                 "changing search_path leaves unqualified names resolving to an unknown schema"
@@ -1925,6 +1981,35 @@ mod tests {
             &[column("email", transform(searchable), searchable)],
             OnUnprotected::Warn,
         ))
+    }
+
+    /// The two other transform kinds, which are never searchable: their
+    /// stored form is deterministic but it is not the plaintext, so a
+    /// predicate over one matches nothing just as an unsearchable `encrypt`
+    /// column does.
+    fn fpe_transform() -> Arc<dyn FieldTransform> {
+        Arc::new(dbsec_core::transform::FpeTransform::new(
+            Arc::new(crate::rows::tests::OneKey),
+            "public.users.email".to_owned(),
+            true,
+        ))
+    }
+
+    fn token_transform() -> Arc<dyn FieldTransform> {
+        Arc::new(dbsec_core::transform::TokenTransform::new(
+            Arc::new(crate::rows::tests::OneKey),
+            "public.users.email".to_owned(),
+        ))
+    }
+
+    /// A catalog holding one column with an arbitrary transform, so the
+    /// predicate tests can cover every kind under both policies.
+    fn catalog_of(
+        transform: Arc<dyn FieldTransform>,
+        searchable: bool,
+        on_unprotected: OnUnprotected,
+    ) -> Arc<WriteCatalog> {
+        Arc::new(WriteCatalog::new(&[column("email", transform, searchable)], on_unprotected))
     }
 
     fn strict_catalog(searchable: bool) -> Arc<WriteCatalog> {
@@ -3015,6 +3100,92 @@ mod tests {
             let mut strict = rewriter(strict_catalog(true));
             let action = strict.on_frame(b'Q', &query_frame(sql)).unwrap();
             assert!(refusal(&action).contains("searchable column email"), "{sql}");
+        }
+    }
+
+    /// A predicate over a protected column with no equality index compares the
+    /// client's plaintext against a stored form that is not the plaintext, so
+    /// it matches nothing. That is the failure `Unprotected` exists to report,
+    /// and it must fire for every non-searchable transform kind — an operator
+    /// who sets `reject` to be told about queries that cannot work gets
+    /// nothing otherwise, and "no rows" reads as "no such user".
+    #[test]
+    fn predicates_over_protected_columns_without_an_index_are_signalled() {
+        let kinds: [(&str, Arc<dyn FieldTransform>); 3] = [
+            ("encrypt (searchable = false)", transform(false)),
+            ("fpe", fpe_transform()),
+            ("token", token_transform()),
+        ];
+        for (kind, column_transform) in kinds {
+            for sql in [
+                "SELECT id FROM users WHERE email = 'a@b.io'",
+                "SELECT id FROM users WHERE 'a@b.io' = email",
+                "SELECT id FROM users WHERE email IN ('a@b.io', 'c@d.io')",
+                "SELECT id FROM users WHERE email LIKE 'a%'",
+                "DELETE FROM users WHERE email = 'a@b.io'",
+            ] {
+                let mut permissive =
+                    rewriter(catalog_of(column_transform.clone(), false, OnUnprotected::Warn));
+                assert!(
+                    rewritten_query(&mut permissive, sql).is_none(),
+                    "{kind} under warn relays: {sql}"
+                );
+
+                let mut strict =
+                    rewriter(catalog_of(column_transform.clone(), false, OnUnprotected::Reject));
+                let action = strict.on_frame(b'Q', &query_frame(sql)).unwrap();
+                let message = refusal(&action);
+                assert!(
+                    message.contains("protected column email") && message.contains("no equality"),
+                    "{kind} under reject refuses: {sql}\ngot: {message}"
+                );
+            }
+        }
+    }
+
+    /// The remedy differs by column, so the two predicate signals stay
+    /// distinct: a searchable column names its blind index, an unindexed one
+    /// names the setting that would fix it.
+    #[test]
+    fn the_two_predicate_signals_name_different_remedies() {
+        let sql = "SELECT id FROM users WHERE email LIKE 'a%'";
+
+        let mut searchable = rewriter(strict_catalog(true));
+        let message = refusal(&searchable.on_frame(b'Q', &query_frame(sql)).unwrap());
+        assert!(message.contains("searchable column email"), "{message}");
+        assert!(message.contains("blind index"), "{message}");
+
+        let mut unindexed = rewriter(strict_catalog(false));
+        let message = refusal(&unindexed.on_frame(b'Q', &query_frame(sql)).unwrap());
+        assert!(message.contains("protected column email"), "{message}");
+        assert!(message.contains("searchable = true"), "{message}");
+    }
+
+    /// A mask-only column stores the plaintext, so its predicates are correct
+    /// exactly as written and must stay silent. `WriteCatalog::new` skips
+    /// columns with no transform, which is what makes this hold.
+    #[test]
+    fn predicates_over_mask_only_columns_stay_quiet() {
+        let mask_only = ProtectedColumn {
+            schema: "public".into(),
+            table: "users".into(),
+            column: "email".into(),
+            transform: None,
+            searchable: false,
+            readable: false,
+            mask: Some(dbsec_core::mask::MaskSpec { keep_first: 1, keep_last: 0, mask_with: '*' }),
+        };
+        let catalog = Arc::new(WriteCatalog::new(&[mask_only], OnUnprotected::Reject));
+        let mut strict = rewriter(catalog);
+        for sql in [
+            "SELECT id FROM users WHERE email = 'a@b.io'",
+            "SELECT id FROM users WHERE email LIKE 'a%'",
+            "SELECT id FROM users WHERE email IN ('a@b.io')",
+        ] {
+            assert!(
+                matches!(strict.on_frame(b'Q', &query_frame(sql)).unwrap(), FrameAction::Relay),
+                "a mask-only column stores the plaintext: {sql}"
+            );
         }
     }
 
