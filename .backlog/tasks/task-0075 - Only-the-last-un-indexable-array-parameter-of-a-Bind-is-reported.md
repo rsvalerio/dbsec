@@ -1,9 +1,10 @@
 ---
 id: TASK-0075
 title: Only the last un-indexable array parameter of a Bind is reported
-status: Triage
+status: Done
 assignee: []
 created_date: '2026-08-13 20:19'
+updated_date: '2026-08-14 06:59'
 labels:
   - code-review-rust
   - observability
@@ -32,3 +33,9 @@ it, and hits the second on the next run.
 <!-- AC:BEGIN -->
 - [ ] #1 A Bind with two un-indexable array parameters names both in the warn log and the refusal message
 <!-- AC:END -->
+
+## Implementation Notes
+
+<!-- SECTION:NOTES:BEGIN -->
+Fixed: un-indexable columns accumulate into a Vec and are joined into one Predicate site, so the warn line and the refusal message name every column rather than the last. Pinned by every_un_indexable_array_of_a_bind_is_named_not_only_the_last.
+<!-- SECTION:NOTES:END -->

@@ -3,9 +3,10 @@ id: TASK-0073
 title: >-
   decode_text_array honours backslash escapes only inside quoted elements,
   producing a wrong blind index
-status: Triage
+status: Done
 assignee: []
 created_date: '2026-08-13 20:19'
+updated_date: '2026-08-14 06:59'
 labels:
   - code-review-rust
   - correctness
@@ -41,3 +42,9 @@ quoted branch already un-escapes; the unquoted branch should too, or should retu
 - [ ] #1 An element containing a backslash escape is either decoded as PostgreSQL decodes it, or refused
 - [ ] #2 Round-trip tests cover unquoted escaped commas and unquoted \x-prefixed elements
 <!-- AC:END -->
+
+## Implementation Notes
+
+<!-- SECTION:NOTES:BEGIN -->
+Fixed: the bare-element branch now escapes with a backslash exactly as the quoted one does, tracks whether an escape occurred so NULL vs the string "NULL" is decided correctly, and trims only unescaped trailing whitespace. Every case verified against a live PostgreSQL 16 (array_in): {a\,b} is one element; {\NULL,NULL} is "NULL" then NULL; {a\ } keeps its space; {\x616263}::bytea[] is x616263 and {\\x616263}::bytea[] is abc. The pre-existing test asserted the last of those wrongly and was corrected.
+<!-- SECTION:NOTES:END -->
