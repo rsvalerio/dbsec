@@ -234,7 +234,8 @@ fn control_host(dsn: &str) -> String {
         .iter()
         .enumerate()
         .map(|(i, host)| match host {
-            tokio_postgres::config::Host::Tcp(name) => match ports.get(i).or(ports.first()) {
+            tokio_postgres::config::Host::Tcp(name) => match ports.get(i).or_else(|| ports.first())
+            {
                 Some(port) => format!("{name}:{port}"),
                 None => name.clone(),
             },

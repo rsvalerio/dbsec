@@ -1584,11 +1584,12 @@ fn statement_ranges(sql: &str) -> Option<Vec<Range<usize>>> {
 }
 
 fn push_statement(ranges: &mut Vec<Range<usize>>, sql: &str, range: Range<usize>) {
-    let trimmed = sql[range.clone()].trim();
+    let text = &sql[range.clone()];
+    let trimmed = text.trim();
     if trimmed.is_empty() {
         return;
     }
-    let start = range.start + (sql[range.clone()].len() - sql[range.clone()].trim_start().len());
+    let start = range.start + (text.len() - text.trim_start().len());
     ranges.push(start..start + trimmed.len());
 }
 

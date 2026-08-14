@@ -50,7 +50,7 @@ pub fn is_enveloped(data: &[u8]) -> bool {
 /// AES-256-GCM bound to one DEK: the key schedule is built once, and the
 /// random-nonce invocation budget is tracked for the life of the instance.
 pub struct Cipher {
-    cipher: Aes256Gcm,
+    gcm: Aes256Gcm,
     /// Encryptions charged against this key so far. Decryption is unlimited —
     /// only encryption draws nonces.
     used: AtomicU64,
@@ -66,7 +66,7 @@ impl Cipher {
     /// A cipher with a smaller budget, so tests can reach the boundary without
     /// performing 2^32 encryptions.
     pub fn with_budget(key: &[u8; 32], budget: u64) -> Self {
-        Self { cipher: Aes256Gcm::new(key.into()), used: AtomicU64::new(0), budget }
+        Self { gcm: Aes256Gcm::new(key.into()), used: AtomicU64::new(0), budget }
     }
 
     /// Encryptions still allowed under this key.
@@ -99,7 +99,7 @@ impl Cipher {
         // violated internal invariant, not a wrong key or tampering, and must
         // not be reported as Error::Decrypt.
         let ciphertext = self
-            .cipher
+            .gcm
             .encrypt(Nonce::from_slice(&nonce), Payload { msg: plaintext, aad: key_id })
             .map_err(|_| Error::Encrypt)?;
 
@@ -119,7 +119,7 @@ impl Cipher {
         }
         let id = &data[MAGIC.len()..MAGIC.len() + KEY_ID_LEN];
         let nonce = &data[MAGIC.len() + KEY_ID_LEN..HEADER_LEN];
-        self.cipher
+        self.gcm
             .decrypt(Nonce::from_slice(nonce), Payload { msg: &data[HEADER_LEN..], aad: id })
             .map_err(|_| Error::Decrypt)
     }
