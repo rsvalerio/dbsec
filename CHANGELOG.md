@@ -2,6 +2,15 @@
 All notable changes to this project will be documented in this file. See [conventional commits](https://www.conventionalcommits.org/) for commit guidelines.
 
 - - -
+## v0.1.2 - 2026-08-16
+#### Bug Fixes
+- (**portal**) keep a pipelined Close from orphaning its in-flight Execute - (71935b1) - Rodrigo Valerio, *Claude Sonnet 4.6*
+#### Miscellaneous Chores
+- (**deny**) re-record the ring clarify waiver against the new forge baseline - (6d4e1ae) - Rodrigo Valerio, *Claude Opus 5 (1M context)*
+- Merge pull request #5 from rsvalerio/fix/task-0113-pipelined-close - (2c4f592) - Rodrigo Valeri
+
+- - -
+
 ## v0.1.1 - 2026-08-14
 #### Bug Fixes
 - (**encrypt**) honour array escapes outside quotes and name every un-indexable array - (4cddea0) - Rodrigo Valerio, *Claude Opus 5*
