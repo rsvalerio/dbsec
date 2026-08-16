@@ -28,6 +28,15 @@
 //! the read path drop exactly that batch's leftovers and stay aligned with a
 //! pipelined next batch.
 //!
+//! A queued expectation therefore has to outlive the names it was made about.
+//! A client may `Close` a statement or portal in the same batch that executes
+//! it — the PostgreSQL JDBC driver does exactly that for a statement it has
+//! decided not to cache — so by the time the rows come back the map entry is
+//! gone. [`Pending::Execute`] consequently carries the [`Positions`] it will
+//! be decrypted with rather than a name to look up later, and a
+//! [`StatementId`] distinguishes one incarnation of a name from the next, so
+//! that a `Close` orphans nothing and a re-`Parse` inherits nothing.
+//!
 //! Every map here is keyed by a client-chosen name, so every one of them is
 //! capped — names, statements, portals and outstanding responses (SEC-33).
 
@@ -161,8 +170,24 @@ pub enum RowSource {
     Undescribed,
 }
 
+/// Identifies one *incarnation* of a prepared statement name. `Parse` of a
+/// name that already exists mints a fresh id, so a description answered for
+/// the previous incarnation is never attributed to the new one — and a queued
+/// Execute keeps pointing at the incarnation it was bound against even after
+/// the name is closed or re-parsed.
+type StatementId = u64;
+
+/// The statement a queued Describe is about: its name, to find the map entry,
+/// and its id, to confirm the entry is still the same incarnation.
+struct StatementRef {
+    name: Vec<u8>,
+    id: StatementId,
+}
+
 /// One prepared statement, as both directions see it.
 struct Statement {
+    /// Which incarnation of this name it is.
+    id: StatementId,
     /// Write path: what Bind must do to each parameter.
     params: ParamTransforms,
     /// Read path: the protected positions of the RowDescription that described
@@ -174,9 +199,25 @@ struct Statement {
 /// A response the server still owes, in the order the client asked for it.
 enum Pending {
     /// A Describe, answered by RowDescription or NoData.
-    Describe(Option<Vec<u8>>),
+    Describe(Option<StatementRef>),
     /// An Execute of a portal, answered by DataRows plus a completion frame.
-    Execute(Option<Vec<u8>>),
+    ///
+    /// `positions` is what the read path will decrypt with, held *here* rather
+    /// than looked up by name when the DataRow arrives. The name is not a
+    /// stable handle: a client may pipeline `Close S` for a statement in the
+    /// same batch that executes it — the PostgreSQL JDBC driver does exactly
+    /// that for a statement it has decided not to cache — so by the time the
+    /// rows come back the entry is gone and the lookup finds nothing. Resolving
+    /// late turned that ordinary traffic into `Error::UndescribedRow`, which
+    /// the read path answers by tearing the session down.
+    ///
+    /// It is filled in two moments, because either can come first: at
+    /// [`SessionPortals::expect_execute`] when the statement is already
+    /// described, and by [`SessionPortals::describe_answered`] back-filling
+    /// this queue when the description arrives after the Execute was queued —
+    /// which is the usual case, since a pipelined batch is fully on the wire
+    /// before its first response comes back.
+    Execute { statement: Option<StatementId>, positions: Option<Positions> },
     /// A Sync (or a simple Query), answered by ReadyForQuery. Marks the batch
     /// boundary the read path resynchronises on.
     Batch,
@@ -188,6 +229,9 @@ struct Tracked {
     /// Portal name → the statement it was bound to.
     portals: HashMap<Vec<u8>, Vec<u8>>,
     pending: VecDeque<Pending>,
+    /// Source of [`StatementId`]s. Monotonic for the life of the session, so
+    /// an id is never reused and a stale reference can only fail to match.
+    next_statement_id: StatementId,
 }
 
 /// One session's extended-protocol state, shared by its two relay tasks.
@@ -225,7 +269,9 @@ impl SessionPortals {
                 limit: MAX_PREPARED_STATEMENTS,
             });
         }
-        tracked.statements.insert(statement.to_vec(), Statement { params, described: None });
+        let id = tracked.next_statement_id;
+        tracked.next_statement_id += 1;
+        tracked.statements.insert(statement.to_vec(), Statement { id, params, described: None });
         Ok(())
     }
 
@@ -259,20 +305,38 @@ impl SessionPortals {
     pub fn expect_describe(&self, target: Target, name: &[u8]) -> Result<(), Error> {
         check_name("describe target", name)?;
         let mut tracked = self.tracked();
-        let statement = match target {
+        let name = match target {
             Target::Statement => Some(name.to_vec()),
             // A portal describes the statement it was bound to: every portal
             // of one statement returns the same columns.
             Target::Portal => tracked.portals.get(name).cloned(),
         };
+        let statement = name.and_then(|name| {
+            let id = tracked.statements.get(&name)?.id;
+            Some(StatementRef { name, id })
+        });
         push(&mut tracked, Pending::Describe(statement))
     }
 
     /// Records that the server owes the DataRows of `portal`.
+    ///
+    /// The statement's positions are captured here when it is already
+    /// described; otherwise [`Self::describe_answered`] fills them in when the
+    /// RowDescription arrives. Either way they are held in the queue entry, so
+    /// closing or re-parsing the statement in the meantime cannot orphan the
+    /// rows already in flight for it.
     pub fn expect_execute(&self, portal: &[u8]) -> Result<(), Error> {
         let mut tracked = self.tracked();
-        let statement = tracked.portals.get(portal).cloned();
-        push(&mut tracked, Pending::Execute(statement))
+        let statement = tracked
+            .portals
+            .get(portal)
+            .and_then(|name| tracked.statements.get(name))
+            .map(|statement| (statement.id, statement.described.clone()));
+        let (statement, positions) = match statement {
+            Some((id, described)) => (Some(id), described),
+            None => (None, None),
+        };
+        push(&mut tracked, Pending::Execute { statement, positions })
     }
 
     /// The client is sending a COPY payload, so the backend is in copy-in
@@ -291,7 +355,8 @@ impl SessionPortals {
     /// ReadyForQuery is not skipped, so its marker stays.
     pub fn copy_data(&self) {
         let mut tracked = self.tracked();
-        let Some(execute) = tracked.pending.iter().rposition(|p| matches!(p, Pending::Execute(_)))
+        let Some(execute) =
+            tracked.pending.iter().rposition(|p| matches!(p, Pending::Execute { .. }))
         else {
             return;
         };
@@ -309,14 +374,37 @@ impl SessionPortals {
     }
 
     /// Attributes a RowDescription to the Describe that asked for it, so every
-    /// later Execute of that statement knows its protected positions.
+    /// Execute of that statement knows its protected positions — the ones
+    /// still queued behind this Describe as well as any bound later.
+    ///
+    /// The back-fill is what makes a pipelined batch work at all: the client
+    /// sends Describe and Execute together and only then reads, so by the time
+    /// this description arrives its Execute is already queued with no
+    /// positions. Matching on [`StatementId`] rather than name means a
+    /// `Close` or a re-`Parse` of the name in between changes nothing — a
+    /// closed statement's queued Execute still gets the description that was
+    /// asked for it, and a re-parsed name's Execute (a different id) is
+    /// correctly left alone.
     pub fn describe_answered(&self, positions: &Positions) {
         let mut tracked = self.tracked();
         let Some(Pending::Describe(statement)) = tracked.pending.front() else { return };
-        let statement = statement.clone();
+        let statement = statement.as_ref().map(|it| (it.name.clone(), it.id));
         tracked.pending.pop_front();
-        if let Some(entry) = statement.and_then(|name| tracked.statements.get_mut(&name)) {
-            entry.described = Some(positions.clone());
+        let Some((name, id)) = statement else { return };
+
+        // The name may since have been closed or re-parsed; only the same
+        // incarnation is still described by this answer.
+        if let Some(entry) = tracked.statements.get_mut(&name) {
+            if entry.id == id {
+                entry.described = Some(positions.clone());
+            }
+        }
+        for pending in &mut tracked.pending {
+            if let Pending::Execute { statement: Some(queued), positions: slot } = pending {
+                if *queued == id && slot.is_none() {
+                    *slot = Some(positions.clone());
+                }
+            }
         }
     }
 
@@ -328,23 +416,23 @@ impl SessionPortals {
     }
 
     /// Which positions the DataRow now arriving must be decrypted with.
+    ///
+    /// Read straight out of the queue entry: no map lookup, so a statement
+    /// closed or re-parsed since the Execute was queued cannot leave the rows
+    /// in flight for it unattributable.
     pub fn row_source(&self) -> RowSource {
         let tracked = self.tracked();
-        let Some(Pending::Execute(statement)) = tracked.pending.front() else {
+        let Some(Pending::Execute { positions, .. }) = tracked.pending.front() else {
             return RowSource::LastDescription;
         };
-        statement
-            .as_ref()
-            .and_then(|name| tracked.statements.get(name))
-            .and_then(|statement| statement.described.clone())
-            .map_or(RowSource::Undescribed, RowSource::Portal)
+        positions.clone().map_or(RowSource::Undescribed, RowSource::Portal)
     }
 
     /// A result set ended: CommandComplete, PortalSuspended or
     /// EmptyQueryResponse.
     pub fn execute_answered(&self) {
         let mut tracked = self.tracked();
-        if matches!(tracked.pending.front(), Some(Pending::Execute(_))) {
+        if matches!(tracked.pending.front(), Some(Pending::Execute { .. })) {
             tracked.pending.pop_front();
         }
     }
@@ -516,6 +604,106 @@ mod tests {
         assert!(portals.bind(b"p2", b"s1").unwrap().is_none());
         portals.expect_execute(b"p").unwrap();
         assert!(matches!(portals.row_source(), RowSource::Undescribed));
+    }
+
+    /// The PostgreSQL JDBC driver emits `Close S` for a statement it has
+    /// decided not to cache in the *same* batch that executes it, so the whole
+    /// batch is on the wire before the first response comes back. Resolving
+    /// the Execute's statement by name when the DataRow arrived found nothing
+    /// — the entry was already gone — and the resulting `UndescribedRow`
+    /// refusal tore down a healthy connection.
+    #[test]
+    fn a_pipelined_close_does_not_orphan_its_own_execute() {
+        let portals = portals();
+        // Parse "s1" / Bind "p"→"s1" / Describe "p" / Execute "p" /
+        // Close S "s1" / Sync.
+        portals.parse(b"s1", ParamTransforms::default()).unwrap();
+        portals.bind(b"p", b"s1").unwrap();
+        portals.expect_describe(Target::Portal, b"p").unwrap();
+        portals.expect_execute(b"p").unwrap();
+        portals.close_statement(b"s1");
+        portals.expect_batch().unwrap();
+
+        // Only now do the responses arrive.
+        portals.describe_answered(&positions(2));
+        let RowSource::Portal(found) = portals.row_source() else {
+            panic!("the description answered for this Execute must still reach it");
+        };
+        assert_eq!(found.len(), 2);
+    }
+
+    /// The same for a portal closed ahead of its own results, which is the
+    /// other half of the pipelined-Close pattern.
+    #[test]
+    fn a_pipelined_portal_close_does_not_orphan_its_own_execute() {
+        let portals = portals();
+        portals.parse(b"s1", ParamTransforms::default()).unwrap();
+        portals.bind(b"p", b"s1").unwrap();
+        portals.expect_describe(Target::Portal, b"p").unwrap();
+        portals.expect_execute(b"p").unwrap();
+        portals.close_portal(b"p");
+        portals.expect_batch().unwrap();
+
+        portals.describe_answered(&positions(3));
+        let RowSource::Portal(found) = portals.row_source() else {
+            panic!("closing the portal must not orphan the rows already in flight");
+        };
+        assert_eq!(found.len(), 3);
+    }
+
+    /// A description is answered for one incarnation of a name. Re-parsing the
+    /// name mid-pipeline must not let the old answer describe the new
+    /// statement — the id is what keeps the two apart.
+    #[test]
+    fn a_reparse_mid_pipeline_does_not_inherit_the_previous_description() {
+        let portals = portals();
+        portals.parse(b"s1", ParamTransforms::default()).unwrap();
+        portals.bind(b"p", b"s1").unwrap();
+        portals.expect_describe(Target::Portal, b"p").unwrap();
+
+        // The client re-parses the same name and executes the new statement
+        // before reading the first Describe's answer.
+        portals.parse(b"s1", ParamTransforms::default()).unwrap();
+        portals.bind(b"p", b"s1").unwrap();
+        portals.expect_execute(b"p").unwrap();
+
+        portals.describe_answered(&positions(2));
+        assert!(
+            matches!(portals.row_source(), RowSource::Undescribed),
+            "the new statement was never described; the old answer is not its own"
+        );
+    }
+
+    /// The fix must not weaken the refusal it was narrowing: an Execute of a
+    /// statement the server genuinely never described still has nothing to
+    /// decrypt with.
+    #[test]
+    fn an_execute_the_server_never_described_still_reports_undescribed() {
+        let portals = portals();
+        portals.parse(b"s1", ParamTransforms::default()).unwrap();
+        portals.bind(b"p", b"s1").unwrap();
+        portals.expect_execute(b"p").unwrap();
+        portals.expect_batch().unwrap();
+        assert!(matches!(portals.row_source(), RowSource::Undescribed));
+
+        // A Describe answered for a *different* statement does not fill it in.
+        let portals = portals_with_two();
+        portals.expect_describe(Target::Statement, b"other").unwrap();
+        portals.expect_execute(b"p").unwrap();
+        portals.describe_answered(&positions(2));
+        assert!(
+            matches!(portals.row_source(), RowSource::Undescribed),
+            "another statement's description must not be back-filled here"
+        );
+    }
+
+    /// Two statements, with portal "p" bound to the undescribed one.
+    fn portals_with_two() -> Arc<SessionPortals> {
+        let portals = portals();
+        portals.parse(b"other", ParamTransforms::default()).unwrap();
+        portals.parse(b"s1", ParamTransforms::default()).unwrap();
+        portals.bind(b"p", b"s1").unwrap();
+        portals
     }
 
     #[test]

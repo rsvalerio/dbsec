@@ -2,6 +2,24 @@
 All notable changes to this project will be documented in this file. See [conventional commits](https://www.conventionalcommits.org/) for commit guidelines.
 
 - - -
+## v0.1.1 - 2026-08-14
+#### Bug Fixes
+- (**encrypt**) honour array escapes outside quotes and name every un-indexable array - (4cddea0) - Rodrigo Valerio, *Claude Opus 5*
+- (**rows**) end the session on a read-path refusal so the batch rolls back - (8f50756) - Rodrigo Valerio, *Claude Opus 5*
+#### Documentation
+- record that a read-path refusal closes the connection - (788bb6f) - Rodrigo Valerio, *Claude Opus 5*
+#### Miscellaneous Chores
+- (**backlog**) file the aggressive-clippy and portal/rewrite findings - (e90af4c) - Rodrigo Valerio, *Claude Sonnet 4.6*
+- (**backlog**) file the crates-wide formal review findings - (a1a2ec2) - Rodrigo Valerio, *Claude Fable 5*
+- (**backlog**) close the array codec findings - (d61623f) - Rodrigo Valerio, *Claude Opus 5*
+- (**backlog**) close the read-path refusal findings - (a71d65d) - Rodrigo Valerio, *Claude Opus 5*
+- (**backlog**) file the wave 10 code-review findings for triage - (964b002) - Rodrigo Valerio, *Claude Opus 5*
+#### Style
+- (**clippy**) apply pedantic/nursery lint fixes - (13d388a) - Rodrigo Valerio, *Claude Sonnet 4.6*
+- add the missing trailing newline to CHANGELOG.md - (225c7ad) - Rodrigo Valerio, *Claude Opus 5*
+
+- - -
+
 ## v0.1.0 - 2026-08-13
 #### Features
 - (**core**) enforce a per-DEK AES-GCM invocation budget with cached ciphers - (d77f17a) - Rodrigo Valerio
