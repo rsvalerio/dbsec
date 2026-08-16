@@ -3,9 +3,10 @@ id: TASK-0115
 title: >-
   IS NULL and IS NOT NULL on a searchable column are falsely warned and refused,
   though they match correctly against the stored form
-status: Triage
+status: Done
 assignee: []
 created_date: '2026-08-14 16:49'
+updated_date: '2026-08-14 20:26'
 labels:
   - code-review-rust
   - security
@@ -45,7 +46,7 @@ Under the default `warn` the same statement runs correctly but emits a warning s
 
 ## Acceptance Criteria
 <!-- AC:BEGIN -->
-- [ ] #1 WHERE col IS NULL and WHERE col IS NOT NULL on a searchable column are relayed unchanged with no warning under warn and no refusal under reject
-- [ ] #2 IS DISTINCT FROM / IS NOT DISTINCT FROM against a non-NULL operand remain on_unprotected sites
-- [ ] #3 Tests cover both null tests under both on_unprotected settings, in WHERE and in a JOIN ON constraint
+- [x] #1 WHERE col IS NULL and WHERE col IS NOT NULL on a searchable column are relayed unchanged with no warning under warn and no refusal under reject
+- [x] #2 IS DISTINCT FROM / IS NOT DISTINCT FROM against a non-NULL operand remain on_unprotected sites
+- [x] #3 Tests cover both null tests under both on_unprotected settings, in WHERE and in a JOIN ON constraint
 <!-- AC:END -->

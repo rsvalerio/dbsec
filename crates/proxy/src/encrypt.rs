@@ -62,6 +62,13 @@
 //! error. So is an array parameter the codec cannot decode faithfully: the
 //! signal moves to Bind time, but it is the same signal.
 //!
+//! `IS NULL` and `IS NOT NULL` are the one exception, and they are exempt for
+//! the same reason the rest are not: nullness is the one property sealing
+//! preserves exactly, so those two match the rows the client meant and there
+//! is nothing to signal. Reporting them would refuse working SQL under
+//! `reject` and dilute the warning stream under `warn` — a signal that fires
+//! on correct queries stops being read. See [`searchable_operand`].
+//!
 //! # SQL text fidelity
 //!
 //! sqlparser's `Display` is not a guaranteed round-trip of its input:
@@ -1078,6 +1085,16 @@ fn column_name(expr: &Expr) -> Option<String> {
 /// The searchable column an unhandled predicate is about, if any. Only the
 /// operands of the predicate are inspected — a searchable column buried in a
 /// subquery belongs to that subquery's own traversal.
+///
+/// `IS NULL` and `IS NOT NULL` are deliberately absent: nullness survives
+/// sealing exactly. [`QueryRewriter::seal_expr`] returns early on a NULL
+/// literal and Bind leaves a NULL parameter untouched, so a NULL in a
+/// protected column is stored as SQL NULL and a non-NULL as a non-NULL
+/// envelope. `col IS NULL` therefore returns exactly the rows the client
+/// meant — no blind index is needed and none would help, so reporting it as
+/// an [`Unprotected`] site would refuse working SQL under `reject` and dilute
+/// the warning stream under `warn`. `IS DISTINCT FROM` is *not* exempt: it
+/// compares against the stored form like any other operator.
 fn searchable_operand(expr: &Expr, scope: &TableScope<'_>) -> Option<String> {
     let operands: [&Expr; 2] = match expr {
         Expr::BinaryOp { left, right, .. } => [left, right],
@@ -1088,8 +1105,6 @@ fn searchable_operand(expr: &Expr, scope: &TableScope<'_>) -> Option<String> {
         | Expr::Like { expr, .. }
         | Expr::ILike { expr, .. }
         | Expr::SimilarTo { expr, .. }
-        | Expr::IsNull(expr)
-        | Expr::IsNotNull(expr)
         | Expr::IsDistinctFrom(expr, _)
         | Expr::IsNotDistinctFrom(expr, _) => [expr, expr],
         _ => return None,
@@ -2997,6 +3012,44 @@ mod tests {
             let mut permissive = rewriter(catalog(true));
             assert!(rewritten_query(&mut permissive, sql).is_none(), "{sql}");
 
+            let mut strict = rewriter(strict_catalog(true));
+            let action = strict.on_frame(b'Q', &query_frame(sql)).unwrap();
+            assert!(refusal(&action).contains("searchable column email"), "{sql}");
+        }
+    }
+
+    /// Nullness survives sealing, so the two null tests are answered correctly
+    /// by the stored form and must not be reported as unprotected. Both modes
+    /// are checked through the same `unprotected` call site: silence under
+    /// `reject` is what proves there is no warning under `warn`.
+    #[test]
+    fn null_tests_over_searchable_columns_are_not_unprotected_sites() {
+        for sql in [
+            "SELECT id FROM users WHERE email IS NULL",
+            "SELECT id FROM users WHERE email IS NOT NULL",
+            "SELECT id FROM users WHERE id > 4 AND email IS NOT NULL",
+            "SELECT u.id FROM users u JOIN other o ON o.id = u.id AND u.email IS NULL",
+        ] {
+            let mut permissive = rewriter(catalog(true));
+            assert!(rewritten_query(&mut permissive, sql).is_none(), "{sql}");
+
+            let mut strict = rewriter(strict_catalog(true));
+            assert!(
+                matches!(strict.on_frame(b'Q', &query_frame(sql)).unwrap(), FrameAction::Relay),
+                "a null test matches correctly against the stored form: {sql}"
+            );
+        }
+    }
+
+    /// `IS DISTINCT FROM` is not in the same position as `IS NULL`: it
+    /// compares against the stored form like any other operator, so it stays a
+    /// signalled site.
+    #[test]
+    fn is_distinct_from_over_a_searchable_column_is_still_signalled() {
+        for sql in [
+            "SELECT id FROM users WHERE email IS DISTINCT FROM 'a@b.io'",
+            "SELECT id FROM users WHERE email IS NOT DISTINCT FROM 'a@b.io'",
+        ] {
             let mut strict = rewriter(strict_catalog(true));
             let action = strict.on_frame(b'Q', &query_frame(sql)).unwrap();
             assert!(refusal(&action).contains("searchable column email"), "{sql}");
