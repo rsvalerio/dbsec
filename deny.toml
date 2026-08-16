@@ -37,7 +37,21 @@ allow = [
     "Zlib",
 ]
 
-# ring vendors BoringSSL and has no single SPDX expression in its manifest.
+# No `[[licenses.clarify]]` entries here, for the same reason there are no
+# `advisories.ignore` entries: a clarification is a judgement about one crate in one
+# dependency tree, and shipping it in the baseline applies that judgement to every
+# consumer — including ones that never depended on the crate.
+#
+# A `ring` clarification lived here until forge-testbed ran `cargo deny` for the first
+# time, and the config failed to deserialize outright: cargo-deny 0.20 requires
+# `license-files` on a clarify table and the entry had none. Nothing had ever executed it —
+# ops carries no clarify block at all. Consumers needing one add it to their own vendored
+# copy, where the file hash can be checked against the version actually in their lockfile.
+
+# dbsec is such a consumer: `ring` is in this repo's Cargo.lock, it vendors BoringSSL, and
+# its manifest carries no single SPDX expression. The hash pins the LICENSE text of the
+# version the lockfile resolves to, so a `ring` bump that changes its licensing fails the
+# check instead of inheriting this judgement silently.
 [[licenses.clarify]]
 name = "ring"
 expression = "MIT AND ISC AND OpenSSL"
