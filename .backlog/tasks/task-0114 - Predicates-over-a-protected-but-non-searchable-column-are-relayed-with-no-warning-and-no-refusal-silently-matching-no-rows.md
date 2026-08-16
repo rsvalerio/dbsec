@@ -3,9 +3,10 @@ id: TASK-0114
 title: >-
   Predicates over a protected but non-searchable column are relayed with no
   warning and no refusal, silently matching no rows
-status: Triage
+status: Done
 assignee: []
 created_date: '2026-08-14 16:48'
+updated_date: '2026-08-14 20:40'
 labels:
   - code-review-rust
   - security
@@ -41,8 +42,8 @@ This contradicts the module's own stated rule (`crates/proxy/src/encrypt.rs:58`)
 
 ## Acceptance Criteria
 <!-- AC:BEGIN -->
-- [ ] #1 An equality predicate over an encrypt column with searchable = false is an on_unprotected site: warned under warn, refused under reject
-- [ ] #2 The same holds for IN lists, and for fpe and token columns
-- [ ] #3 Mask-only columns (transform = "none") stay silent, since their stored form is the plaintext and the predicate is correct as written
-- [ ] #4 Tests cover each transform kind under both on_unprotected settings
+- [x] #1 An equality predicate over an encrypt column with searchable = false is an on_unprotected site: warned under warn, refused under reject
+- [x] #2 The same holds for IN lists, and for fpe and token columns
+- [x] #3 Mask-only columns (transform = "none") stay silent, since their stored form is the plaintext and the predicate is correct as written
+- [x] #4 Tests cover each transform kind under both on_unprotected settings
 <!-- AC:END -->
