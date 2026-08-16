@@ -1569,9 +1569,30 @@ fn unwrap_casts(expr: &Expr) -> &Expr {
 /// literal at all. For BYTEA-form columns a `\x`-prefixed string is
 /// Postgres' hex input syntax, so it denotes the bytes it encodes rather than
 /// its own characters — sealing it verbatim would round-trip the hex text.
+///
+/// Every string-literal syntax Postgres accepts is matched, not just the
+/// ordinary `'...'` one. Missing any of them is a fail-open under the default
+/// `on_unprotected = "warn"`: the literal falls through to the
+/// [`Unprotected::UnsupportedValue`] gate, which under `warn` forwards the
+/// statement verbatim and lets the server store the plaintext. `E'...'` is the
+/// one that matters most in practice — many drivers emit it automatically for
+/// any string containing a backslash, so it needs no unusual client to reach.
+///
+/// Each variant carries content sqlparser has already *decoded*, which is what
+/// makes one shared handler correct: `E'o\'brien'` arrives as `o'brien` and
+/// `U&'d\0061t\+000061'` as `data`, so the bytes sealed are the bytes the
+/// server would have stored. `U&'...' UESCAPE '!'` is the sole gap and it does
+/// not reach here at all — sqlparser 0.53 cannot parse it, so it is caught
+/// earlier as [`Unprotected::Unparseable`] rather than silently mis-sealed.
 fn literal_plaintext(expr: &Expr, wire: WireForm) -> Option<Vec<u8>> {
     match unwrap_casts(expr) {
-        Expr::Value(Value::SingleQuotedString(s)) => Some(text_plaintext(s, wire)),
+        Expr::Value(
+            Value::SingleQuotedString(s)
+            | Value::EscapedStringLiteral(s)
+            | Value::UnicodeStringLiteral(s)
+            | Value::NationalStringLiteral(s),
+        ) => Some(text_plaintext(s, wire)),
+        Expr::Value(Value::DollarQuotedString(s)) => Some(text_plaintext(&s.value, wire)),
         Expr::Value(Value::Number(n, _)) => Some(n.as_bytes().to_vec()),
         _ => None,
     }
@@ -2136,6 +2157,59 @@ mod tests {
         .expect("rewritten");
         assert!(!sql.contains(&hex), "the plaintext bytes are still on the wire: {sql}");
         assert_eq!(open_hex_literal(&sql, false), b"alice@example.com");
+    }
+
+    /// Postgres has five string-literal syntaxes and only one of them is
+    /// `'...'`. Each of the others reached the `UnsupportedValue` gate, which
+    /// under the default `warn` forwards the statement verbatim — so the
+    /// server decoded the literal and stored the plaintext in a column the
+    /// operator had marked protected.
+    ///
+    /// Each case asserts on the *decoded* content, which is the part that
+    /// makes this more than a variant list: `E'o\'brien'` must seal
+    /// `o'brien`, not the source text, or the column would round-trip a
+    /// backslash the client never sent.
+    #[test]
+    fn every_postgres_string_literal_syntax_is_sealed() {
+        for (literal, plaintext) in [
+            (r"E'o\'brien@secret.test'", "o'brien@secret.test"),
+            (r"E'tab\there@secret.test'", "tab\there@secret.test"),
+            ("$$alice@secret.test$$", "alice@secret.test"),
+            ("$tag$bob@secret.test$tag$", "bob@secret.test"),
+            (r"U&'d\0061ve@secret.test'", "dave@secret.test"),
+            ("N'nina@secret.test'", "nina@secret.test"),
+        ] {
+            let mut rewriter = rewriter(catalog(false));
+            let sql = rewritten_query(
+                &mut rewriter,
+                &format!("INSERT INTO users (id, email) VALUES (1, {literal})"),
+            )
+            .unwrap_or_else(|| panic!("{literal} was not rewritten at all"));
+
+            assert!(!sql.contains("secret.test"), "{literal} left plaintext on the wire: {sql}");
+            assert_eq!(
+                open_hex_literal(&sql, false),
+                plaintext.as_bytes(),
+                "{literal} sealed the wrong bytes"
+            );
+        }
+    }
+
+    /// `E'\\x41'` decodes to the four characters `\x41`, which for a BYTEA
+    /// column is Postgres' hex input syntax for one byte. The decode and the
+    /// hex read have to compose in that order, or the column stores the
+    /// literal text instead of the byte it denotes.
+    #[test]
+    fn an_escape_string_holding_bytea_hex_syntax_seals_the_bytes_it_denotes() {
+        let mut rewriter = rewriter(catalog(false));
+        let hex = hex::encode("alice@secret.test");
+        let sql = rewritten_query(
+            &mut rewriter,
+            &format!(r"INSERT INTO users (email) VALUES (E'\\x{hex}')"),
+        )
+        .expect("rewritten");
+        assert!(!sql.contains(&hex), "the plaintext bytes are still on the wire: {sql}");
+        assert_eq!(open_hex_literal(&sql, false), b"alice@secret.test");
     }
 
     #[test]
@@ -3470,6 +3544,14 @@ mod tests {
                 "UPDATE users SET email 'gina@secret.test'",
                 "SET search_path TO tenant7",
                 "INSERT INTO users (email) VALUES ('hank@secret.test')",
+                // The non-`'...'` literal syntaxes. These now seal rather than
+                // pass through, but they must not reach the log on the way —
+                // and wrapping one in a function call puts it back on a
+                // passthrough site, where the value is logged if anything is.
+                r"INSERT INTO users (email) VALUES (lower(E'ivan\'s@secret.test'))",
+                "INSERT INTO users (email) VALUES (lower($$judy@secret.test$$))",
+                r"UPDATE users SET email = E'kate\'s@secret.test'",
+                r"SELECT id FROM users WHERE email LIKE E'liam\'s@secret.test%'",
             ] {
                 // Errors are the point of some of these; only the log matters.
                 drop(rewriter.on_frame(b'Q', &query_frame(sql)));
@@ -3478,8 +3560,10 @@ mod tests {
 
         let events = captured.0.lock().unwrap().join("\n");
         assert!(events.contains("passing through unencrypted"), "the sites did emit: {events}");
-        for plaintext in ["alice", "bob", "carol", "dave", "erin", "fred", "gina", "hank", "secret"]
-        {
+        for plaintext in [
+            "alice", "bob", "carol", "dave", "erin", "fred", "gina", "hank", "ivan", "judy",
+            "kate", "liam", "secret",
+        ] {
             assert!(!events.contains(plaintext), "{plaintext} reached the log:\n{events}");
         }
     }

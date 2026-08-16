@@ -3,9 +3,10 @@ id: TASK-0084
 title: >-
   E'...' and dollar/unicode/national string literals are never sealed, writing
   plaintext under the default warn mode
-status: Triage
+status: Done
 assignee: []
 created_date: '2026-08-14 14:06'
+updated_date: '2026-08-16 20:32'
 labels:
   - security-review
   - security
@@ -30,7 +31,7 @@ priority: high
 
 ## Acceptance Criteria
 <!-- AC:BEGIN -->
-- [ ] #1 E-string, dollar-quoted, unicode and national string literals assigned to a protected column are sealed
-- [ ] #2 A regression test inserts an E-string into a protected column and asserts ciphertext at rest
-- [ ] #3 The plaintext-in-log test is extended to cover an E-string value
+- [x] #1 E-string, dollar-quoted, unicode and national string literals assigned to a protected column are sealed
+- [x] #2 A regression test inserts an E-string into a protected column and asserts ciphertext at rest
+- [x] #3 The plaintext-in-log test is extended to cover an E-string value
 <!-- AC:END -->
