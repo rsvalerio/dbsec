@@ -1,11 +1,19 @@
-# reason: dbsec pins the ring LICENSE hash in [[licenses.clarify]]; the forge baseline states the expression only, and without the file hash cargo-deny cannot confirm the vendored BoringSSL license text that this repo's Cargo.lock actually resolves to.
+# reason: ring is in this repo's Cargo.lock and vendors BoringSSL, so dbsec adds the [[licenses.clarify]] entry the forge baseline deliberately leaves to consumers, pinning the LICENSE hash for the version the lockfile resolves to. Purely additive: the baseline comment is kept verbatim, so a forge-side edit to it still fails the check.
 --- forge/config/deny.toml
 +++ deny.toml
-@@ -41,6 +41,7 @@
- [[licenses.clarify]]
- name = "ring"
- expression = "MIT AND ISC AND OpenSSL"
-+license-files = [{ path = "LICENSE", hash = 0xbd0eed23 }]
+@@ -48,6 +48,15 @@
+ # ops carries no clarify block at all. Consumers needing one add it to their own vendored
+ # copy, where the file hash can be checked against the version actually in their lockfile.
 
++# dbsec is such a consumer: `ring` is in this repo's Cargo.lock, it vendors BoringSSL, and
++# its manifest carries no single SPDX expression. The hash pins the LICENSE text of the
++# version the lockfile resolves to, so a `ring` bump that changes its licensing fails the
++# check instead of inheriting this judgement silently.
++[[licenses.clarify]]
++name = "ring"
++expression = "MIT AND ISC AND OpenSSL"
++license-files = [{ path = "LICENSE", hash = 0xbd0eed23 }]
++
  [bans]
  multiple-versions = "warn"
+ wildcards = "allow"
