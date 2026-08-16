@@ -392,6 +392,7 @@ dependencies = [
  "dbsec-core",
  "futures-util",
  "hex",
+ "proptest",
  "rand 0.8.7",
  "rcgen",
  "rustls",

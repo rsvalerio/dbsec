@@ -35,6 +35,7 @@ workspace = true
 
 [dev-dependencies]
 futures-util = { workspace = true }
+proptest = { workspace = true }
 rcgen = "0.13"
 sqlx = { version = "0.9.0", default-features = false, features = ["runtime-tokio", "tls-rustls-aws-lc-rs", "postgres"] }
 tempfile = { workspace = true }

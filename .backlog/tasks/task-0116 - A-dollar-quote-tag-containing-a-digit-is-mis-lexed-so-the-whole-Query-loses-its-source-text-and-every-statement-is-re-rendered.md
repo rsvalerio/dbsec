@@ -3,9 +3,10 @@ id: TASK-0116
 title: >-
   A dollar-quote tag containing a digit is mis-lexed, so the whole Query loses
   its source text and every statement is re-rendered
-status: Triage
+status: Done
 assignee: []
 created_date: '2026-08-14 16:49'
+updated_date: '2026-08-14 21:34'
 labels:
   - code-review-rust
   - readability
@@ -48,8 +49,8 @@ More broadly: `statement_ranges` / `skip_quoted` / `skip_dollar_quoted` / `skip_
 
 ## Acceptance Criteria
 <!-- AC:BEGIN -->
-- [ ] #1 skip_dollar_quoted accepts a tag whose non-leading characters include digits, matching PostgreSQL identifier rules
-- [ ] #2 A Query mixing a rewritten INSERT with a $tag1$…$tag1$ statement preserves the untouched statement's source text, comments included
-- [ ] #3 A ; inside a dollar-quoted body with a digit-bearing tag does not split the statement
-- [ ] #4 A property test asserts statement_ranges' ranges re-parse to the same statement list sqlparser produces for the whole text
+- [x] #1 skip_dollar_quoted accepts a tag whose non-leading characters include digits, matching PostgreSQL identifier rules
+- [x] #2 A Query mixing a rewritten INSERT with a $tag1$…$tag1$ statement preserves the untouched statement's source text, comments included
+- [x] #3 A ; inside a dollar-quoted body with a digit-bearing tag does not split the statement
+- [x] #4 A property test asserts statement_ranges' ranges re-parse to the same statement list sqlparser produces for the whole text
 <!-- AC:END -->
