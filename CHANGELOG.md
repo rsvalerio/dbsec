@@ -2,6 +2,13 @@
 All notable changes to this project will be documented in this file. See [conventional commits](https://www.conventionalcommits.org/) for commit guidelines.
 
 - - -
+## v0.1.3 - 2026-08-16
+#### Bug Fixes
+- (**encrypt**) signal predicates over protected columns that have no index (#7) - (24a8afc) - Rodrigo Valeri, *Claude Sonnet 4.6*
+- (**encrypt**) stop refusing IS NULL / IS NOT NULL on searchable columns - (2e199d0) - Rodrigo Valerio, *Claude Sonnet 4.6*
+
+- - -
+
 ## v0.1.2 - 2026-08-16
 #### Bug Fixes
 - (**portal**) keep a pipelined Close from orphaning its in-flight Execute - (71935b1) - Rodrigo Valerio, *Claude Sonnet 4.6*
