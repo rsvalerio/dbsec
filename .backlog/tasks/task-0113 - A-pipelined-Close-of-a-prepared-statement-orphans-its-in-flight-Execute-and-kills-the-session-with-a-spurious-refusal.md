@@ -3,9 +3,10 @@ id: TASK-0113
 title: >-
   A pipelined Close of a prepared statement orphans its in-flight Execute and
   kills the session with a spurious refusal
-status: Triage
+status: Done
 assignee: []
 created_date: '2026-08-14 16:48'
+updated_date: '2026-08-14 21:42'
 labels:
   - code-review-rust
   - idioms-correctness
@@ -45,8 +46,8 @@ The PostgreSQL JDBC driver emits `Close` for a statement it has decided not to c
 
 ## Acceptance Criteria
 <!-- AC:BEGIN -->
-- [ ] #1 A pipelined Parse/Bind/Describe/Execute/Close S/Sync batch decrypts its DataRows with the positions the Describe returned, and does not refuse or close the session
-- [ ] #2 A portal Close pipelined ahead of its own Execute's results is covered by the same test
-- [ ] #3 A regression test in portal.rs drives close_statement between expect_execute and row_source and asserts RowSource::Portal
-- [ ] #4 Error::UndescribedRow is still raised for a genuine Execute of a statement the server never described
+- [x] #1 A pipelined Parse/Bind/Describe/Execute/Close S/Sync batch decrypts its DataRows with the positions the Describe returned, and does not refuse or close the session
+- [x] #2 A portal Close pipelined ahead of its own Execute's results is covered by the same test
+- [x] #3 A regression test in portal.rs drives close_statement between expect_execute and row_source and asserts RowSource::Portal
+- [x] #4 Error::UndescribedRow is still raised for a genuine Execute of a statement the server never described
 <!-- AC:END -->
