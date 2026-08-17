@@ -1106,7 +1106,7 @@ pub mod tests {
         assert!(decryptor.on_frame(b'D', &row).unwrap().body().is_none());
 
         let plaintext = vec![b'x'; 64 * 1024];
-        let ct = envelope::encrypt(&KEY, &KEY_ID, &plaintext).unwrap();
+        let ct = envelope::encrypt(&KEY, &KEY_ID, &cell_context(), &plaintext).unwrap();
         let row = data_row(&[Some(&ct)]);
         let rewritten = decryptor.on_frame(b'D', &row).unwrap().body().unwrap();
         assert_eq!(pgwire::parse_data_row(&rewritten).unwrap()[0], Some(plaintext.as_slice()));
