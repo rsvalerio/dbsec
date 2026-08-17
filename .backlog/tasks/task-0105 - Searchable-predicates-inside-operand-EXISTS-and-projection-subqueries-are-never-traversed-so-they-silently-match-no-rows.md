@@ -3,9 +3,10 @@ id: TASK-0105
 title: >-
   Searchable predicates inside operand / EXISTS / projection subqueries are
   never traversed, so they silently match no rows and evade reject mode
-status: Triage
+status: Done
 assignee: []
 created_date: '2026-08-14 18:16'
+updated_date: '2026-08-17 16:42'
 labels:
   - security-review
   - security
@@ -39,9 +40,9 @@ task-0037 handled the direct `IN`/join/CTE/set-op forms; this residual operand-s
 
 ## Acceptance Criteria
 <!-- AC:BEGIN -->
-- [ ] #1 A searchable equality inside a scalar subquery, EXISTS, and IN-(SELECT) body is rewritten to its blind-index form
-- [ ] #2 A searchable equality inside a projection subquery is rewritten
-- [ ] #3 Any of the above that cannot be rewritten reaches `unprotected()` and is refused under `reject`
-- [ ] #4 Row-wise `WHERE (col, ...) IN (...)` over a searchable column is rewritten or flagged, never silently relayed
-- [ ] #5 A regression test covers the `NOT IN (subquery)` mass-delete amplifier
+- [x] #1 A searchable equality inside a scalar subquery, EXISTS, and IN-(SELECT) body is rewritten to its blind-index form
+- [x] #2 A searchable equality inside a projection subquery is rewritten
+- [x] #3 Any of the above that cannot be rewritten reaches `unprotected()` and is refused under `reject`
+- [x] #4 Row-wise `WHERE (col, ...) IN (...)` over a searchable column is rewritten or flagged, never silently relayed
+- [x] #5 A regression test covers the `NOT IN (subquery)` mass-delete amplifier
 <!-- AC:END -->
