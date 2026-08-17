@@ -23,11 +23,23 @@ and masking for PostgreSQL. Not a framework.
 ## Ciphertext envelope
 
 ```
-"DBS1" | key_id (16B) | nonce (12B) | AES-256-GCM ciphertext+tag
+"DBS2" | key_id (16B) | nonce (12B) | AES-256-GCM ciphertext+tag
 ```
 
 Searchable columns prepend `hmac_sha256(index_key, plaintext)[..32]`. Stored as BYTEA.
 Non-magic values pass through untouched (gradual migration of existing plaintext).
+
+The GCM associated data is `key_id || schema.table.column`, not the key id alone. Every
+encrypted column in a process seals under the same active DEK and so stamps the same key
+id; binding only that would authenticate a blob anywhere the key reaches, letting anyone
+who can write stored bytes paste one column's ciphertext into another and have it decrypt
+cleanly. Binding the column means a relocated value fails authentication instead. The
+binding is per column, not per cell — moving a value between two rows of the *same* column
+is still undetected, because neither data path knows a row's identity (the read path
+matches result columns by `(table oid, attnum)` and never sees a primary key).
+
+`"DBS1"` is the pre-context version: same header, key id alone as associated data. See
+"Upgrading DBS1 rows to the bound envelope" below.
 
 ## Core abstraction
 
@@ -160,6 +172,12 @@ TLS: `MaybeTls` stream enum both hops. Downstream handles `SSLRequest` from clie
   parameters and `SET search_path`, and once the default no longer holds it stops
   resolving unqualified names at all; that is an `on_unprotected` site too. Qualifying
   either the config or the SQL removes the question.
+- **Ciphertext relocation is detected across columns, not across rows.** The envelope AAD
+  binds `schema.table.column`, so pasting a stored value into a different column or table
+  fails authentication; pasting it into the *same* column of another row does not. Binding
+  a row identity would need a primary key on both paths, and the read path has none — it
+  matches result columns by `(table oid, attnum)` and never sees the key. Rows written
+  before the binding (`DBS1`) have neither guarantee until they are re-encrypted.
 - FF1 on tiny domains (<6 digits) is brute-forceable — refuse in config validation.
 - Rotating the blind-index/FPE/token keys breaks determinism; only DEKs rotate freely.
   Rotation is an operator re-index, not a proxy feature — see below.
@@ -172,6 +190,16 @@ TLS: `MaybeTls` stream enum both hops. Downstream handles `SSLRequest` from clie
   start) and otherwise fails closed with `Error::KeyExhausted` rather than reusing a spent
   key. A counter-based nonce would remove the birthday bound but needs durable counter
   state across restarts; that trade is not taken.
+- **The proxy must not be run under a pre-forking supervisor.** The per-key budget bounds
+  nonce collisions inside one generator's stream; it says nothing about two generators
+  emitting the *same* stream. Nonces come from `thread_rng` — thread-local userspace
+  ChaCha12 state — so a `fork()` after a DEK is resolved gives both children identical
+  nonces under one key, each staying inside its budget while colliding with the other, and
+  GCM nonce reuse is retroactive over every row under that DEK. `main` builds a
+  multi-thread tokio runtime and never forks, so this is a deployment constraint rather
+  than a live bug. Supporting a forking model means reseeding after fork, or moving the
+  nonce draw to `OsRng` (fork-safe, since the kernel holds the state) and paying a
+  `getrandom` syscall per protected value.
 - Masking is enforced only for traffic through this proxy.
 
 ## Deterministic key rotation and compromise recovery
@@ -205,6 +233,28 @@ version writes use) plus a `versions` map. The proxy reads only `current`; the o
 versions stay so the previous key material survives a rotation and the migration can find
 it.
 
+### Vault token lease, and why revocation needs a restart
+
+The proxy authenticates once at startup with the configured static token. A watchdog task
+asks Vault about that token once a minute (`auth/token/lookup-self`) and renews it
+(`auth/token/renew-self`) when under ten minutes of lease remain, so a TTL'd token can be
+used without it quietly expiring mid-run. A lease that is running out and cannot be
+extended is logged at WARN on every check, naming the remaining TTL — deliberately loud,
+because the key caches otherwise hide an expired token entirely: everything already cached
+keeps serving and only the first cache miss fails, at ERROR, with nothing to connect it to
+the token. Deployments end up using root tokens because of exactly that.
+
+**Revoking the token, or rotating a key in Vault, has no effect on a running proxy.** The
+DEK and index-key caches are grow-only and carry no TTL, so a key resolved once is served
+from memory for the life of the process. This is a decision, not an omission: a cache TTL
+would put a Vault round-trip on the relay path at unpredictable moments and make Vault a
+per-request availability dependency, and it buys nothing here — deterministic index keys
+*must not* change under a running column, and re-fetching a DEK returns the same DEK.
+
+So the runbook is: **any Vault-side revocation or rotation is followed by a proxy
+restart.** Until the restart, treat the running process as still holding every key it has
+already resolved.
+
 ### If a deterministic key is exposed
 
 Treat it as disclosure of the column's equality and frequency distribution: the blind
@@ -212,7 +262,8 @@ index becomes an offline oracle against the whole column, and FPE values become 
 by whoever holds the key. Encryption of the underlying value is unaffected — the DEK is a
 different key — so this is a linkability compromise, not a plaintext one.
 
-1. **Stop the bleeding.** Revoke the Vault token or policy that leaked. Read
+1. **Stop the bleeding.** Revoke the Vault token or policy that leaked, then restart every
+   proxy that used it — revocation does not reach a running one (see above). Read
    `{path}/index_keys/{name}` and confirm which versions existed at the time.
 2. **Take the column out of search.** Set `searchable = false` (or drop `transform` to
    `"none"` with a mask) and restart. Writes stop emitting an index under the exposed key;
@@ -238,6 +289,33 @@ The honest summary: steps 4 and 5 are a migration the operator writes. What chan
 that the key material is versioned rather than stored under one unversioned name, so the
 migration has something to point at, and a partially completed rotation is a legible state
 rather than a lost key.
+
+### Upgrading DBS1 rows to the bound envelope
+
+`DBS1` values — everything written before the column binding — keep opening, under any
+column, so an upgrade needs no migration step to stay *readable*. What they do not get is
+the relocation protection: their tag was computed over the key id alone, and a tag cannot
+be extended after the fact. A stored `DBS1` blob therefore still decrypts wherever its DEK
+reaches, which is the whole point of moving to `DBS2`.
+
+Closing that gap means re-encrypting, and re-encryption is a read-then-write through the
+proxy — nothing else has the DEK and the column context together:
+
+1. **Upgrade and restart.** From then on every write emits `DBS2`; reads accept both.
+2. **Rewrite each protected column in batches**, through the proxy, keyed by primary key:
+   `UPDATE t SET c = c WHERE id BETWEEN ? AND ?` does *not* work — the value never leaves
+   the server. The rewrite has to `SELECT` the batch (the proxy decrypts), then `UPDATE`
+   with the returned plaintext as a bound parameter (the proxy re-seals it, bound to the
+   column). Batch small enough that one transaction is cheap to retry.
+3. **Confirm the sweep.** `DBS2` is `\x44425332` at the head of the BYTEA column (after the
+   32-byte blind index, for searchable columns), so
+   `SELECT count(*) FROM t WHERE substring(c from 1 for 4) <> '\x44425332'` — offset by 32
+   where an index prefix is present — counts what is left. Zero means the column is bound.
+4. **Only then** treat cross-column relocation as detected for that column. Until the
+   count is zero, a single un-upgraded row is a usable relocation source.
+
+Rotating the DEK does not do this for you: DEKs roll per start, but existing rows are not
+rewritten, and an old `DBS1` row keeps its old key id and its old (unbound) tag.
 
 ### Retiring the shared-map layout
 

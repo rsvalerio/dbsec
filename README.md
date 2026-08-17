@@ -4,7 +4,9 @@ Transparent PostgreSQL proxy for field-level encryption — a deliberately small
 Acra replacement. A library (`dbsec-core`) does the work; the `dbsec` binary is
 a thin tokio TCP wrapper around it.
 
-- AES-256-GCM ciphertext envelope with key ids (rotation-friendly), Vault/OpenBao-backed keys
+- AES-256-GCM ciphertext envelope with key ids (rotation-friendly) and the column bound
+  into the associated data, so stored bytes do not authenticate in another column;
+  Vault/OpenBao-backed keys
 - Searchable encryption via deterministic HMAC blind index
 - Storage-free pseudonymization (FF1 FPE + HMAC tokens) and read-path masking
 - TLS on both hops (rustls), flat TOML config, PostgreSQL only
@@ -87,6 +89,19 @@ UPDATE …` commit its `UPDATE` behind an error saying the statement failed.
 Closing the connection is what makes the backend roll that implicit transaction
 back. A refused *write*, by contrast, never reaches the backend at all, so
 there is nothing to stop and the session continues.
+
+**Do not run the proxy under a pre-forking supervisor.** GCM nonces come from a
+userspace generator whose state is per thread, so a `fork()` after the process
+has resolved its DEK gives both children the same nonce stream under the same
+key — and GCM nonce reuse is retroactive over every row stored under that key.
+The proxy is a single multi-threaded process that never forks; run it that way,
+and scale by running independent instances rather than by forking one.
+
+Two more operational constraints worth knowing before an incident: revoking a
+Vault token or rotating a key in Vault does **not** reach a running proxy (the
+key caches have no TTL — restart it), and ciphertext relocation is detected
+across columns and tables but not between rows of the same column. Both are
+covered in `plans/PLAN.md`.
 
 `COPY` is never encrypted. `COPY ... FROM` carries its payload in `CopyData`
 frames rather than SQL, and `COPY ... TO` bypasses the read path — so a
