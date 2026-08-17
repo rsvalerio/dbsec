@@ -57,7 +57,10 @@ build: ## Compile (debug)
 release: ## Compile (release)
 	cargo build --release --bin dbsec
 
-run: ## Run the proxy
+# Startup is fail-closed: with no `./dbsec.toml` the proxy refuses to run
+# rather than relaying in plaintext. `cargo run --bin dbsec -- --plain-relay`
+# is the deliberate way to start without one.
+run: ## Run the proxy (needs ./dbsec.toml)
 	cargo run --bin dbsec
 
 test: ## Run the test suite

@@ -94,6 +94,62 @@ protected column leaves as its stored form, which for a mask-only column is the
 *unmasked* value. Both are `on_unprotected` sites; bulk-load through `INSERT`,
 or seal the data before it reaches the proxy.
 
+## Deploying the proxy
+
+**Startup is fail-closed.** `dbsec` with no argument loads `./dbsec.toml`, and if
+that file is not there it refuses to start. The built-in defaults configure no
+columns and no TLS, so falling back to them would leave a transparent plaintext
+relay whose only evidence is `protected_columns=0` in one log line — and the
+ways to get there are mundane: a systemd unit whose `WorkingDirectory` moved, a
+container whose config volume mounted somewhere else. A deployment that really
+does want a bare relay says so:
+
+```
+dbsec /etc/dbsec/dbsec.toml   # explicit path — the shape to prefer in a unit file
+dbsec --plain-relay           # no config, no protection, on purpose
+```
+
+**The config file is a secret file when it carries a secret.** `keys_file`, the
+Vault `token_file` and the downstream TLS key are refused unless they are
+readable only by their owner (`chmod 600`), and the config itself joins them the
+moment it holds an inline `[vault] token` or a `control_dsn` with a password.
+Prefer `token_file` over an inline `token` so the credential is not in the file
+that ships with the deployment at all. A config that carries no secret is an
+ordinary file and its mode is not checked.
+
+**Core dumps are disabled.** The process holds every DEK, every deterministic
+index key and the Vault token in memory, and a core file writes all of it to
+disk at once — the `Drop`-based zeroization the crate relies on never runs on an
+abort. Startup therefore sets `RLIMIT_CORE` to 0 and clears the process'
+`dumpable` attribute (`prctl(PR_SET_DUMPABLE, 0)`), which is what stops a
+`kernel.core_pattern` piping to `systemd-coredump` or `apport` from collecting
+the image anyway; clearing it also blocks a `ptrace` attach from another process
+running as the same user. `dbsec --allow-core-dumps` turns both off for
+debugging a crash — with the understanding that the resulting core is key
+material.
+
+**Swap is the other half, and it is a host setting.** Key material paged out
+lands on disk just as a core file would. The proxy deliberately does not call
+`mlockall` itself: to be worth anything it would have to cover every allocation
+the process ever makes, needs an `RLIMIT_MEMLOCK` only the deployment can grant,
+and a partial lock would read as a guarantee it is not. Run the proxy on a host
+with no swap, or with encrypted swap — `cryptsetup` with a random key per boot,
+which is what a swap partition holding this process' pages is worth. Systemd
+covers the rest of the process' surface:
+
+```ini
+# /etc/systemd/system/dbsec.service
+[Service]
+ExecStart=/usr/local/bin/dbsec /etc/dbsec/dbsec.toml
+WorkingDirectory=/etc/dbsec
+LimitCORE=0
+MemoryDenyWriteExecute=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=yes
+NoNewPrivileges=yes
+```
+
 ## Develop
 
 ```
