@@ -121,9 +121,9 @@ use std::sync::Arc;
 use dbsec_core::pgwire;
 use dbsec_core::transform::{FieldTransform, WireForm};
 use sqlparser::ast::{
-    Assignment, AssignmentTarget, Expr, Ident, Insert, JoinConstraint, JoinOperator, ObjectName,
-    OnConflict, OnConflictAction, OnInsert, Query, Select, SetExpr, Statement, TableFactor,
-    TableWithJoins, Value,
+    Assignment, AssignmentTarget, Expr, FunctionArg, FunctionArgExpr, GroupByExpr, Ident, Insert,
+    JoinConstraint, JoinOperator, ObjectName, OnConflict, OnConflictAction, OnInsert, Query,
+    Select, SelectItem, SetExpr, Statement, TableFactor, TableWithJoins, Value,
 };
 use sqlparser::dialect::PostgreSqlDialect;
 use sqlparser::parser::{Parser, ParserError};
@@ -547,7 +547,12 @@ impl QueryRewriter {
                 }
                 let scope = self.scope(std::slice::from_ref(table))?;
                 if let Some(selection) = selection {
-                    changed |= self.rewrite_selection(selection, &scope, params)?;
+                    changed |= self.rewrite_predicate(selection, &scope, params)?;
+                }
+                // `SET x = (SELECT ...)` on an unprotected column still hides a
+                // query whose own predicates need rewriting.
+                for assignment in assignments.iter_mut() {
+                    changed |= self.rewrite_nested_queries(&mut assignment.value, params)?;
                 }
                 Ok(changed)
             }
@@ -560,7 +565,7 @@ impl QueryRewriter {
                 let scope = self.scope(tables)?;
                 let mut changed = false;
                 if let Some(selection) = delete.selection.as_mut() {
-                    changed |= self.rewrite_selection(selection, &scope, params)?;
+                    changed |= self.rewrite_predicate(selection, &scope, params)?;
                 }
                 Ok(changed)
             }
@@ -795,6 +800,11 @@ impl QueryRewriter {
             }
         }
         changed |= self.rewrite_set_expr(&mut query.body, params)?;
+        if let Some(order_by) = query.order_by.as_mut() {
+            for order in &mut order_by.exprs {
+                changed |= self.rewrite_nested_queries(&mut order.expr, params)?;
+            }
+        }
         Ok(changed)
     }
 
@@ -845,7 +855,135 @@ impl QueryRewriter {
             }
         }
         for predicate in [select.selection.as_mut(), select.having.as_mut()].into_iter().flatten() {
-            changed |= self.rewrite_selection(predicate, &scope, params)?;
+            changed |= self.rewrite_predicate(predicate, &scope, params)?;
+        }
+        // Subqueries sitting in an *expression* rather than in FROM. These
+        // carry their own FROM, so they are walked by `rewrite_query` against
+        // their own scope; the predicate pass above deliberately stops at the
+        // subquery boundary, which is what keeps each query rewritten once.
+        for expr in select_expressions(select) {
+            changed |= self.rewrite_nested_queries(expr, params)?;
+        }
+        Ok(changed)
+    }
+
+    /// A predicate owned by a statement or select: rewritten against its own
+    /// scope, then swept for nested queries.
+    ///
+    /// Both halves are needed at every site that owns a `WHERE`, and keeping
+    /// them behind one call is what stops a site being given only one of them
+    /// — which is exactly how `DELETE` and `UPDATE` came to walk their
+    /// predicates without ever crossing into a subquery.
+    fn rewrite_predicate(
+        &self,
+        expr: &mut Expr,
+        scope: &TableScope<'_>,
+        params: &mut ParamTransforms,
+    ) -> Result<bool, Rejection> {
+        let mut changed = self.rewrite_selection(expr, scope, params)?;
+        changed |= self.rewrite_nested_queries(expr, params)?;
+        Ok(changed)
+    }
+
+    /// Rewrites every query nested inside an expression, and nothing else.
+    ///
+    /// The counterpart to [`Self::rewrite_selection`], which rewrites
+    /// predicates inside one scope and never crosses a subquery boundary.
+    /// Splitting the two jobs this way is what makes the traversal safe:
+    /// each [`Query`] is reached from exactly one place, so no predicate can
+    /// be rewritten twice. Recursion into a nested query stops here because
+    /// [`Self::rewrite_query`] walks its insides itself.
+    ///
+    /// Before this existed, `rewrite_select` descended only into FROM-clause
+    /// derived tables, CTE bodies and set-operation branches. A searchable
+    /// equality inside a scalar subquery, an `EXISTS`, or a projection item
+    /// was left comparing the client's plaintext against the stored
+    /// `blind_index || envelope` — matching nothing, and never reaching
+    /// [`Self::unprotected`], so `reject` did not flag it either.
+    ///
+    /// "Matches nothing" is not a safe failure mode. `DELETE FROM t WHERE id
+    /// NOT IN (SELECT id FROM users WHERE email = '...')` turns an empty
+    /// subquery result into `NOT IN (empty)`, which is true for every row, so
+    /// the statement deletes the whole table.
+    fn rewrite_nested_queries(
+        &self,
+        expr: &mut Expr,
+        params: &mut ParamTransforms,
+    ) -> Result<bool, Rejection> {
+        let mut changed = false;
+        // The children to walk, gathered first: a closure capturing `changed`
+        // would borrow it for the whole match.
+        let mut children: Vec<&mut Expr> = Vec::new();
+        match expr {
+            // A query boundary: `rewrite_query` takes it from here, so the
+            // walk deliberately does not descend past this point.
+            Expr::Subquery(query) | Expr::Exists { subquery: query, .. } => {
+                return self.rewrite_query(query, params);
+            }
+            Expr::InSubquery { expr: operand, subquery, .. } => {
+                changed |= self.rewrite_query(subquery, params)?;
+                children.push(operand.as_mut());
+            }
+            Expr::BinaryOp { left, right, .. }
+            | Expr::AnyOp { left, right, .. }
+            | Expr::AllOp { left, right, .. }
+            | Expr::IsDistinctFrom(left, right)
+            | Expr::IsNotDistinctFrom(left, right) => {
+                children.push(left.as_mut());
+                children.push(right.as_mut());
+            }
+            Expr::UnaryOp { expr: inner, .. }
+            | Expr::Nested(inner)
+            | Expr::Cast { expr: inner, .. }
+            | Expr::IsNull(inner)
+            | Expr::IsNotNull(inner)
+            | Expr::IsTrue(inner)
+            | Expr::IsNotTrue(inner)
+            | Expr::IsFalse(inner)
+            | Expr::IsNotFalse(inner)
+            | Expr::Collate { expr: inner, .. } => children.push(inner.as_mut()),
+            Expr::InList { expr: operand, list, .. } => {
+                children.push(operand.as_mut());
+                children.extend(list.iter_mut());
+            }
+            Expr::Between { expr: operand, low, high, .. } => {
+                children.push(operand.as_mut());
+                children.push(low.as_mut());
+                children.push(high.as_mut());
+            }
+            Expr::Like { expr: operand, pattern, .. }
+            | Expr::ILike { expr: operand, pattern, .. }
+            | Expr::SimilarTo { expr: operand, pattern, .. } => {
+                children.push(operand.as_mut());
+                children.push(pattern.as_mut());
+            }
+            Expr::Tuple(items) => children.extend(items.iter_mut()),
+            Expr::Case { operand, conditions, results, else_result } => {
+                children.extend(operand.iter_mut().map(AsMut::as_mut));
+                children.extend(else_result.iter_mut().map(AsMut::as_mut));
+                children.extend(conditions.iter_mut());
+                children.extend(results.iter_mut());
+            }
+            Expr::Function(function) => {
+                if let sqlparser::ast::FunctionArguments::List(list) = &mut function.args {
+                    for argument in &mut list.args {
+                        let (FunctionArg::Named { arg, .. }
+                        | FunctionArg::ExprNamed { arg, .. }
+                        | FunctionArg::Unnamed(arg)) = argument;
+                        if let FunctionArgExpr::Expr(inner) = arg {
+                            children.push(inner);
+                        }
+                    }
+                }
+            }
+            // Everything else is a leaf, or a shape that cannot hold a query.
+            // A miss here leaves the pre-existing behaviour rather than
+            // opening a new hole, and an *outer* predicate over a protected
+            // column is still signalled by `rewrite_selection`.
+            _ => {}
+        }
+        for child in children {
+            changed |= self.rewrite_nested_queries(child, params)?;
         }
         Ok(changed)
     }
@@ -933,7 +1071,19 @@ impl QueryRewriter {
         scope: &TableScope<'_>,
         params: &mut ParamTransforms,
     ) -> Result<bool, Rejection> {
-        let Some(transform) = column_ref(scope, column).cloned() else { return Ok(false) };
+        let Some(transform) = column_ref(scope, column).cloned() else {
+            // Row-wise `(a, b) IN ((..), (..))`: no single transform covers a
+            // row constructor, so it cannot be rewritten — but it still has to
+            // be reported rather than relayed to match nothing.
+            if let Some((column, searchable)) = protected_column(column, scope) {
+                self.unprotected(&if searchable {
+                    Unprotected::Predicate { column, shape: "row-wise IN list" }
+                } else {
+                    Unprotected::UnindexedPredicate { column, shape: "row-wise IN list" }
+                })?;
+            }
+            return Ok(false);
+        };
         if !transform.supports_search() {
             // Same as `rewrite_equality`: no index to compare against, so
             // every element would be tested against the stored form.
@@ -1236,10 +1386,23 @@ fn protected_operand(expr: &Expr, scope: &TableScope<'_>) -> Option<(String, boo
         | Expr::IsNotDistinctFrom(expr, _) => [expr, expr],
         _ => return None,
     };
-    operands.into_iter().find_map(|operand| {
-        let transform = column_ref(scope, operand)?;
-        Some((column_name(operand)?, transform.supports_search()))
-    })
+    operands.into_iter().find_map(|operand| protected_column(operand, scope))
+}
+
+/// The first protected column an operand names, seeing through a row
+/// constructor.
+///
+/// Row-wise `(a, b) IN (...)` puts an [`Expr::Tuple`] where a column
+/// reference would normally be. Without this the tuple resolves to no
+/// transform at all, so the predicate was neither rewritten nor reported —
+/// the same silent no-match this module exists to prevent, just reached by a
+/// different syntax.
+fn protected_column(operand: &Expr, scope: &TableScope<'_>) -> Option<(String, bool)> {
+    if let Expr::Tuple(items) = operand {
+        return items.iter().find_map(|item| protected_column(item, scope));
+    }
+    let transform = column_ref(scope, operand)?;
+    Some((column_name(operand)?, transform.supports_search()))
 }
 
 /// The AST discriminant of an expression — its *shape*, never its value.
@@ -1651,6 +1814,27 @@ fn unwrap_casts(expr: &Expr) -> &Expr {
         Expr::Cast { expr, .. } | Expr::Nested(expr) => unwrap_casts(expr),
         other => other,
     }
+}
+
+/// The expression positions of a `SELECT` that can hold a nested query and are
+/// not already swept elsewhere.
+///
+/// `WHERE` and `HAVING` are deliberately absent: they go through
+/// `rewrite_predicate`, which sweeps them as part of rewriting them. Listing
+/// them here as well would walk each of their subqueries twice.
+fn select_expressions(select: &mut Select) -> impl Iterator<Item = &mut Expr> {
+    let projection = select.projection.iter_mut().filter_map(|item| match item {
+        SelectItem::UnnamedExpr(expr) | SelectItem::ExprWithAlias { expr, .. } => Some(expr),
+        SelectItem::QualifiedWildcard(..) | SelectItem::Wildcard(_) => None,
+    });
+    let group_by = match &mut select.group_by {
+        GroupByExpr::Expressions(exprs, _) => Some(exprs.iter_mut()),
+        GroupByExpr::All(_) => None,
+    };
+    let join_constraints = select.from.iter_mut().flat_map(|table| {
+        table.joins.iter_mut().filter_map(|join| join_condition(&mut join.join_operator))
+    });
+    projection.chain(group_by.into_iter().flatten()).chain(join_constraints)
 }
 
 /// The plaintext a literal expression stands for, or `None` when it is not a
@@ -2856,6 +3040,125 @@ mod tests {
         }
     }
 
+    /// A subquery in an *expression* position carries its own FROM, so the
+    /// searchable equality inside it has to be rewritten against that scope.
+    /// The outer statement mentions no protected column at all, which is why
+    /// nothing signalled: the predicate simply compared plaintext against the
+    /// stored form and matched nothing.
+    #[test]
+    fn searchable_equality_inside_an_operand_subquery_is_rewritten() {
+        for sql in [
+            // Scalar subquery as an operand.
+            "SELECT * FROM orders WHERE user_id = \
+             (SELECT id FROM users WHERE email = 'alice@secret.test')",
+            // EXISTS, which was not even an arm in the predicate walk.
+            "SELECT * FROM orders o WHERE EXISTS \
+             (SELECT 1 FROM users u WHERE u.email = 'alice@secret.test')",
+            // The body of IN (SELECT ...).
+            "SELECT * FROM orders WHERE user_id IN \
+             (SELECT id FROM users WHERE email = 'alice@secret.test')",
+            // Projection position.
+            "SELECT (SELECT id FROM users WHERE email = 'alice@secret.test') FROM orders",
+            // Nested two deep, to pin that the recursion is not one level.
+            "SELECT * FROM orders WHERE user_id IN (SELECT id FROM t WHERE x IN \
+             (SELECT id FROM users WHERE email = 'alice@secret.test'))",
+            // Inside a function argument and a CASE.
+            "SELECT coalesce((SELECT id FROM users WHERE email = 'alice@secret.test'), 0) FROM t",
+            "SELECT CASE WHEN EXISTS \
+             (SELECT 1 FROM users WHERE email = 'alice@secret.test') THEN 1 ELSE 0 END FROM t",
+            // ORDER BY and HAVING.
+            "SELECT id FROM orders ORDER BY \
+             (SELECT id FROM users WHERE email = 'alice@secret.test')",
+            "SELECT count(*) FROM orders HAVING count(*) > \
+             (SELECT id FROM users WHERE email = 'alice@secret.test')",
+        ] {
+            let mut rewriter = rewriter(catalog(true));
+            let rewritten = rewritten_query(&mut rewriter, sql)
+                .unwrap_or_else(|| panic!("subquery was never traversed: {sql}"));
+            assert!(
+                rewritten.to_ascii_uppercase().contains("SUBSTRING"),
+                "the inner equality was not indexed: {rewritten}"
+            );
+            assert!(
+                !rewritten.contains("alice@secret.test"),
+                "plaintext still compared against the stored form: {rewritten}"
+            );
+        }
+    }
+
+    /// The amplifier that makes "matches nothing" unsafe rather than merely
+    /// wrong: an empty subquery result turns `NOT IN (empty)` into true for
+    /// every row, so the DELETE takes the whole table instead of sparing the
+    /// rows the operator meant to keep.
+    #[test]
+    fn the_not_in_subquery_mass_delete_amplifier_is_rewritten() {
+        let sql = "DELETE FROM t WHERE id NOT IN \
+                   (SELECT id FROM users WHERE email = 'keep@secret.test')";
+
+        let mut rewriter = rewriter(catalog(true));
+        let rewritten = rewritten_query(&mut rewriter, sql).expect("the subquery was traversed");
+        assert!(rewritten.to_ascii_uppercase().contains("SUBSTRING"), "not indexed: {rewritten}");
+        assert!(!rewritten.contains("keep@secret.test"), "plaintext survived: {rewritten}");
+
+        // The rewritten predicate must still be a NOT IN over the same shape,
+        // so the statement's meaning is unchanged apart from the index match.
+        assert!(rewritten.contains("NOT IN"), "the predicate shape changed: {rewritten}");
+    }
+
+    /// A subquery predicate that cannot be expressed as an index match is a
+    /// site like any other — reaching it through a subquery must not lose the
+    /// signal, or `reject` would pass exactly the queries it exists to catch.
+    #[test]
+    fn an_unrewritable_predicate_inside_a_subquery_is_still_refused() {
+        for sql in [
+            "SELECT * FROM orders WHERE user_id = \
+             (SELECT id FROM users WHERE email LIKE 'a%')",
+            "SELECT * FROM orders WHERE EXISTS \
+             (SELECT 1 FROM users WHERE email > 'a@b.io')",
+            "SELECT (SELECT id FROM users WHERE email = lower('a@b.io')) FROM t",
+        ] {
+            let mut strict = rewriter(strict_catalog(true));
+            let action = strict.on_frame(b'Q', &query_frame(sql)).unwrap();
+            assert!(
+                refusal(&action).contains("searchable column email"),
+                "{sql}\n  got: {}",
+                refusal(&action)
+            );
+        }
+    }
+
+    /// Row-wise `(a, b) IN (...)` puts a row constructor where a column
+    /// reference would be, so no single transform covers it. It cannot be
+    /// rewritten, but relaying it silently is the same no-match failure.
+    #[test]
+    fn a_row_wise_in_list_over_a_searchable_column_is_signalled() {
+        let sql = "SELECT id FROM users WHERE (email, id) IN (('a@b.io', 1), ('c@d.io', 2))";
+
+        let mut permissive = rewriter(catalog(true));
+        assert!(rewritten_query(&mut permissive, sql).is_none(), "nothing to rewrite");
+
+        let mut strict = rewriter(strict_catalog(true));
+        let action = strict.on_frame(b'Q', &query_frame(sql)).unwrap();
+        assert!(refusal(&action).contains("searchable column email"), "{}", refusal(&action));
+    }
+
+    /// The traversal must not turn subqueries over unprotected columns into
+    /// refusals, nor rewrite anything in them.
+    #[test]
+    fn subqueries_over_unprotected_columns_are_left_alone() {
+        let mut strict = rewriter(strict_catalog(true));
+        for sql in [
+            "SELECT * FROM orders WHERE user_id = (SELECT id FROM other WHERE name = 'x')",
+            "SELECT * FROM orders WHERE EXISTS (SELECT 1 FROM other WHERE id > 4)",
+            "SELECT (SELECT id FROM other WHERE name = 'x') FROM t",
+        ] {
+            assert!(
+                matches!(strict.on_frame(b'Q', &query_frame(sql)).unwrap(), FrameAction::Relay),
+                "{sql}"
+            );
+        }
+    }
+
     /// A non-UTF-8 Query body never reaches the parser; it is still a site.
     #[test]
     fn non_utf8_query_is_refused_in_strict_mode() {
@@ -3677,9 +3980,7 @@ mod tests {
         let parsed = Parser::parse_sql(&PostgreSqlDialect {}, "SELECT lower('a@b.io')").unwrap();
         let Statement::Query(query) = &parsed[0] else { panic!("a query") };
         let SetExpr::Select(select) = query.body.as_ref() else { panic!("a select") };
-        let sqlparser::ast::SelectItem::UnnamedExpr(expr) = &select.projection[0] else {
-            panic!("an expression")
-        };
+        let SelectItem::UnnamedExpr(expr) = &select.projection[0] else { panic!("an expression") };
         assert_eq!(expr_shape(expr), "function call");
         assert!(!expr_shape(expr).contains("a@b.io"));
     }
