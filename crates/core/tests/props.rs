@@ -155,7 +155,9 @@ proptest! {
     #[test]
     fn startup_lengths_never_panic(len_field in any::<[u8; 4]>()) {
         if let Ok(body_len) = pgwire::startup_body_len(len_field) {
-            prop_assert!((4..=pgwire::MAX_MESSAGE_LEN - 4).contains(&body_len));
+            // The startup cap, not the 1 GiB frame limit: no length a peer can
+            // put on the wire may authorise a pre-auth allocation above it.
+            prop_assert!((4..=pgwire::MAX_STARTUP_MESSAGE_LEN - 4).contains(&body_len));
         }
     }
 

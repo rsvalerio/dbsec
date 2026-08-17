@@ -272,6 +272,13 @@ async fn request_upstream_tls(mut sock: TcpStream, addr: &str) -> Result<TcpStre
 
 /// Reads one startup-phase message (which has no type byte). Returns the full
 /// message including its length field, or `None` on a clean pre-startup EOF.
+///
+/// The buffer is sized from the client's own length prefix, so the only thing
+/// standing between an unauthenticated peer and a `vec![0u8; …]` of its
+/// choosing is the bound [`pgwire::startup_body_len`] applies
+/// ([`pgwire::MAX_STARTUP_MESSAGE_LEN`], not the 1 GiB frame limit) — which is
+/// why that check runs before the allocation rather than after the read
+/// (SEC-33).
 async fn read_startup_message<S>(stream: &mut S) -> Result<Option<Vec<u8>>, Error>
 where
     S: AsyncRead + Unpin,
@@ -636,6 +643,45 @@ mod tests {
         .await
         .unwrap_err();
         assert!(output.lock().await.is_empty());
+    }
+
+    /// The refusal has to happen *before* the buffer is sized, so the input is
+    /// nothing but the four-byte length prefix: a reader that allocated and
+    /// then tried to fill 1 GiB would fail with `UnexpectedEof` instead.
+    #[tokio::test]
+    async fn oversized_startup_length_is_refused_before_anything_is_allocated() {
+        for len in [pgwire::MAX_STARTUP_MESSAGE_LEN + 1, pgwire::MAX_MESSAGE_LEN, i32::MAX as usize]
+        {
+            let len_field = (len as i32).to_be_bytes();
+            let result = read_startup_message(&mut &len_field[..]).await;
+            assert!(
+                matches!(
+                    result,
+                    Err(Error::Wire(dbsec_core::Error::StartupMessageTooLarge {
+                        max: pgwire::MAX_STARTUP_MESSAGE_LEN,
+                        ..
+                    }))
+                ),
+                "length {len} should be refused without reading a body, got {result:?}"
+            );
+        }
+    }
+
+    /// The cap only has to be above what a real driver sends. A startup packet
+    /// carrying a long `options=-c …` is the largest legitimate shape there is,
+    /// and it still goes through untouched.
+    #[tokio::test]
+    async fn a_startup_message_with_a_large_options_parameter_still_reads() {
+        let mut params = b"user\0test\0options\0".to_vec();
+        params.extend(std::iter::repeat_n(b'x', 8 * 1024));
+        params.extend_from_slice(b"\0\0");
+        let mut msg = ((8 + params.len()) as i32).to_be_bytes().to_vec();
+        msg.extend_from_slice(&pgwire::PROTOCOL_V3.to_be_bytes());
+        msg.extend_from_slice(&params);
+        assert!(msg.len() <= pgwire::MAX_STARTUP_MESSAGE_LEN, "fixture must stay under the cap");
+
+        let read = read_startup_message(&mut msg.as_slice()).await.unwrap();
+        assert_eq!(read.as_deref(), Some(msg.as_slice()));
     }
 
     #[test]

@@ -27,6 +27,12 @@ pub enum Error {
     KeyExhausted(String),
     #[error("invalid wire message length {0}")]
     BadMessageLength(i32),
+    /// A startup packet whose length prefix exceeds
+    /// [`pgwire::MAX_STARTUP_MESSAGE_LEN`]. Distinct from
+    /// [`Error::BadMessageLength`] because the length is well-formed — it is
+    /// the pre-authentication allocation bound that refuses it.
+    #[error("startup message is {len} bytes, over the {max} byte limit")]
+    StartupMessageTooLarge { len: usize, max: usize },
     #[error("message field does not fit the wire protocol's fixed-width encoding")]
     WireFieldOverflow,
     #[error("malformed backend message")]

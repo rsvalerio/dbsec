@@ -22,6 +22,20 @@ pub const FRAME_HEADER_LEN: usize = 5;
 /// Largest message we accept; matches Postgres' own 1 GiB limit.
 pub const MAX_MESSAGE_LEN: usize = 1 << 30;
 
+/// Largest startup-phase message we accept, which is far smaller than
+/// [`MAX_MESSAGE_LEN`] on purpose.
+///
+/// A startup packet is a handful of `key\0value\0` parameters — a few hundred
+/// bytes in practice — and PostgreSQL caps its own at `MAX_STARTUP_PACKET_LENGTH`
+/// (10,000 bytes). The general 1 GiB frame limit is Postgres parity for
+/// *authenticated* traffic; applying it here let an unauthenticated peer make
+/// the proxy allocate and zero 1 GiB per connection from a 4-byte length
+/// prefix, for as long as the startup deadline allows (SEC-33). 16 KiB leaves
+/// generous headroom over what any driver sends — including a long
+/// `options=-c …` — while keeping the pre-auth allocation per connection
+/// negligible.
+pub const MAX_STARTUP_MESSAGE_LEN: usize = 16 * 1024;
+
 /// What the client opened the connection with.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Startup {
@@ -47,10 +61,26 @@ pub fn startup_kind(code: i32) -> Startup {
 
 /// Validates a startup-message length field and returns the number of bytes
 /// that follow it (code + payload).
+///
+/// # Errors
+///
+/// [`Error::BadMessageLength`] when the field is negative or smaller than the
+/// header it introduces, and [`Error::StartupMessageTooLarge`] when it exceeds
+/// [`MAX_STARTUP_MESSAGE_LEN`] — the latter is separate because it is the
+/// pre-authentication allocation bound, and an operator who has to raise it
+/// needs to see which limit was hit.
 pub fn startup_body_len(len_field: [u8; 4]) -> Result<usize, Error> {
     let len = i32::from_be_bytes(len_field);
-    if len < STARTUP_HEADER_LEN as i32 || len as usize > MAX_MESSAGE_LEN {
+    if len < STARTUP_HEADER_LEN as i32 {
         return Err(Error::BadMessageLength(len));
+    }
+    // Checked before the caller sizes any buffer from it: the whole point is
+    // that the allocation never happens (SEC-33).
+    if len as usize > MAX_STARTUP_MESSAGE_LEN {
+        return Err(Error::StartupMessageTooLarge {
+            len: len as usize,
+            max: MAX_STARTUP_MESSAGE_LEN,
+        });
     }
     Ok(len as usize - 4)
 }
@@ -300,10 +330,34 @@ mod tests {
     #[test]
     fn startup_len_bounds() {
         assert_eq!(startup_body_len(8i32.to_be_bytes()).unwrap(), 4);
-        assert!(startup_body_len(7i32.to_be_bytes()).is_err());
-        assert!(startup_body_len(0i32.to_be_bytes()).is_err());
-        assert!(startup_body_len((-1i32).to_be_bytes()).is_err());
-        assert!(startup_body_len(((MAX_MESSAGE_LEN as i32) + 1).to_be_bytes()).is_err());
+        assert!(matches!(startup_body_len(7i32.to_be_bytes()), Err(Error::BadMessageLength(7))));
+        assert!(matches!(startup_body_len(0i32.to_be_bytes()), Err(Error::BadMessageLength(0))));
+        assert!(matches!(
+            startup_body_len((-1i32).to_be_bytes()),
+            Err(Error::BadMessageLength(-1))
+        ));
+    }
+
+    /// The startup cap is what stops an unauthenticated peer sizing a buffer
+    /// from its own length prefix (SEC-33), so both sides of the boundary are
+    /// pinned — including the general 1 GiB frame limit, which no longer
+    /// applies to a startup packet.
+    #[test]
+    fn startup_len_refuses_packets_over_the_startup_cap() {
+        let len = |n: usize| (n as i32).to_be_bytes();
+        assert_eq!(
+            startup_body_len(len(MAX_STARTUP_MESSAGE_LEN)).unwrap(),
+            MAX_STARTUP_MESSAGE_LEN - 4
+        );
+        for over in [MAX_STARTUP_MESSAGE_LEN + 1, MAX_MESSAGE_LEN, i32::MAX as usize] {
+            assert!(
+                matches!(
+                    startup_body_len(len(over)),
+                    Err(Error::StartupMessageTooLarge { max: MAX_STARTUP_MESSAGE_LEN, .. })
+                ),
+                "length {over} should be refused by the startup cap"
+            );
+        }
     }
 
     /// One RowDescription field with the given identity, text format.
