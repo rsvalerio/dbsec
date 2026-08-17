@@ -20,7 +20,16 @@ tokio-postgres-rustls = "0.13"
 sqlparser = "0.53"
 
 # crypto
-aes = "0.8"
+#
+# `aes` carries the `zeroize` feature for both its own users (FF1) and
+# `aes-gcm`, which has no such feature of its own but builds its cipher out of
+# this crate. Without it the expanded AES round-key schedule — from which the
+# original key is recoverable — is left intact in freed heap when a DEK rolls
+# and its `Cipher` drops, while the `Zeroizing` key bytes it was derived from
+# are wiped. Cargo unifies features per package, so enabling it here covers
+# every `Aes256` in the graph. `envelope::tests::the_aes_key_schedule_is_wiped_on_drop`
+# fails if it is ever dropped.
+aes = { version = "0.8", features = ["zeroize"] }
 aes-gcm = "0.10"
 hmac = "0.12"
 sha2 = "0.10"
