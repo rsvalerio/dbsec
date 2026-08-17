@@ -327,13 +327,18 @@ async fn serve(validated: ValidatedConfig) -> Result<(), Error> {
     // ordinary migration invalidates without touching the names the write
     // path uses (see `resolve`).
     let mut refresh = None;
+    // The Vault key source alone gets a watchdog: its token has a lease that
+    // the key caches would otherwise mask until the first cache miss.
+    let mut vault_keys = None;
     let (rows, writes) = match &protected {
         None => (None, None),
         Some(protected) => {
             let keys: Arc<dyn dbsec_core::keys::KeySource> = match &protected.keys {
                 KeySourceConfig::File(keys_file) => Arc::new(FileKeySource::load(keys_file)?),
                 KeySourceConfig::Vault(setup) => {
-                    Arc::new(vault::VaultKeySource::connect(setup).await?)
+                    let source = Arc::new(vault::VaultKeySource::connect(setup).await?);
+                    vault_keys = Some(source.clone());
+                    source
                 }
             };
             let columns = Arc::new(columns::build(&config, &keys));
@@ -389,6 +394,8 @@ async fn serve(validated: ValidatedConfig) -> Result<(), Error> {
             shutdown_rx.clone(),
         ))
     });
+    let token_watch =
+        vault_keys.map(|keys| tokio::spawn(vault::token_watch(keys, shutdown_rx.clone())));
     let mut sessions = JoinSet::new();
     let outcome = tokio::select! {
         result = accept_loop(listener, &ctx, config.max_sessions, &mut sessions, &shutdown_rx) => {
@@ -406,6 +413,13 @@ async fn serve(validated: ValidatedConfig) -> Result<(), Error> {
         // re-resolution in flight against an unresponsive control connection.
         if tokio::time::timeout(SHUTDOWN_DRAIN_TIMEOUT, refresher).await.is_err() {
             tracing::warn!("column refresher did not stop within the drain timeout");
+        }
+    }
+    if let Some(token_watch) = token_watch {
+        // Same shape as the refresher: it is either sleeping or mid-lookup,
+        // and the timeout backstops a lookup against an unresponsive Vault.
+        if tokio::time::timeout(SHUTDOWN_DRAIN_TIMEOUT, token_watch).await.is_err() {
+            tracing::warn!("vault token watch did not stop within the drain timeout");
         }
     }
     drain_sessions(&mut sessions, SHUTDOWN_DRAIN_TIMEOUT).await;

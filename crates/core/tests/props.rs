@@ -3,13 +3,12 @@
 
 use std::sync::Arc;
 
-use dbsec_core::envelope::{self, Ciphers, KeyId, KEY_ID_LEN, NONCE_LEN};
+use dbsec_core::envelope::{self, CellContext, Ciphers, KeyId, KEY_ID_LEN, NONCE_LEN};
 use dbsec_core::keys::{Key, KeySource};
 use dbsec_core::mask::MaskSpec;
 use dbsec_core::transform::{EncryptTransform, FieldTransform, FpeTransform, TokenTransform};
 use dbsec_core::{blind_index, pgwire, Error};
 use proptest::prelude::*;
-use zeroize::Zeroizing;
 
 const TEST_KEY: [u8; 32] = [7u8; 32];
 const TEST_KEY_ID: KeyId = [1u8; KEY_ID_LEN];
@@ -20,22 +19,28 @@ struct TestKeys;
 
 impl KeySource for TestKeys {
     fn active_key(&self) -> Result<(KeyId, Key), Error> {
-        Ok((TEST_KEY_ID, Zeroizing::new(TEST_KEY)))
+        Ok((TEST_KEY_ID, Key::new(TEST_KEY)))
     }
     fn key(&self, id: &KeyId) -> Result<Key, Error> {
         if id == &TEST_KEY_ID {
-            Ok(Zeroizing::new(TEST_KEY))
+            Ok(Key::new(TEST_KEY))
         } else {
             Err(Error::UnknownKey(hex::encode(id)))
         }
     }
     fn index_key(&self, _name: &str) -> Result<Key, Error> {
-        Ok(Zeroizing::new(TEST_INDEX_KEY))
+        Ok(Key::new(TEST_INDEX_KEY))
     }
 }
 
 fn test_ciphers() -> Arc<Ciphers> {
     Arc::new(Ciphers::new(Arc::new(TestKeys)))
+}
+
+/// The column every envelope in these properties is bound to, unless the
+/// property is about the binding itself.
+fn test_context() -> CellContext {
+    CellContext::new("public.users.email")
 }
 
 proptest! {
@@ -45,10 +50,10 @@ proptest! {
         key_id in any::<[u8; KEY_ID_LEN]>(),
         plaintext in proptest::collection::vec(any::<u8>(), 0..512),
     ) {
-        let ct = envelope::encrypt(&key, &key_id, &plaintext).unwrap();
+        let ct = envelope::encrypt(&key, &key_id, &test_context(), &plaintext).unwrap();
         prop_assert!(envelope::is_enveloped(&ct));
         prop_assert_eq!(envelope::key_id(&ct).unwrap(), key_id);
-        prop_assert_eq!(envelope::decrypt(&key, &ct).unwrap(), plaintext);
+        prop_assert_eq!(envelope::decrypt(&key, &test_context(), &ct).unwrap(), plaintext);
     }
 
     #[test]
@@ -58,12 +63,12 @@ proptest! {
         pos in any::<prop::sample::Index>(),
         flip in 1u8..,
     ) {
-        let mut ct = envelope::encrypt(&key, &[1u8; KEY_ID_LEN], &plaintext).unwrap();
+        let mut ct = envelope::encrypt(&key, &[1u8; KEY_ID_LEN], &test_context(), &plaintext).unwrap();
         let pos = pos.index(ct.len());
         ct[pos] ^= flip;
         // Corrupting the magic makes it non-enveloped; anything else must
         // fail authentication (key id is bound as AAD, nonce feeds the tag).
-        match envelope::decrypt(&key, &ct) {
+        match envelope::decrypt(&key, &test_context(), &ct) {
             Err(Error::Malformed) => prop_assert!(pos < envelope::MAGIC.len()),
             Err(Error::Decrypt) => prop_assert!(pos >= envelope::MAGIC.len()),
             Ok(_) => prop_assert!(false, "tampered ciphertext decrypted"),
@@ -76,7 +81,7 @@ proptest! {
         key in any::<[u8; 32]>(),
         data in proptest::collection::vec(any::<u8>(), 0..256),
     ) {
-        let _ = envelope::decrypt(&key, &data);
+        let _ = envelope::decrypt(&key, &test_context(), &data);
         let _ = envelope::key_id(&data);
         let _ = envelope::is_enveloped(&data);
     }
@@ -86,10 +91,26 @@ proptest! {
         key in any::<[u8; 32]>(),
         plaintext in proptest::collection::vec(any::<u8>(), 0..64),
     ) {
-        let a = envelope::encrypt(&key, &[1u8; KEY_ID_LEN], &plaintext).unwrap();
-        let b = envelope::encrypt(&key, &[1u8; KEY_ID_LEN], &plaintext).unwrap();
+        let a = envelope::encrypt(&key, &[1u8; KEY_ID_LEN], &test_context(), &plaintext).unwrap();
+        let b = envelope::encrypt(&key, &[1u8; KEY_ID_LEN], &test_context(), &plaintext).unwrap();
         let nonce = |ct: &[u8]| ct[4 + KEY_ID_LEN..4 + KEY_ID_LEN + NONCE_LEN].to_vec();
         prop_assert_ne!(nonce(&a), nonce(&b));
+    }
+
+    /// Whatever the value, stored bytes never open under a column they were
+    /// not sealed for — the binding is in the tag, not in the plaintext.
+    #[test]
+    fn a_value_never_opens_under_another_column(
+        key in any::<[u8; 32]>(),
+        plaintext in proptest::collection::vec(any::<u8>(), 0..128),
+    ) {
+        let stored =
+            envelope::encrypt(&key, &[1u8; KEY_ID_LEN], &test_context(), &plaintext).unwrap();
+        let elsewhere = CellContext::new("public.users.ssn");
+        prop_assert!(matches!(
+            envelope::decrypt(&key, &elsewhere, &stored),
+            Err(Error::Decrypt)
+        ));
     }
 
     #[test]
@@ -111,12 +132,12 @@ proptest! {
         index_key in any::<[u8; 32]>(),
         plaintext in proptest::collection::vec(any::<u8>(), 0..128),
     ) {
-        let ct = envelope::encrypt(&key, &[1u8; KEY_ID_LEN], &plaintext).unwrap();
+        let ct = envelope::encrypt(&key, &[1u8; KEY_ID_LEN], &test_context(), &plaintext).unwrap();
         let index = blind_index::compute(&index_key, &plaintext);
         let stored = blind_index::prepend(&index, &ct);
         let (idx, env) = blind_index::split(&stored).unwrap();
         prop_assert_eq!(idx, index);
-        prop_assert_eq!(envelope::decrypt(&key, env).unwrap(), plaintext);
+        prop_assert_eq!(envelope::decrypt(&key, &test_context(), env).unwrap(), plaintext);
     }
 
     #[test]
@@ -218,7 +239,7 @@ proptest! {
         let ciphers = test_ciphers();
 
         for index_key in [None, Some("users.email".to_owned())] {
-            let encrypt = EncryptTransform::new(ciphers.clone(), index_key);
+            let encrypt = EncryptTransform::new(ciphers.clone(), test_context(), index_key);
             // Bytes the fuzzer chose cannot pass GCM authentication under a key
             // it does not have, so an opened plaintext would mean the envelope
             // was read without being verified.
@@ -250,8 +271,9 @@ proptest! {
         plaintext in proptest::collection::vec(any::<u8>(), 0..128),
     ) {
         let ciphers = test_ciphers();
-        let searchable = EncryptTransform::new(ciphers.clone(), Some("users.email".into()));
-        let plain = EncryptTransform::new(ciphers, None);
+        let searchable =
+            EncryptTransform::new(ciphers.clone(), test_context(), Some("users.email".into()));
+        let plain = EncryptTransform::new(ciphers, test_context(), None);
 
         let indexed = searchable.seal(&plaintext)?;
         let opened = plain.open(&indexed)?;

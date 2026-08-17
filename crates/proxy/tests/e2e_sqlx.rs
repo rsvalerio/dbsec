@@ -166,7 +166,7 @@ async fn sqlx_driver_end_to_end() {
         .unwrap();
     for row in &stored {
         let email: Vec<u8> = row.get(0);
-        assert_eq!(&email[32..36], b"DBS1", "blind index then envelope magic");
+        assert_eq!(&email[32..36], b"DBS2", "blind index then envelope magic");
         assert_eq!(row.get::<_, &str>(1).len(), 12, "FPE keeps the shape");
         assert_eq!(row.get::<_, &str>(2).len(), 64, "HMAC token at rest");
     }

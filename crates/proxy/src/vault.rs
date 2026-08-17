@@ -39,6 +39,31 @@
 //! — so each migration warns, and retiring the shared map is an operator
 //! procedure documented in `plans/PLAN.md`.
 //!
+//! # Token lease, and what revocation does not do
+//!
+//! The proxy authenticates once, at startup, with the configured static token.
+//! [`token_watch`] then asks Vault about that token once a minute and renews
+//! it when the lease runs low, so a TTL'd token — the good practice — can be
+//! used without it silently expiring mid-run. When the lease is running out
+//! and cannot be extended, the watch says so at WARN on every check rather
+//! than waiting for the failure: the key caches would otherwise mask an
+//! expired token completely, since everything already cached keeps serving and
+//! only the *first cache miss* fails, at ERROR, with nothing pointing at the
+//! lease. That masking is exactly what pushes deployments to long-lived or
+//! root tokens.
+//!
+//! **Revoking the token, or rotating a key in Vault, does not reach a running
+//! proxy.** The DEK and index-key caches are grow-only and have no TTL: a key
+//! resolved once is served from memory for the life of the process, so
+//! incident response that revokes or rotates in Vault has no effect until the
+//! proxy is restarted. That is deliberate rather than pending — a TTL on these
+//! caches would put a Vault round-trip on the relay path at unpredictable
+//! moments and make Vault a per-request availability dependency, and it would
+//! not help the case it looks like it helps: index keys are deterministic and
+//! *must not* change under a running column, and a re-fetched DEK is the same
+//! DEK. **Restart the proxy** as part of any Vault-side revocation or
+//! rotation; `plans/PLAN.md` carries this in the operator procedures.
+//!
 //! # Runtime requirements
 //!
 //! `KeySource` is synchronous and is called from inside the relay loop, so
@@ -80,6 +105,21 @@ use crate::Error;
 /// or a permission denial is never remembered as an absent key.
 const MISSING_DEK_CACHE_TTL: Duration = Duration::from_mins(1);
 const MISSING_DEK_CACHE_MAX: usize = 4096;
+
+/// How often [`token_watch`] asks Vault about the token the proxy holds.
+///
+/// One request a minute against `auth/token/lookup-self` is nothing next to
+/// the traffic the proxy already carries, and it bounds how stale the
+/// "expiring soon" warning can be.
+const TOKEN_CHECK_INTERVAL: Duration = Duration::from_mins(1);
+
+/// A token with less lease than this left is renewed on the next check — or,
+/// when it cannot be renewed, warned about on every check until it is.
+///
+/// Comfortably more than one [`TOKEN_CHECK_INTERVAL`], so a renewal that
+/// fails still leaves several attempts (and several warnings) before the lease
+/// actually runs out.
+const TOKEN_RENEW_THRESHOLD: Duration = Duration::from_mins(10);
 
 /// Wrapped-DEK record stored at `{path}/deks/{key_id_hex}`.
 #[derive(Serialize, Deserialize)]
@@ -135,6 +175,37 @@ impl Drop for IndexKeyRecord {
     }
 }
 
+/// The pre-versioning shared map: `name -> hex key`, every value a live
+/// deterministic key.
+///
+/// A newtype rather than a bare `HashMap<String, String>` for the same reason
+/// [`IndexKeyRecord`] is one: the map `vaultrs` deserializes into is a
+/// plaintext copy of every legacy index key, and these are the keys that can
+/// never be rotated, so it is wiped on drop instead of being freed intact.
+/// Serde sees through the newtype, so the stored shape is unchanged.
+#[derive(Deserialize)]
+pub(crate) struct LegacyIndexKeys(HashMap<String, String>);
+
+impl LegacyIndexKeys {
+    fn get(&self, name: &str) -> Option<&str> {
+        self.0.get(name).map(String::as_str)
+    }
+
+    /// Wipes every key in the map. Called from [`Drop`]; separate so the wipe
+    /// is observable in a test.
+    fn wipe(&mut self) {
+        for hex_key in self.0.values_mut() {
+            hex_key.zeroize();
+        }
+    }
+}
+
+impl Drop for LegacyIndexKeys {
+    fn drop(&mut self) {
+        self.wipe();
+    }
+}
+
 /// The Vault operations the key source needs, behind a seam so the key logic
 /// — which branch mints, which propagates, which retries — is exercised
 /// without a live server. `None` means "no such secret"; every other failure
@@ -157,10 +228,48 @@ pub(crate) trait KeyStore: Send + Sync {
     /// Reads the pre-versioning layout: one shared `name -> hex key` map.
     fn read_legacy_index_keys(
         &self,
-    ) -> impl Future<Output = Result<Option<HashMap<String, String>>, CoreError>> + Send;
+    ) -> impl Future<Output = Result<Option<LegacyIndexKeys>, CoreError>> + Send;
 
     /// Fetches and unwraps the DEK stored under `id`.
     fn fetch_dek(&self, id: &KeyId) -> impl Future<Output = Result<Option<Key>, CoreError>> + Send;
+
+    /// What Vault currently says about the token this store authenticates
+    /// with (`auth/token/lookup-self`).
+    fn token_status(&self) -> impl Future<Output = Result<TokenStatus, CoreError>> + Send;
+
+    /// Extends the token's lease (`auth/token/renew-self`), answering with what
+    /// it looks like afterwards.
+    fn renew_token(&self) -> impl Future<Output = Result<TokenStatus, CoreError>> + Send;
+}
+
+/// What Vault says about the proxy's own token.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct TokenStatus {
+    /// Time left on the lease. Zero means "never expires" — a root token or a
+    /// periodic one Vault reports without a TTL.
+    pub(crate) ttl: Duration,
+    pub(crate) renewable: bool,
+}
+
+impl TokenStatus {
+    fn never_expires(&self) -> bool {
+        self.ttl.is_zero()
+    }
+}
+
+/// The outcome of one pass of [`token_watch`], so the decision is testable
+/// without waiting on a timer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum TokenCheck {
+    /// Nothing to do: the token never expires, or has plenty of lease left.
+    Healthy,
+    /// The lease was running down and Vault extended it.
+    Renewed,
+    /// The lease is running down and cannot be extended — the operator has to
+    /// issue a new token and restart.
+    Expiring,
+    /// Vault could not be asked. Not evidence the token is bad.
+    Unknown,
 }
 
 /// The live Vault-backed [`KeyStore`].
@@ -221,7 +330,7 @@ impl KeyStore for VaultStore {
         }
     }
 
-    async fn read_legacy_index_keys(&self) -> Result<Option<HashMap<String, String>>, CoreError> {
+    async fn read_legacy_index_keys(&self) -> Result<Option<LegacyIndexKeys>, CoreError> {
         let path = self.legacy_index_keys_path();
         match vaultrs::kv2::read(&self.client, &self.config.mount, &path).await {
             Ok(keys) => Ok(Some(keys)),
@@ -249,7 +358,30 @@ impl KeyStore for VaultStore {
         )
         .await
         .map_err(|e| backend_error(format!("transit unwrap of DEK {id_hex}"), e))?;
-        decode_key_b64(&unwrapped.plaintext).map(Some)
+        // Moved out of the response struct rather than borrowed, so the base64
+        // DEK plaintext is wiped here instead of being freed intact with it.
+        let plaintext = Zeroizing::new(unwrapped.plaintext);
+        decode_key_b64(&plaintext).map(Some)
+    }
+
+    async fn token_status(&self) -> Result<TokenStatus, CoreError> {
+        let mut info = vaultrs::token::lookup_self(&self.client)
+            .await
+            .map_err(|e| backend_error("looking up the vault token".to_owned(), e))?;
+        // The response echoes the token itself back. Wiped rather than dropped
+        // intact, for the same reason the DEK plaintexts are.
+        info.id.zeroize();
+        Ok(TokenStatus { ttl: Duration::from_secs(info.ttl), renewable: info.renewable })
+    }
+
+    async fn renew_token(&self) -> Result<TokenStatus, CoreError> {
+        // No increment: Vault applies the token's own period or its mount's
+        // default, which is what the operator configured when issuing it.
+        let mut auth = vaultrs::token::renew_self(&self.client, None)
+            .await
+            .map_err(|e| backend_error("renewing the vault token".to_owned(), e))?;
+        auth.client_token.zeroize();
+        Ok(TokenStatus { ttl: Duration::from_secs(auth.lease_duration), renewable: auth.renewable })
     }
 }
 
@@ -322,9 +454,14 @@ impl VaultKeySource<VaultStore> {
         )
         .await
         .map_err(|e| backend_error("transit data key".to_owned(), e))?;
-        let plaintext = datakey
-            .plaintext
-            .ok_or_else(|| CoreError::KeySource("transit returned no plaintext data key".into()))?;
+        // Transit hands the DEK back base64-encoded in a plain `String`, which
+        // is a second plaintext copy of the key. `decode_key_b64` wipes the raw
+        // bytes it decodes, so this wipes the encoded form the crate owns —
+        // the copy still inside the `vaultrs` response struct is out of reach
+        // (documented as a best-effort edge), but this one is not.
+        let plaintext = Zeroizing::new(datakey.plaintext.ok_or_else(|| {
+            CoreError::KeySource("transit returned no plaintext data key".into())
+        })?);
         let key = decode_key_b64(&plaintext)?;
 
         // The OS entropy source rather than `thread_rng` (SEC-10): this id is
@@ -412,7 +549,7 @@ impl<S: KeyStore> VaultKeySource<S> {
         let record = IndexKeyRecord::first(hex::encode(fresh.as_slice()));
         if self.store.create_index_key(name, &record).await? {
             tracing::info!(name, "minted new deterministic index key");
-            return Ok(fresh);
+            return Ok(Key::from(fresh));
         }
 
         // Lost the create race. The winner's key is the one already in use by
@@ -443,6 +580,8 @@ impl<S: KeyStore> VaultKeySource<S> {
             return Ok(None);
         };
         let key = decode_key_hex(hex_key)?;
+        // `legacy` still holds every other name's key material; it is wiped
+        // when it drops at the end of this function.
         let record = IndexKeyRecord::first(hex::encode(key.as_slice()));
         self.store.create_index_key(name, &record).await?;
         tracing::warn!(
@@ -471,6 +610,73 @@ impl<S: KeyStore> VaultKeySource<S> {
             missing.clear();
         }
         missing.insert(*id, Instant::now());
+    }
+
+    /// One pass of [`token_watch`]: ask Vault about the token, renew it if the
+    /// lease is running down, and say so loudly when it cannot be renewed.
+    ///
+    /// Split out from the loop so the decision — not the timer — is what the
+    /// tests exercise.
+    async fn check_token(&self) -> TokenCheck {
+        let status = match self.store.token_status().await {
+            Ok(status) => status,
+            Err(e) => {
+                // Not evidence of a bad token: Vault may simply be
+                // unreachable, and the caches keep serving meanwhile.
+                tracing::warn!(error = %e, "could not check the vault token's lease");
+                return TokenCheck::Unknown;
+            }
+        };
+        if status.never_expires() || status.ttl > TOKEN_RENEW_THRESHOLD {
+            return TokenCheck::Healthy;
+        }
+        if !status.renewable {
+            tracing::warn!(
+                ttl_secs = status.ttl.as_secs(),
+                "the vault token expires soon and is not renewable; cached keys will keep \
+                 serving until the first cache miss, which then fails the session — issue a \
+                 fresh token and restart the proxy before then"
+            );
+            return TokenCheck::Expiring;
+        }
+        match self.store.renew_token().await {
+            Ok(renewed) => {
+                tracing::info!(ttl_secs = renewed.ttl.as_secs(), "renewed the vault token");
+                TokenCheck::Renewed
+            }
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    ttl_secs = status.ttl.as_secs(),
+                    "the vault token is near expiry and renewal failed; issue a fresh token \
+                     and restart the proxy before the lease runs out"
+                );
+                TokenCheck::Expiring
+            }
+        }
+    }
+}
+
+/// Keeps the proxy's Vault token alive, and makes a token that is running out
+/// visible instead of letting the key caches mask it.
+///
+/// Without this, a TTL'd token — the good practice — expires mid-run and
+/// nothing notices: every key already cached keeps working, so traffic looks
+/// healthy right up to the first cache miss, which then fails a session at
+/// ERROR with no hint that the cause is an expired lease. That failure mode is
+/// what pushes deployments towards long-lived or root tokens.
+///
+/// Runs until `shutdown` flips, mirroring [`crate::resolve::refresh_loop`].
+pub(crate) async fn token_watch<S: KeyStore>(
+    source: std::sync::Arc<VaultKeySource<S>>,
+    mut shutdown: tokio::sync::watch::Receiver<bool>,
+) {
+    loop {
+        tokio::select! {
+            () = tokio::time::sleep(TOKEN_CHECK_INTERVAL) => {}
+            _ = shutdown.changed() => return,
+        }
+        source.check_token().await;
     }
 }
 
@@ -514,7 +720,7 @@ fn decode_key_b64(encoded: &str) -> Result<Key, CoreError> {
         .map_err(|e| backend_error("data key is not valid base64".to_owned(), e))?;
     let result = <[u8; 32]>::try_from(raw.as_slice())
         .map_err(|_| CoreError::KeySource(format!("data key must be 32 bytes, got {}", raw.len())))
-        .map(Zeroizing::new);
+        .map(Key::new);
     raw.zeroize();
     result
 }
@@ -523,7 +729,7 @@ fn decode_key_hex(encoded: &str) -> Result<Key, CoreError> {
     let mut raw = hex::decode(encoded)
         .map_err(|e| backend_error("stored index key is not valid hex".to_owned(), e))?;
     let result = <[u8; 32]>::try_from(raw.as_slice())
-        .map(Zeroizing::new)
+        .map(Key::new)
         .map_err(|_| CoreError::KeySource("stored index key must be 32 bytes".into()));
     raw.zeroize();
     result
@@ -564,6 +770,11 @@ mod tests {
         steal_create_with: Mutex<Option<IndexKeyRecord>>,
         creates: Mutex<u32>,
         dek_reads: Mutex<u32>,
+        /// What `lookup-self` answers. `None` makes the lookup itself fail.
+        token: Mutex<Option<TokenStatus>>,
+        /// What a renewal leaves behind; `None` makes the renewal fail.
+        renews_to: Mutex<Option<TokenStatus>>,
+        renewals: Mutex<u32>,
     }
 
     impl FakeStore {
@@ -609,13 +820,11 @@ mod tests {
             Ok(true)
         }
 
-        async fn read_legacy_index_keys(
-            &self,
-        ) -> Result<Option<HashMap<String, String>>, CoreError> {
+        async fn read_legacy_index_keys(&self) -> Result<Option<LegacyIndexKeys>, CoreError> {
             match self.read_legacy {
                 Fault::Fails => Err(CoreError::KeySource("vault is unhappy".into())),
                 Fault::Hangs => std::future::pending().await,
-                Fault::None => Ok(self.legacy.lock().expect("lock").clone()),
+                Fault::None => Ok(self.legacy.lock().expect("lock").clone().map(LegacyIndexKeys)),
             }
         }
 
@@ -627,14 +836,36 @@ mod tests {
                 Fault::None => Ok(self.deks.lock().expect("lock").get(id).cloned()),
             }
         }
+
+        async fn token_status(&self) -> Result<TokenStatus, CoreError> {
+            self.token
+                .lock()
+                .expect("lock")
+                .ok_or_else(|| CoreError::KeySource("vault is unhappy".into()))
+        }
+
+        async fn renew_token(&self) -> Result<TokenStatus, CoreError> {
+            *self.renewals.lock().expect("lock") += 1;
+            let renewed = *self.renews_to.lock().expect("lock");
+            let renewed =
+                renewed.ok_or_else(|| CoreError::KeySource("renewal refused".to_owned()))?;
+            *self.token.lock().expect("lock") = Some(renewed);
+            Ok(renewed)
+        }
+    }
+
+    /// A store whose token looks like `ttl` / `renewable` and whose renewals
+    /// reset the lease to an hour.
+    fn store_with_token(ttl: Duration, renewable: bool) -> FakeStore {
+        let store = FakeStore::default();
+        *store.token.lock().expect("lock") = Some(TokenStatus { ttl, renewable });
+        *store.renews_to.lock().expect("lock") =
+            Some(TokenStatus { ttl: Duration::from_secs(3600), renewable });
+        store
     }
 
     fn source<S: KeyStore>(store: S) -> VaultKeySource<S> {
-        VaultKeySource::new(
-            store,
-            Duration::from_millis(100),
-            (ACTIVE_ID, Zeroizing::new([7u8; 32])),
-        )
+        VaultKeySource::new(store, Duration::from_millis(100), (ACTIVE_ID, Key::new([7u8; 32])))
     }
 
     #[tokio::test]
@@ -781,6 +1012,20 @@ mod tests {
         assert!(matches!(record.current_key(), Err(CoreError::KeySource(_))));
     }
 
+    /// The shared map carries the deterministic keys that can never be
+    /// rotated, so the copy the proxy owns is wiped rather than freed intact.
+    /// `Drop` calls exactly this.
+    #[test]
+    fn the_legacy_shared_map_is_wiped_rather_than_dropped_intact() {
+        let hex_key = hex::encode(STORED);
+        let mut legacy = LegacyIndexKeys(HashMap::from([(NAME.to_owned(), hex_key.clone())]));
+        assert_eq!(legacy.get(NAME), Some(hex_key.as_str()), "readable before the wipe");
+
+        legacy.wipe();
+
+        assert_eq!(legacy.get(NAME), Some(""), "the key material is gone, not just unreachable");
+    }
+
     #[test]
     fn debugging_a_record_never_prints_key_material() {
         let hex_key = hex::encode(STORED);
@@ -821,7 +1066,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn fetched_dek_is_cached() {
         let store = FakeStore::default();
-        store.deks.lock().expect("lock").insert(OTHER_ID, Zeroizing::new(STORED));
+        store.deks.lock().expect("lock").insert(OTHER_ID, Key::new(STORED));
         let keys = source(store);
 
         assert_eq!(*keys.key(&OTHER_ID).expect("fetches"), STORED);
@@ -847,6 +1092,54 @@ mod tests {
 
         let error = keys.key(&OTHER_ID).expect_err("cannot block_in_place here");
         assert!(error.to_string().contains("multi-thread"), "got {error}");
+    }
+
+    #[tokio::test]
+    async fn a_healthy_token_is_left_alone() {
+        // Root and periodic tokens report ttl = 0, "never expires".
+        let keys = source(store_with_token(Duration::ZERO, false));
+        assert_eq!(keys.check_token().await, TokenCheck::Healthy);
+
+        let keys = source(store_with_token(Duration::from_secs(3600), true));
+        assert_eq!(keys.check_token().await, TokenCheck::Healthy);
+        assert_eq!(*keys.store.renewals.lock().expect("lock"), 0, "nothing to renew");
+    }
+
+    #[tokio::test]
+    async fn a_token_running_out_of_lease_is_renewed() {
+        let keys = source(store_with_token(Duration::from_secs(60), true));
+
+        assert_eq!(keys.check_token().await, TokenCheck::Renewed);
+        assert_eq!(*keys.store.renewals.lock().expect("lock"), 1);
+        // And the extended lease means the next check has nothing to do.
+        assert_eq!(keys.check_token().await, TokenCheck::Healthy);
+        assert_eq!(*keys.store.renewals.lock().expect("lock"), 1);
+    }
+
+    /// The failure this watch exists for: a lease that cannot be extended must
+    /// be surfaced while the caches still make everything look healthy.
+    #[tokio::test]
+    async fn a_token_that_cannot_be_renewed_is_reported_not_masked() {
+        let keys = source(store_with_token(Duration::from_secs(60), false));
+
+        assert_eq!(keys.check_token().await, TokenCheck::Expiring);
+        assert_eq!(*keys.store.renewals.lock().expect("lock"), 0, "not renewable, so not tried");
+
+        // A renewable token whose renewal is refused is the same situation.
+        let store = store_with_token(Duration::from_secs(60), true);
+        *store.renews_to.lock().expect("lock") = None;
+        let keys = source(store);
+        assert_eq!(keys.check_token().await, TokenCheck::Expiring);
+    }
+
+    /// An unreachable Vault says nothing about the token — reporting it as
+    /// expiring would cry wolf on every network blip.
+    #[tokio::test]
+    async fn an_unreachable_vault_is_not_reported_as_an_expiring_token() {
+        let keys = source(FakeStore::default());
+
+        assert_eq!(keys.check_token().await, TokenCheck::Unknown);
+        assert_eq!(*keys.store.renewals.lock().expect("lock"), 0);
     }
 
     #[test]

@@ -11,7 +11,55 @@ use zeroize::{Zeroize, Zeroizing};
 use crate::envelope::{KeyId, KEY_ID_LEN};
 use crate::Error;
 
-pub type Key = Zeroizing<[u8; 32]>;
+/// 32 bytes of live key material: a DEK, or one of the deterministic index
+/// keys.
+///
+/// A newtype over `Zeroizing<[u8; 32]>` rather than an alias for it, purely so
+/// it cannot be printed. `Zeroizing` derives `Debug`, so with an alias a stray
+/// `?key` in a `tracing` call — or a `#[derive(Debug)]` on any struct that
+/// happens to hold one — compiles silently and writes raw key bytes into a log.
+/// No production site does that today; this is what makes it impossible to
+/// start. The rest of the crate's secret-bearing types (`Secret`,
+/// `IndexKeyRecord`, `TlsContext`) already hand-write a redacting `Debug`, and
+/// this is the same treatment for the one type that was missing it.
+///
+/// [`Deref`] gives back the bytes, so the key is as usable as the alias was —
+/// the redaction covers formatting, not access.
+#[derive(Clone)]
+pub struct Key(Zeroizing<[u8; 32]>);
+
+impl Key {
+    pub fn new(bytes: [u8; 32]) -> Self {
+        Self(Zeroizing::new(bytes))
+    }
+}
+
+/// Redacted rather than derived: see [`Key`].
+impl std::fmt::Debug for Key {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("Key(<redacted>)")
+    }
+}
+
+impl std::ops::Deref for Key {
+    type Target = [u8; 32];
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl AsRef<[u8]> for Key {
+    fn as_ref(&self) -> &[u8] {
+        &*self.0
+    }
+}
+
+impl From<Zeroizing<[u8; 32]>> for Key {
+    fn from(bytes: Zeroizing<[u8; 32]>) -> Self {
+        Self(bytes)
+    }
+}
 
 pub trait KeySource: Send + Sync {
     /// The DEK new envelopes are encrypted under, with the id stamped into them.
@@ -165,7 +213,7 @@ fn decode<const N: usize>(hex_str: &str, what: &str) -> Result<[u8; N], Error> {
 }
 
 fn decode_key(hex_str: &str) -> Result<Key, Error> {
-    decode::<32>(hex_str, "key").map(Zeroizing::new)
+    decode::<32>(hex_str, "key").map(Key::new)
 }
 
 /// Appends `bytes` as lowercase hex straight into `out`. `hex::encode` would
@@ -197,6 +245,39 @@ email = \"0303030303030303030303030303030303030303030303030303030303030303\"
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("keys.toml"), contents).unwrap();
         dir
+    }
+
+    /// A stray `?key` in a `tracing` call must not be able to write key bytes
+    /// into a log line. `Zeroizing` derives `Debug`, so before the newtype this
+    /// compiled and printed all 32 bytes.
+    #[test]
+    fn debugging_a_key_never_prints_its_bytes() {
+        let key = Key::new([7u8; 32]);
+        let rendered = format!("{key:?}");
+
+        assert!(!rendered.contains('7'), "key material must not reach a log line: {rendered}");
+        assert!(rendered.contains("redacted"), "and the redaction is legible: {rendered}");
+        // The bytes are still reachable — the redaction is on formatting only.
+        assert_eq!(*key, [7u8; 32]);
+    }
+
+    /// The other half: a struct that holds a `Key` can derive `Debug` — the
+    /// thing that silently leaks with a `Zeroizing` alias — without exposing
+    /// anything.
+    #[test]
+    fn a_struct_holding_a_key_can_derive_debug_safely() {
+        #[derive(Debug)]
+        struct Holder {
+            name: &'static str,
+            key: Key,
+        }
+
+        let holder = Holder { name: "public.users.email", key: Key::new([9u8; 32]) };
+        let rendered = format!("{holder:?}");
+
+        assert!(rendered.contains(holder.name), "non-secret fields still print");
+        assert!(!rendered.contains('9'), "the key does not: {rendered}");
+        assert_eq!(*holder.key, [9u8; 32], "and the field is still usable");
     }
 
     #[test]

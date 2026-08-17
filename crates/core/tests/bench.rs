@@ -24,11 +24,10 @@
 use std::sync::Arc;
 use std::time::Instant;
 
-use dbsec_core::envelope::{Ciphers, KeyId, KEY_ID_LEN};
+use dbsec_core::envelope::{CellContext, Ciphers, KeyId, KEY_ID_LEN};
 use dbsec_core::keys::{Key, KeySource};
 use dbsec_core::transform::{EncryptTransform, FieldTransform, FpeTransform, TokenTransform};
 use dbsec_core::Error;
-use zeroize::Zeroizing;
 
 const KEY: [u8; 32] = [7u8; 32];
 const KEY_ID: KeyId = [1u8; KEY_ID_LEN];
@@ -39,13 +38,13 @@ struct BenchKeys;
 
 impl KeySource for BenchKeys {
     fn active_key(&self) -> Result<(KeyId, Key), Error> {
-        Ok((KEY_ID, Zeroizing::new(KEY)))
+        Ok((KEY_ID, Key::new(KEY)))
     }
     fn key(&self, _id: &KeyId) -> Result<Key, Error> {
-        Ok(Zeroizing::new(KEY))
+        Ok(Key::new(KEY))
     }
     fn index_key(&self, _name: &str) -> Result<Key, Error> {
-        Ok(Zeroizing::new(INDEX_KEY))
+        Ok(Key::new(INDEX_KEY))
     }
 }
 
@@ -75,8 +74,9 @@ fn seal_open_throughput() {
         (0..256).map(|i| format!("4111-1111-1111-{i:04}").into_bytes()).collect();
 
     let ciphers = Arc::new(Ciphers::new(keys.clone()));
-    let encrypt = EncryptTransform::new(ciphers.clone(), None);
-    let searchable = EncryptTransform::new(ciphers, Some("users.email".into()));
+    let context = CellContext::new("public.users.email");
+    let encrypt = EncryptTransform::new(ciphers.clone(), context.clone(), None);
+    let searchable = EncryptTransform::new(ciphers, context, Some("users.email".into()));
     let fpe = FpeTransform::new(keys.clone(), "cards.pan".into(), true);
     let token = TokenTransform::new(keys.clone(), "users.ssn".into());
 

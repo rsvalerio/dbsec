@@ -8,13 +8,12 @@
 
 use std::sync::Arc;
 
-use dbsec_core::envelope::{Ciphers, KeyId, KEY_ID_LEN};
+use dbsec_core::envelope::{CellContext, Ciphers, KeyId, KEY_ID_LEN};
 use dbsec_core::keys::{Key, KeySource};
 use dbsec_core::mask::MaskSpec;
 use dbsec_core::transform::{EncryptTransform, FieldTransform, FpeTransform, TokenTransform};
 use dbsec_core::Error;
 use libfuzzer_sys::fuzz_target;
-use zeroize::Zeroizing;
 
 const KEY: [u8; 32] = [7u8; 32];
 const KEY_ID: KeyId = [1u8; KEY_ID_LEN];
@@ -24,17 +23,17 @@ struct FuzzKeys;
 
 impl KeySource for FuzzKeys {
     fn active_key(&self) -> Result<(KeyId, Key), Error> {
-        Ok((KEY_ID, Zeroizing::new(KEY)))
+        Ok((KEY_ID, Key::new(KEY)))
     }
     fn key(&self, id: &KeyId) -> Result<Key, Error> {
         if id == &KEY_ID {
-            Ok(Zeroizing::new(KEY))
+            Ok(Key::new(KEY))
         } else {
             Err(Error::UnknownKey(hex::encode(id)))
         }
     }
     fn index_key(&self, _name: &str) -> Result<Key, Error> {
-        Ok(Zeroizing::new(INDEX_KEY))
+        Ok(Key::new(INDEX_KEY))
     }
 }
 
@@ -70,7 +69,11 @@ fuzz_target!(|data: &[u8]| {
     let ciphers = Arc::new(Ciphers::new(keys.clone()));
 
     for index_key in [None, Some("users.email".to_owned())] {
-        let encrypt = EncryptTransform::new(ciphers.clone(), index_key);
+        let encrypt = EncryptTransform::new(
+            ciphers.clone(),
+            CellContext::new("public.users.email"),
+            index_key,
+        );
         // Arbitrary bytes cannot pass GCM authentication under a key the fuzzer
         // does not have, so an opened value would mean the envelope was read
         // without being verified.

@@ -92,7 +92,7 @@ async fn vault_key_source_survives_restarts() {
     let stored =
         direct.query_one(&format!("SELECT email FROM {TABLE} WHERE id = 1"), &[]).await.unwrap();
     let first: Vec<u8> = stored.get(0);
-    assert_eq!(&first[32..36], b"DBS1", "blind index then envelope magic");
+    assert_eq!(&first[32..36], b"DBS2", "blind index then envelope magic");
     let first_key_id = first[KEY_ID_AT].to_vec();
     let first_index = first[..32].to_vec();
 

@@ -8,7 +8,7 @@ use std::sync::{Arc, OnceLock};
 use aes::Aes256;
 use fpe::ff1::{FlexibleNumeralString, FF1};
 
-use crate::envelope::Ciphers;
+use crate::envelope::{CellContext, Ciphers};
 use crate::keys::{Key, KeySource};
 use crate::{blind_index, envelope, Error};
 
@@ -64,6 +64,10 @@ pub trait FieldTransform: Send + Sync {
 /// budget for it.
 pub struct EncryptTransform {
     ciphers: Arc<Ciphers>,
+    /// The column this transform belongs to, bound into every envelope it
+    /// writes so its ciphertexts authenticate nowhere else. One transform per
+    /// protected column, so this is fixed for the transform's life.
+    context: CellContext,
     /// Name of the deterministic index key; `Some` makes the column searchable.
     index_key_name: Option<String>,
     /// The index key itself, resolved on first use and reused per value.
@@ -71,8 +75,8 @@ pub struct EncryptTransform {
 }
 
 impl EncryptTransform {
-    pub fn new(ciphers: Arc<Ciphers>, index_key: Option<String>) -> Self {
-        Self { ciphers, index_key_name: index_key, index_key: OnceLock::new() }
+    pub fn new(ciphers: Arc<Ciphers>, context: CellContext, index_key: Option<String>) -> Self {
+        Self { ciphers, context, index_key_name: index_key, index_key: OnceLock::new() }
     }
 
     pub fn searchable(&self) -> bool {
@@ -99,7 +103,7 @@ impl EncryptTransform {
 
 impl FieldTransform for EncryptTransform {
     fn seal(&self, plaintext: &[u8]) -> Result<Vec<u8>, Error> {
-        let sealed = self.ciphers.seal(plaintext)?;
+        let sealed = self.ciphers.seal(&self.context, plaintext)?;
         match self.blind_index(plaintext)? {
             Some(index) => Ok(blind_index::prepend(&index, &sealed)),
             None => Ok(sealed),
@@ -118,7 +122,7 @@ impl FieldTransform for EncryptTransform {
             // Neither stored form: pre-migration plaintext, passed through.
             None => return Ok(None),
         };
-        self.ciphers.open(enveloped).map(Some)
+        self.ciphers.open(&self.context, enveloped).map(Some)
     }
 
     fn search_index(&self, plaintext: &[u8]) -> Result<Option<Vec<u8>>, Error> {
@@ -255,7 +259,6 @@ mod tests {
     use super::*;
     use crate::envelope::{KeyId, KEY_ID_LEN};
     use crate::keys::Key;
-    use zeroize::Zeroizing;
 
     const KEY: [u8; 32] = [7u8; 32];
     const KEY_ID: KeyId = [1u8; KEY_ID_LEN];
@@ -265,17 +268,17 @@ mod tests {
 
     impl KeySource for TestKeys {
         fn active_key(&self) -> Result<(KeyId, Key), Error> {
-            Ok((KEY_ID, Zeroizing::new(KEY)))
+            Ok((KEY_ID, Key::new(KEY)))
         }
         fn key(&self, id: &KeyId) -> Result<Key, Error> {
             if id == &KEY_ID {
-                Ok(Zeroizing::new(KEY))
+                Ok(Key::new(KEY))
             } else {
                 Err(Error::UnknownKey("test".into()))
             }
         }
         fn index_key(&self, _name: &str) -> Result<Key, Error> {
-            Ok(Zeroizing::new(INDEX_KEY))
+            Ok(Key::new(INDEX_KEY))
         }
     }
 
@@ -283,9 +286,13 @@ mod tests {
         Arc::new(Ciphers::new(Arc::new(TestKeys)))
     }
 
+    fn email() -> CellContext {
+        CellContext::new("public.users.email")
+    }
+
     #[test]
     fn seal_open_roundtrip() {
-        let t = EncryptTransform::new(ciphers(), None);
+        let t = EncryptTransform::new(ciphers(), email(), None);
         let stored = t.seal(b"alice@example.com").unwrap();
         assert!(envelope::is_enveloped(&stored));
         assert_eq!(t.open(&stored).unwrap().unwrap(), b"alice@example.com");
@@ -294,7 +301,7 @@ mod tests {
 
     #[test]
     fn searchable_seal_carries_blind_index() {
-        let t = EncryptTransform::new(ciphers(), Some("users.email".into()));
+        let t = EncryptTransform::new(ciphers(), email(), Some("users.email".into()));
         let stored = t.seal(b"alice").unwrap();
         let (index, _) = blind_index::split(&stored).unwrap();
         assert_eq!(index, blind_index::compute(&INDEX_KEY, b"alice"));
@@ -304,16 +311,53 @@ mod tests {
     #[test]
     fn disabling_searchable_still_opens_index_prefixed_rows() {
         let shared = ciphers();
-        let searchable = EncryptTransform::new(shared.clone(), Some("users.email".into()));
+        let searchable = EncryptTransform::new(shared.clone(), email(), Some("users.email".into()));
         let stored = searchable.seal(b"alice@example.com").unwrap();
 
         // The same column after `searchable = false`: rows written under the
         // old config must still decrypt, never pass through as raw bytes.
-        let plain = EncryptTransform::new(shared, None);
+        let plain = EncryptTransform::new(shared, email(), None);
         assert_eq!(plain.open(&stored).unwrap().unwrap(), b"alice@example.com");
         // The reverse direction (searchable turned on) keeps working too.
         let bare = searchable.open(&plain.seal(b"bob@example.com").unwrap()).unwrap();
         assert_eq!(bare.unwrap(), b"bob@example.com");
+    }
+
+    /// Two columns sharing one DEK still cannot read each other's stored
+    /// bytes: whoever can write the table cannot relocate a value into a
+    /// column it was not sealed for.
+    #[test]
+    fn a_value_relocated_into_another_column_fails_to_open() {
+        let shared = ciphers();
+        let ssn = EncryptTransform::new(shared.clone(), CellContext::new("public.users.ssn"), None);
+        let card =
+            EncryptTransform::new(shared, CellContext::new("public.users.credit_card"), None);
+
+        let stored = ssn.seal(b"078-05-1120").unwrap();
+        assert!(matches!(card.open(&stored), Err(Error::Decrypt)));
+        assert_eq!(ssn.open(&stored).unwrap().unwrap(), b"078-05-1120");
+    }
+
+    /// The blind index travels with the envelope, so relocating a searchable
+    /// value carries a valid-looking search token with it — the envelope
+    /// underneath is still what refuses.
+    #[test]
+    fn relocating_a_searchable_value_fails_despite_a_valid_index_prefix() {
+        let shared = ciphers();
+        let ssn = EncryptTransform::new(
+            shared.clone(),
+            CellContext::new("public.users.ssn"),
+            Some("public.users.ssn".into()),
+        );
+        let card = EncryptTransform::new(
+            shared,
+            CellContext::new("public.users.credit_card"),
+            Some("public.users.credit_card".into()),
+        );
+
+        let stored = ssn.seal(b"078-05-1120").unwrap();
+        assert!(blind_index::split(&stored).is_some(), "the stored form carries an index");
+        assert!(matches!(card.open(&stored), Err(Error::Decrypt)));
     }
 
     #[test]

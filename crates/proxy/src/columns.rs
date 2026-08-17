@@ -4,7 +4,7 @@
 
 use std::sync::Arc;
 
-use dbsec_core::envelope::Ciphers;
+use dbsec_core::envelope::{CellContext, Ciphers};
 use dbsec_core::keys::KeySource;
 use dbsec_core::mask::MaskSpec;
 use dbsec_core::transform::{EncryptTransform, FieldTransform, FpeTransform, TokenTransform};
@@ -52,7 +52,16 @@ pub fn build(config: &Config, keys: &Arc<dyn KeySource>) -> Vec<ProtectedColumn>
             {
                 TransformKind::Encrypt => {
                     let index_key = column.searchable.then(|| key_name.clone());
-                    (Some(Arc::new(EncryptTransform::new(ciphers.clone(), index_key))), true)
+                    // The same `schema.table.column` that names the index key
+                    // is bound into every envelope this column writes, so a
+                    // ciphertext moved to another column stops authenticating.
+                    // Both data paths reach this one transform for the column,
+                    // so write and read always agree on the binding.
+                    let context = CellContext::new(key_name);
+                    (
+                        Some(Arc::new(EncryptTransform::new(ciphers.clone(), context, index_key))),
+                        true,
+                    )
                 }
                 TransformKind::Fpe => (
                     Some(Arc::new(FpeTransform::new(keys.clone(), key_name, column.detokenize))),
@@ -111,5 +120,30 @@ mod tests {
 
         assert!(columns[4].transform.is_none(), "mask-only column has no transform");
         assert_eq!(columns[4].mask.unwrap().keep_first, 1);
+    }
+
+    /// Two encrypted columns share one DEK, so only the per-column binding
+    /// stops stored bytes being moved from one into the other. This pins the
+    /// wiring: the transform each column gets is bound to *its* name.
+    #[test]
+    fn each_encrypted_column_is_bound_to_its_own_name() {
+        let config: Config = toml::from_str(
+            "keys_file = \"k\"\ncontrol_dsn = \"d\"\n\
+             \n[[column]]\ntable = \"users\"\ncolumn = \"ssn\"\n\
+             \n[[column]]\ntable = \"users\"\ncolumn = \"credit_card\"\n",
+        )
+        .unwrap();
+        let keys: Arc<dyn KeySource> = Arc::new(OneKey);
+        let columns = build(&config, &keys);
+
+        let ssn = columns[0].transform.as_ref().expect("encrypt column has a transform");
+        let card = columns[1].transform.as_ref().expect("encrypt column has a transform");
+
+        let stored = ssn.seal(b"078-05-1120").unwrap();
+        assert!(
+            matches!(card.open(&stored), Err(dbsec_core::Error::Decrypt)),
+            "an ssn value pasted into credit_card must not authenticate"
+        );
+        assert_eq!(ssn.open(&stored).unwrap().unwrap(), b"078-05-1120");
     }
 }

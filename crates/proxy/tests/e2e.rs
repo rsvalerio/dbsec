@@ -85,7 +85,7 @@ async fn transparent_encryption_end_to_end() {
         .await
         .unwrap();
     let email: Vec<u8> = stored.get(0);
-    assert_eq!(&email[32..36], b"DBS1", "blind index then envelope magic");
+    assert_eq!(&email[32..36], b"DBS2", "blind index then envelope magic");
     assert_ne!(stored.get::<_, &str>(1), "555-123-4567");
     assert_eq!(stored.get::<_, &str>(1).len(), 12, "FPE keeps the shape");
     assert_eq!(stored.get::<_, &str>(2).len(), 64, "HMAC token at rest");
@@ -314,7 +314,7 @@ async fn a_recreated_table_is_re_resolved_and_refused_in_strict_mode() {
     client.execute(&insert, &[&&b"carol@example.com"[..]]).await.unwrap();
     let stored: Vec<u8> =
         direct.query_one(&select, &[]).await.unwrap().get::<_, Option<Vec<u8>>>(0).unwrap();
-    assert_eq!(&stored[32..36], b"DBS1", "writes are still sealed after the migration");
+    assert_eq!(&stored[32..36], b"DBS2", "writes are still sealed after the migration");
 
     // The read path heals: the first read that cannot explain the column asks
     // for a re-resolution, and the next one decrypts again. Polled rather than

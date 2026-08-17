@@ -64,7 +64,7 @@ def psycopg3_server_side_binding(direct):
     with direct.cursor() as cur:
         cur.execute(f"SELECT email, phone, ssn, note FROM {TABLE} WHERE id = 1")
         email, phone, ssn, note = cur.fetchone()
-        check(bytes(email)[32:36] == b"DBS1", "stored value is not blind index + envelope")
+        check(bytes(email)[32:36] == b"DBS2", "stored value is not blind index + envelope")
         check(phone != "555-101-2020" and len(phone) == 12, f"FPE at rest wrong: {phone!r}")
         check(len(ssn) == 64, f"token at rest wrong: {ssn!r}")
         check(note == "grace-note", "mask-only column should stay plaintext at rest")
@@ -100,7 +100,7 @@ def psycopg3_prepared_and_binary(direct):
     with direct.cursor() as cur:
         cur.execute(f"SELECT email FROM {TABLE} WHERE note = 'prepared' ORDER BY id")
         for (email,) in cur.fetchall():
-            check(bytes(email)[32:36] == b"DBS1", "prepared insert stored plaintext")
+            check(bytes(email)[32:36] == b"DBS2", "prepared insert stored plaintext")
 
 
 def psycopg3_client_side_binding(direct):
@@ -121,7 +121,7 @@ def psycopg3_client_side_binding(direct):
     with direct.cursor() as cur:
         cur.execute(f"SELECT email, phone FROM {TABLE} WHERE note = 'client-side'")
         email, phone = cur.fetchone()
-        check(bytes(email)[32:36] == b"DBS1", "client-side binding stored plaintext")
+        check(bytes(email)[32:36] == b"DBS2", "client-side binding stored plaintext")
         check(phone != "555-707-8080", "client-side binding stored the phone in the clear")
 
 
@@ -149,7 +149,7 @@ def psycopg2_client_side_binding(direct):
     with direct.cursor() as cur:
         cur.execute(f"SELECT email, phone FROM {TABLE} WHERE note = 'psycopg2'")
         email, phone = cur.fetchone()
-        check(bytes(email)[32:36] == b"DBS1", "psycopg2 stored plaintext")
+        check(bytes(email)[32:36] == b"DBS2", "psycopg2 stored plaintext")
         check(phone != "555-909-1010", "psycopg2 stored the phone in the clear")
 
 
