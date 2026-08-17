@@ -27,8 +27,9 @@
 //! sites are: non-UTF-8 and unparseable SQL, `INSERT` without a column list,
 //! `INSERT ... SELECT`, `COPY`, `MERGE`, `PREPARE` of a write, a non-literal
 //! expression bound to a protected column, an unqualified name under a
-//! changed `search_path`, and a predicate over a searchable column the
-//! rewriter cannot turn into a blind-index match.
+//! changed `search_path`, an unqualified column matching a protected column
+//! in more than one relation in scope, and a predicate over a searchable
+//! column the rewriter cannot turn into a blind-index match.
 //!
 //! A refusal is a statement-level error, not a dropped connection: the client
 //! gets ErrorResponse + ReadyForQuery (or, in the extended protocol,
@@ -214,6 +215,67 @@ enum SqlOutcome {
     Rewrite(RewriteOutcome),
     /// Refuse it with this message.
     Refuse(String),
+}
+
+/// What sealing an `INSERT`'s `VALUES` list did.
+#[derive(Default)]
+struct SealedValues {
+    /// Whether a value was rewritten, so the statement needs re-rendering.
+    changed: bool,
+    /// The protected columns the rows carried, normalized — the columns whose
+    /// values went through [`QueryRewriter::seal_expr`], which is what makes
+    /// `EXCLUDED.<col>` safe to re-store in the conflict action. A value
+    /// `seal_expr` could not seal is not silently included: it raised its own
+    /// [`Unprotected::UnsupportedValue`] there, so under `reject` the
+    /// statement never reaches the conflict action at all, and under `warn`
+    /// the plaintext it re-stores is the plaintext already being inserted.
+    columns: HashSet<String>,
+}
+
+/// What an assignment list may write into: the target table's protected
+/// columns, and what the rest of the same statement already sealed.
+struct AssignmentScope<'a> {
+    columns: &'a Columns,
+    sealed: SealedValues,
+}
+
+impl AssignmentScope<'_> {
+    /// A plain `UPDATE`: no `EXCLUDED` relation exists, so no value in this
+    /// statement is one the proxy sealed a clause earlier.
+    fn of(columns: &Columns) -> AssignmentScope<'_> {
+        AssignmentScope { columns, sealed: SealedValues::default() }
+    }
+
+    /// Whether `value` is `EXCLUDED.<column>` naming a column this `INSERT`'s
+    /// `VALUES` list already sealed.
+    ///
+    /// `INSERT ... ON CONFLICT (id) DO UPDATE SET email = EXCLUDED.email` is
+    /// the canonical PostgreSQL upsert, and `EXCLUDED.email` is exactly the
+    /// value this proxy sealed a few clauses earlier — storing it stores the
+    /// sealed form, which is what the column is supposed to hold. There is no
+    /// plaintext here to seal, so treating it as
+    /// [`Unprotected::UnsupportedValue`] refused correct SQL outright under
+    /// `reject`: an availability false positive of the kind that keeps
+    /// operators on the permissive default instead of enabling fail-closed.
+    ///
+    /// The whitelist is deliberately narrow, because a reference that is *not*
+    /// provably already sealed would write plaintext with no signal at all:
+    ///
+    /// - the qualifier must be the `EXCLUDED` pseudo-relation, not another
+    ///   table in the statement;
+    /// - the column must be the same column being assigned — a different one
+    ///   was sealed under a different column's transform, so its stored form
+    ///   is not a value this column can be read back through;
+    /// - and it must be one the `VALUES` list actually carried. `EXCLUDED.c`
+    ///   for a column the INSERT did not list is that column's default, which
+    ///   nothing sealed.
+    fn re_stores_a_sealed_value(&self, value: &Expr, column: &str) -> bool {
+        let Expr::CompoundIdentifier(idents) = value else { return false };
+        let [qualifier, referenced] = idents.as_slice() else { return false };
+        normalize(qualifier) == "excluded"
+            && normalize(referenced) == column
+            && self.sealed.columns.contains(column)
+    }
 }
 
 /// Per-session write-path state: rewrites Query/Parse SQL and Bind
@@ -538,14 +600,20 @@ impl QueryRewriter {
     ) -> Result<bool, Rejection> {
         match statement {
             Statement::Insert(insert) => self.rewrite_insert(insert, params),
-            Statement::Update { table, assignments, selection, .. } => {
+            Statement::Update { table, assignments, from, selection, .. } => {
                 let mut changed = false;
                 if let TableFactor::Table { name, .. } = &table.relation {
                     if let Some(columns) = self.table(name)? {
-                        changed |= self.seal_assignments(assignments, columns, params)?;
+                        let target = AssignmentScope::of(columns);
+                        changed |= self.seal_assignments(assignments, &target, params)?;
                     }
                 }
-                let scope = self.scope(std::slice::from_ref(table))?;
+                // `UPDATE ... FROM other` is a join: the predicate resolves
+                // names against the joined relation as well as the target, so
+                // a searchable column of *that* relation is as much a rewrite
+                // site as the target's own. Dropping it with the `..` left the
+                // comparison relayed verbatim — no rewrite, and no signal.
+                let scope = self.scope(std::iter::once(&*table).chain(from.as_ref()))?;
                 if let Some(selection) = selection {
                     changed |= self.rewrite_predicate(selection, &scope, params)?;
                 }
@@ -554,6 +622,8 @@ impl QueryRewriter {
                 for assignment in assignments.iter_mut() {
                     changed |= self.rewrite_nested_queries(&mut assignment.value, params)?;
                 }
+                changed |=
+                    self.rewrite_derived_tables(std::iter::once(&mut *table).chain(from), params)?;
                 Ok(changed)
             }
             Statement::Query(query) => self.rewrite_query(query, params),
@@ -562,11 +632,25 @@ impl QueryRewriter {
                     sqlparser::ast::FromTable::WithFromKeyword(tables)
                     | sqlparser::ast::FromTable::WithoutKeyword(tables) => tables,
                 };
-                let scope = self.scope(tables)?;
+                // `USING` is the DELETE spelling of `UPDATE ... FROM`, and it
+                // is a separate field: a predicate over the joined relation
+                // resolves against it, so it belongs in the scope too. Left
+                // out, `DELETE FROM sessions USING users WHERE users.email =
+                // $1` compares plaintext against the stored form and deletes
+                // nothing — and its `<>` inversion deletes everything.
+                let scope = self.scope(tables.iter().chain(delete.using.iter().flatten()))?;
                 let mut changed = false;
                 if let Some(selection) = delete.selection.as_mut() {
                     changed |= self.rewrite_predicate(selection, &scope, params)?;
                 }
+                let tables = match &mut delete.from {
+                    sqlparser::ast::FromTable::WithFromKeyword(tables)
+                    | sqlparser::ast::FromTable::WithoutKeyword(tables) => tables,
+                };
+                changed |= self.rewrite_derived_tables(
+                    tables.iter_mut().chain(delete.using.iter_mut().flatten()),
+                    params,
+                )?;
                 Ok(changed)
             }
             Statement::Copy { source, to, .. } => {
@@ -617,13 +701,27 @@ impl QueryRewriter {
     ) -> Result<bool, Rejection> {
         let Some(columns) = self.table(&insert.table_name)? else { return Ok(false) };
         let mut changed = false;
+        let mut sealed = SealedValues::default();
         if insert.columns.is_empty() {
             // Without a column list the values cannot be matched to columns:
             // the table's own column order is not something the proxy knows.
             self.unprotected(&Unprotected::NoColumnList(&insert.table_name))?;
         } else {
-            changed |= self.rewrite_insert_values(insert, columns, params)?;
+            sealed = self.rewrite_insert_values(insert, columns, params)?;
+            changed |= sealed.changed;
         }
+        // The conflict action's `WHERE` is a predicate over the target table,
+        // exactly like an UPDATE's own, so it is resolved against the same
+        // scope. The alias an `INSERT INTO t AS x` gives that table is the
+        // only name the predicate can qualify with, so the scope carries it.
+        let scope = TableScope {
+            tables: vec![ScopedTable {
+                alias: insert.table_alias.as_ref().map(normalize),
+                name: insert.table_name.0.iter().map(normalize).collect(),
+                columns,
+            }],
+        };
+        let target = AssignmentScope { columns, sealed };
         // The conflict action writes the same columns on every existing row,
         // and it is a plain assignment list — the UPDATE path handles it.
         match insert.on.as_mut() {
@@ -631,10 +729,13 @@ impl QueryRewriter {
                 action: OnConflictAction::DoUpdate(update),
                 ..
             })) => {
-                changed |= self.seal_assignments(&mut update.assignments, columns, params)?;
+                changed |= self.seal_assignments(&mut update.assignments, &target, params)?;
+                if let Some(selection) = update.selection.as_mut() {
+                    changed |= self.rewrite_predicate(selection, &scope, params)?;
+                }
             }
             Some(OnInsert::DuplicateKeyUpdate(assignments)) => {
-                changed |= self.seal_assignments(assignments, columns, params)?;
+                changed |= self.seal_assignments(assignments, &target, params)?;
             }
             _ => {}
         }
@@ -646,36 +747,34 @@ impl QueryRewriter {
         insert: &mut Insert,
         columns: &Columns,
         params: &mut ParamTransforms,
-    ) -> Result<bool, Rejection> {
-        let protected: Vec<(usize, &str, Arc<dyn FieldTransform>)> = insert
+    ) -> Result<SealedValues, Rejection> {
+        let protected: Vec<(usize, &Ident, Arc<dyn FieldTransform>)> = insert
             .columns
             .iter()
             .enumerate()
             .filter_map(|(position, ident)| {
-                let name = normalize(ident);
-                columns
-                    .get(&name)
-                    .map(|transform| (position, ident.value.as_str(), transform.clone()))
+                columns.get(&normalize(ident)).map(|transform| (position, ident, transform.clone()))
             })
             .collect();
         if protected.is_empty() {
-            return Ok(false);
+            return Ok(SealedValues::default());
         }
         let table = insert.table_name.clone();
-        let Some(source) = insert.source.as_mut() else { return Ok(false) };
+        let Some(source) = insert.source.as_mut() else { return Ok(SealedValues::default()) };
         let SetExpr::Values(values) = source.body.as_mut() else {
             self.unprotected(&Unprotected::InsertFromSelect(&table))?;
-            return Ok(false);
+            return Ok(SealedValues::default());
         };
-        let mut changed = false;
+        let mut sealed = SealedValues::default();
         for row in &mut values.rows {
-            for (position, column, transform) in &protected {
+            for (position, ident, transform) in &protected {
                 if let Some(expr) = row.get_mut(*position) {
-                    changed |= self.seal_expr(expr, transform, column, params)?;
+                    sealed.changed |= self.seal_expr(expr, transform, &ident.value, params)?;
                 }
             }
         }
-        Ok(changed)
+        sealed.columns = protected.iter().map(|(_, ident, _)| normalize(ident)).collect();
+        Ok(sealed)
     }
 
     /// Seals every assignment that targets a protected column. Shared by
@@ -683,21 +782,25 @@ impl QueryRewriter {
     fn seal_assignments(
         &self,
         assignments: &mut [Assignment],
-        columns: &Columns,
+        target: &AssignmentScope<'_>,
         params: &mut ParamTransforms,
     ) -> Result<bool, Rejection> {
         let mut changed = false;
-        for Assignment { target, value } in assignments {
-            match target {
+        for Assignment { target: assigned, value } in assignments {
+            match assigned {
                 AssignmentTarget::ColumnName(column) => {
                     let Some(ident) = column.0.last() else { continue };
-                    let Some(transform) = columns.get(&normalize(ident)) else { continue };
+                    let name = normalize(ident);
+                    let Some(transform) = target.columns.get(&name) else { continue };
+                    if target.re_stores_a_sealed_value(value, &name) {
+                        continue;
+                    }
                     let transform = transform.clone();
                     let name = ident.value.clone();
                     changed |= self.seal_expr(value, &transform, &name, params)?;
                 }
                 AssignmentTarget::Tuple(names) => {
-                    changed |= self.seal_tuple_assignment(names, value, columns, params)?;
+                    changed |= self.seal_tuple_assignment(names, value, target, params)?;
                 }
             }
         }
@@ -737,18 +840,18 @@ impl QueryRewriter {
         &self,
         names: &[ObjectName],
         value: &mut Expr,
-        columns: &Columns,
+        target: &AssignmentScope<'_>,
         params: &mut ParamTransforms,
     ) -> Result<bool, Rejection> {
         // Qualified targets are legal here (`SET (u.email, id) = ...`), so the
         // last ident names the column, as on the single-column path.
-        let protected: Vec<(usize, String, Arc<dyn FieldTransform>)> = names
+        let protected: Vec<(usize, &Ident, Arc<dyn FieldTransform>)> = names
             .iter()
             .enumerate()
             .filter_map(|(position, name)| {
                 let ident = name.0.last()?;
-                let transform = columns.get(&normalize(ident))?;
-                Some((position, ident.value.clone(), transform.clone()))
+                let transform = target.columns.get(&normalize(ident))?;
+                Some((position, ident, transform.clone()))
             })
             .collect();
         if protected.is_empty() {
@@ -758,8 +861,8 @@ impl QueryRewriter {
         // Signals every protected column in the target, so the operator sees
         // each one rather than only the first.
         let signal = |site: &dyn Fn(&str) -> Unprotected<'_>| -> Result<bool, Rejection> {
-            for (_, column, _) in &protected {
-                self.unprotected(&site(column))?;
+            for (_, ident, _) in &protected {
+                self.unprotected(&site(&ident.value))?;
             }
             Ok(false)
         };
@@ -780,8 +883,11 @@ impl QueryRewriter {
         }
 
         let mut changed = false;
-        for (position, column, transform) in &protected {
-            changed |= self.seal_expr(&mut elements[*position], transform, column, params)?;
+        for (position, ident, transform) in &protected {
+            if target.re_stores_a_sealed_value(&elements[*position], &normalize(ident)) {
+                continue;
+            }
+            changed |= self.seal_expr(&mut elements[*position], transform, &ident.value, params)?;
         }
         Ok(changed)
     }
@@ -843,17 +949,7 @@ impl QueryRewriter {
                 }
             }
         }
-        // Derived tables carry their own FROM, so they are rewritten against
-        // their own scope rather than this one.
-        for table in &mut select.from {
-            for factor in std::iter::once(&mut table.relation)
-                .chain(table.joins.iter_mut().map(|join| &mut join.relation))
-            {
-                if let TableFactor::Derived { subquery, .. } = factor {
-                    changed |= self.rewrite_query(subquery, params)?;
-                }
-            }
-        }
+        changed |= self.rewrite_derived_tables(&mut select.from, params)?;
         for predicate in [select.selection.as_mut(), select.having.as_mut()].into_iter().flatten() {
             changed |= self.rewrite_predicate(predicate, &scope, params)?;
         }
@@ -871,6 +967,34 @@ impl QueryRewriter {
         }
         for expr in select_expressions(select) {
             changed |= self.rewrite_nested_queries(expr, params)?;
+        }
+        Ok(changed)
+    }
+
+    /// Rewrites the derived tables of a relation list against their own
+    /// scopes.
+    ///
+    /// A derived table carries its own FROM, so its predicates belong to its
+    /// own traversal rather than the enclosing one. Every clause that holds
+    /// relations needs this pass, not only `SELECT`: `UPDATE ... FROM (SELECT
+    /// ...)` and `DELETE ... USING (SELECT ...)` walked their own `WHERE` but
+    /// never descended into the subquery next to it, so a searchable equality
+    /// in there was left comparing plaintext against the stored form — no
+    /// rewrite, no signal, and no rows.
+    fn rewrite_derived_tables<'from>(
+        &self,
+        from: impl IntoIterator<Item = &'from mut TableWithJoins>,
+        params: &mut ParamTransforms,
+    ) -> Result<bool, Rejection> {
+        let mut changed = false;
+        for table in from {
+            for factor in std::iter::once(&mut table.relation)
+                .chain(table.joins.iter_mut().map(|join| &mut join.relation))
+            {
+                if let TableFactor::Derived { subquery, .. } = factor {
+                    changed |= self.rewrite_query(subquery, params)?;
+                }
+            }
         }
         Ok(changed)
     }
@@ -998,7 +1122,14 @@ impl QueryRewriter {
 
     /// Collects the protected tables visible to a predicate, with their
     /// aliases, so column references can be resolved.
-    fn scope(&self, from: &[TableWithJoins]) -> Result<TableScope<'_>, Rejection> {
+    ///
+    /// Takes an iterator rather than a slice because the relations a predicate
+    /// sees are not always contiguous: `UPDATE ... FROM` keeps its second
+    /// relation in a field of its own, next to the target.
+    fn scope<'from>(
+        &self,
+        from: impl IntoIterator<Item = &'from TableWithJoins>,
+    ) -> Result<TableScope<'_>, Rejection> {
         let mut tables = Vec::new();
         for table_with_joins in from {
             let factors = std::iter::once(&table_with_joins.relation)
@@ -1080,6 +1211,10 @@ impl QueryRewriter {
         params: &mut ParamTransforms,
     ) -> Result<bool, Rejection> {
         let Some(transform) = column_ref(scope, column).cloned() else {
+            if let Some(column) = ambiguous_column(column, scope) {
+                self.unprotected(&Unprotected::AmbiguousColumn { column, shape: "IN list" })?;
+                return Ok(false);
+            }
             // Row-wise `(a, b) IN ((..), (..))`: no single transform covers a
             // row constructor, so it cannot be rewritten — but it still has to
             // be reported rather than relayed to match nothing.
@@ -1163,8 +1298,15 @@ impl QueryRewriter {
         expr: &Expr,
         scope: &TableScope<'_>,
     ) -> Result<bool, Rejection> {
-        let Some((column, searchable)) = protected_operand(expr, scope) else { return Ok(false) };
         let shape = expr_shape(expr);
+        // Checked first: an ambiguous name resolves to no transform, so the
+        // protected-operand test below cannot see it, and it is precisely the
+        // case that must not be left as a plaintext comparison.
+        if let Some(column) = ambiguous_operand(expr, scope) {
+            self.unprotected(&Unprotected::AmbiguousColumn { column, shape })?;
+            return Ok(false);
+        }
+        let Some((column, searchable)) = protected_operand(expr, scope) else { return Ok(false) };
         self.unprotected(&if searchable {
             Unprotected::Predicate { column, shape }
         } else {
@@ -1298,26 +1440,42 @@ struct TableScope<'a> {
     tables: Vec<ScopedTable<'a>>,
 }
 
+/// What a scope made of a column reference.
+///
+/// Ambiguity is a case of its own rather than a second spelling of "not
+/// found": an unqualified name matching a protected column in two relations
+/// cannot be rewritten — guessing which table's blind index to compare against
+/// is exactly the wrong-rows outcome the rewrite exists to prevent — but it
+/// still *is* a predicate over a protected column, so it has to reach
+/// [`QueryRewriter::unprotected`]. Collapsing it into "no protected column
+/// here" left the comparison relayed with nothing but a log line, refused by
+/// nothing, matching no row.
+enum ColumnResolution<'a> {
+    /// Exactly one protected column in scope carries this name.
+    One(&'a Arc<dyn FieldTransform>),
+    /// More than one does, and no rewrite can choose between them.
+    Ambiguous,
+    /// No protected column in scope carries this name.
+    Unknown,
+}
+
 impl TableScope<'_> {
     /// Resolves a (possibly qualified) column reference to its transform.
-    /// Unqualified names matching more than one protected table are skipped —
-    /// ambiguity must not guess.
-    fn resolve(&self, idents: &[Ident]) -> Option<&Arc<dyn FieldTransform>> {
-        let (column, qualifiers) = idents.split_last()?;
+    fn resolve(&self, idents: &[Ident]) -> ColumnResolution<'_> {
+        let Some((column, qualifiers)) = idents.split_last() else {
+            return ColumnResolution::Unknown;
+        };
         let column = normalize(column);
-        let matches: Vec<_> = self
+        let mut matches = self
             .tables
             .iter()
             .filter(|table| table.matches(qualifiers))
-            .filter_map(|table| table.columns.get(&column))
-            .collect();
-        match matches.as_slice() {
-            [transform] => Some(transform),
-            [] => None,
-            _ => {
-                tracing::warn!(column, "ambiguous column reference; equality not rewritten");
-                None
-            }
+            .filter_map(|table| table.columns.get(&column));
+        let Some(transform) = matches.next() else { return ColumnResolution::Unknown };
+        if matches.next().is_some() {
+            ColumnResolution::Ambiguous
+        } else {
+            ColumnResolution::One(transform)
         }
     }
 }
@@ -1341,11 +1499,21 @@ impl ScopedTable<'_> {
     }
 }
 
-fn column_ref<'a>(scope: &'a TableScope<'_>, expr: &Expr) -> Option<&'a Arc<dyn FieldTransform>> {
+/// How a scope resolves an expression that may be a column reference.
+fn resolve_column<'a>(scope: &'a TableScope<'_>, expr: &Expr) -> ColumnResolution<'a> {
     match expr {
         Expr::Identifier(ident) => scope.resolve(std::slice::from_ref(ident)),
         Expr::CompoundIdentifier(idents) => scope.resolve(idents),
-        _ => None,
+        _ => ColumnResolution::Unknown,
+    }
+}
+
+/// The transform of a column reference that resolves to exactly one protected
+/// column. An ambiguous one deliberately does not: see [`ColumnResolution`].
+fn column_ref<'a>(scope: &'a TableScope<'_>, expr: &Expr) -> Option<&'a Arc<dyn FieldTransform>> {
+    match resolve_column(scope, expr) {
+        ColumnResolution::One(transform) => Some(transform),
+        ColumnResolution::Ambiguous | ColumnResolution::Unknown => None,
     }
 }
 
@@ -1477,9 +1645,17 @@ fn column_name(expr: &Expr) -> Option<String> {
 /// the warning stream under `warn`. `IS DISTINCT FROM` is *not* exempt: it
 /// compares against the stored form like any other operator.
 fn protected_operand(expr: &Expr, scope: &TableScope<'_>) -> Option<(String, bool)> {
-    let operands: [&Expr; 2] = match expr {
-        Expr::BinaryOp { left, right, .. } => [left, right],
-        Expr::AnyOp { left, right, .. } | Expr::AllOp { left, right, .. } => [left, right],
+    predicate_operands(expr)?.into_iter().find_map(|operand| protected_column(operand, scope))
+}
+
+/// The operands of an unhandled predicate — the positions a column reference
+/// can occupy such that the comparison is *about* that column. `None` for an
+/// expression that is not a comparison at all.
+fn predicate_operands(expr: &Expr) -> Option<[&Expr; 2]> {
+    match expr {
+        Expr::BinaryOp { left, right, .. }
+        | Expr::AnyOp { left, right, .. }
+        | Expr::AllOp { left, right, .. } => Some([left, right]),
         Expr::InList { expr, .. }
         | Expr::InSubquery { expr, .. }
         | Expr::Between { expr, .. }
@@ -1487,10 +1663,27 @@ fn protected_operand(expr: &Expr, scope: &TableScope<'_>) -> Option<(String, boo
         | Expr::ILike { expr, .. }
         | Expr::SimilarTo { expr, .. }
         | Expr::IsDistinctFrom(expr, _)
-        | Expr::IsNotDistinctFrom(expr, _) => [expr, expr],
-        _ => return None,
-    };
-    operands.into_iter().find_map(|operand| protected_column(operand, scope))
+        | Expr::IsNotDistinctFrom(expr, _) => Some([expr, expr]),
+        _ => None,
+    }
+}
+
+/// The name of a predicate operand that matches a protected column in more
+/// than one relation in scope.
+fn ambiguous_operand(expr: &Expr, scope: &TableScope<'_>) -> Option<String> {
+    predicate_operands(expr)?.into_iter().find_map(|operand| ambiguous_column(operand, scope))
+}
+
+/// The same for one operand, seeing through a row constructor exactly as
+/// [`protected_column`] does.
+fn ambiguous_column(operand: &Expr, scope: &TableScope<'_>) -> Option<String> {
+    if let Expr::Tuple(items) = operand {
+        return items.iter().find_map(|item| ambiguous_column(item, scope));
+    }
+    match resolve_column(scope, operand) {
+        ColumnResolution::Ambiguous => column_name(operand),
+        ColumnResolution::One(_) | ColumnResolution::Unknown => None,
+    }
 }
 
 /// The first protected column an operand names, seeing through a row
@@ -2207,6 +2400,11 @@ enum Unprotected<'a> {
     ComputedColumn { column: String, shape: &'static str },
     /// A predicate over a searchable column that no index match can express.
     Predicate { column: String, shape: &'static str },
+    /// An unqualified name matching a protected column in more than one
+    /// relation in scope. Nothing was rewritten, because choosing one of them
+    /// would compare against the wrong table's blind index — and an
+    /// unrewritten predicate over a protected column matches no row.
+    AmbiguousColumn { column: String, shape: &'static str },
     /// A predicate over a protected column that has no equality index at all,
     /// so no rewrite could express it. Kept apart from [`Self::Predicate`]
     /// because the remedy differs: that one is a query to rewrite, this one is
@@ -2269,6 +2467,13 @@ impl Unprotected<'_> {
                 shape,
                 "unsupported predicate for a searchable column; it will match no rows"
             ),
+            Self::AmbiguousColumn { column, shape } => tracing::warn!(
+                column,
+                shape,
+                "unqualified column matches a protected column in more than one relation in \
+                 scope, so the predicate cannot be rewritten and will match no rows; qualify \
+                 it with its table or alias"
+            ),
             Self::UnindexedPredicate { column, shape } => tracing::warn!(
                 column,
                 shape,
@@ -2324,6 +2529,11 @@ impl Unprotected<'_> {
             Self::Predicate { column, shape } => format!(
                 "searchable column {column} was used in a {shape}, which cannot be matched \
                  against its blind index"
+            ),
+            Self::AmbiguousColumn { column, shape } => format!(
+                "column {column} in a {shape} matches a protected column in more than one \
+                 relation in scope, so it cannot be resolved to one and the comparison would \
+                 match no rows; qualify it with its table or alias"
             ),
             Self::UnindexedPredicate { column, shape } => format!(
                 "protected column {column} was used in a {shape}, but it has no equality index, \
@@ -2452,6 +2662,15 @@ mod tests {
         on_unprotected: OnUnprotected,
     ) -> Arc<WriteCatalog> {
         Arc::new(WriteCatalog::new(&[column("email", transform, searchable)], on_unprotected))
+    }
+
+    /// Two protected tables that both carry a searchable `email`, so an
+    /// unqualified `email` in a query joining them resolves to neither.
+    fn ambiguous_catalog(on_unprotected: OnUnprotected) -> Arc<WriteCatalog> {
+        let mut accounts = column("email", transform(true), true);
+        accounts.table = "accounts".into();
+        let users = column("email", transform(true), true);
+        Arc::new(WriteCatalog::new(&[users, accounts], on_unprotected))
     }
 
     fn strict_catalog(searchable: bool) -> Arc<WriteCatalog> {
@@ -3448,6 +3667,100 @@ mod tests {
         }
     }
 
+    /// The conflict action carries a `WHERE` of its own, and it is a predicate
+    /// over the target table exactly like an UPDATE's. Dropping it left a
+    /// searchable equality there comparing plaintext against the stored
+    /// `blind_index || envelope`: no rewrite, no signal, no rows.
+    #[test]
+    fn a_searchable_predicate_in_a_do_update_where_is_rewritten_or_signalled() {
+        let mut qualified = rewriter(catalog(true));
+        let sql = rewritten_query(
+            &mut qualified,
+            "INSERT INTO users (id) VALUES (1) \
+             ON CONFLICT (id) DO UPDATE SET id = 2 WHERE users.email = 'a@b.io'",
+        )
+        .expect("rewritten");
+        assert!(!sql.contains("a@b.io"), "{sql}");
+        assert!(sql.contains("FROM 1 FOR 32"), "{sql}");
+
+        // The alias an `INSERT INTO t AS x` gives the target is the only name
+        // its conflict-action predicate can qualify with.
+        let mut aliased = rewriter(catalog(true));
+        let sql = rewritten_query(
+            &mut aliased,
+            "INSERT INTO users AS u (id) VALUES (1) \
+             ON CONFLICT (id) DO UPDATE SET id = 2 WHERE u.email = 'a@b.io'",
+        )
+        .expect("rewritten");
+        assert!(!sql.contains("a@b.io") && sql.contains("FROM 1 FOR 32"), "{sql}");
+
+        // And a shape no index can answer is a gate, not a silent relay.
+        let mut strict = rewriter(strict_catalog(true));
+        let action = strict
+            .on_frame(
+                b'Q',
+                &query_frame(
+                    "INSERT INTO users (id) VALUES (1) \
+                     ON CONFLICT (id) DO UPDATE SET id = 2 WHERE email LIKE 'a%'",
+                ),
+            )
+            .unwrap();
+        assert!(refusal(&action).contains("searchable column email"));
+    }
+
+    /// `SET col = EXCLUDED.col` re-stores the value this proxy sealed in the
+    /// same statement's VALUES list, so it is neither sealed again nor
+    /// refused — refusing the canonical upsert is what keeps operators off
+    /// `reject`. The whitelist stops there: every reference that is not
+    /// provably already sealed is still a site.
+    #[test]
+    fn the_canonical_upsert_re_stores_the_value_it_just_sealed() {
+        let sql = "INSERT INTO users (id, email) VALUES (1, 'a@b.io') \
+                   ON CONFLICT (id) DO UPDATE SET email = EXCLUDED.email";
+
+        let mut permissive = rewriter(catalog(false));
+        let rewritten = rewritten_query(&mut permissive, sql).expect("rewritten");
+        assert!(!rewritten.contains("a@b.io"), "{rewritten}");
+        assert_eq!(rewritten.matches("'\\x").count(), 1, "only the VALUES literal: {rewritten}");
+        assert!(rewritten.contains("EXCLUDED.email"), "{rewritten}");
+
+        let mut strict = rewriter(strict_catalog(false));
+        assert!(
+            matches!(strict.on_frame(b'Q', &query_frame(sql)).unwrap(), FrameAction::Replace(_)),
+            "the canonical upsert must not be refused under reject"
+        );
+
+        // Row-wise, the same statement takes the tuple path.
+        let mut strict = rewriter(strict_catalog(false));
+        let action = strict
+            .on_frame(
+                b'Q',
+                &query_frame(
+                    "INSERT INTO users (id, email) VALUES (1, 'a@b.io') \
+                     ON CONFLICT (id) DO UPDATE SET (email) = (EXCLUDED.email)",
+                ),
+            )
+            .unwrap();
+        assert!(matches!(action, FrameAction::Replace(_)), "row-wise upsert refused");
+
+        for refused in [
+            // Not listed by the INSERT, so `EXCLUDED.email` is the column's
+            // own default and nothing sealed it.
+            "INSERT INTO users (id) VALUES (1) \
+             ON CONFLICT (id) DO UPDATE SET email = EXCLUDED.email",
+            // A different column: sealed, if at all, under another transform.
+            "INSERT INTO users (id, email) VALUES (1, 'a@b.io') \
+             ON CONFLICT (id) DO UPDATE SET email = EXCLUDED.id",
+            // Not the EXCLUDED relation at all.
+            "INSERT INTO users (id, email) VALUES (1, 'a@b.io') \
+             ON CONFLICT (id) DO UPDATE SET email = users.name",
+        ] {
+            let mut strict = rewriter(strict_catalog(false));
+            let action = strict.on_frame(b'Q', &query_frame(refused)).unwrap();
+            assert!(refusal(&action).contains("protected column email"), "{refused}");
+        }
+    }
+
     /// The conflict action is reached even when the INSERT's own column list
     /// has nothing protected in it.
     #[test]
@@ -3961,6 +4274,137 @@ mod tests {
         assert!(decode_binary_array(&lying).is_none());
     }
 
+    /// Element bytes drawn from the array format's own metacharacters — the
+    /// quote, the escape, the braces, the separator, the NULL spelling — so a
+    /// generated array actually reaches the branches that decide where one
+    /// element ends and the next begins. Uniformly random bytes would spend
+    /// almost every case being rejected by the first field.
+    fn array_element() -> impl Strategy<Value = Option<Vec<u8>>> {
+        let byte = prop::sample::select(vec![
+            b'a', b'N', b'U', b'L', b'x', b',', b'"', b'\\', b'{', b'}', b' ', 0x00, 0xff,
+        ]);
+        prop::option::of(prop::collection::vec(byte, 0..6))
+    }
+
+    /// Wire bytes for a `= ANY($n)` parameter: arbitrary noise, both encoders'
+    /// own output, and text literals assembled straight out of the format's
+    /// metacharacters — the shapes no encoder produces but a client can send.
+    fn array_bytes() -> impl Strategy<Value = Vec<u8>> {
+        let metacharacters = prop::sample::select(vec![
+            "a", ",", "\"", "\\", "{", "}", " ", "NULL", "\\x61", "\\\\x61",
+        ]);
+        prop_oneof![
+            prop::collection::vec(any::<u8>(), 0..64),
+            prop::collection::vec(array_element(), 0..6)
+                .prop_map(|elements| encode_binary_array(&elements, 1).expect("encodes")),
+            prop::collection::vec(array_element(), 0..6)
+                .prop_map(|elements| encode_text_array(&elements)),
+            prop::collection::vec(metacharacters, 0..8).prop_map(|parts| format!(
+                "{{{}}}",
+                parts.concat()
+            )
+            .into_bytes()),
+        ]
+    }
+
+    proptest! {
+        /// Re-encoding what was decoded is the whole codec's contract: a
+        /// `= ANY($n)` array goes out as the same array with blind indexes in
+        /// it, so every element the decoder produced has to survive the
+        /// encoder unchanged, NULLs and element boundaries included.
+        #[test]
+        fn the_array_codec_round_trips_every_element(
+            elements in prop::collection::vec(array_element(), 0..8),
+        ) {
+            let binary = encode_binary_array(&elements, 1).expect("encodes");
+            let decoded = decode_binary_array(&binary).expect("decodes its own output");
+            prop_assert_eq!(&decoded.elements, &elements);
+
+            // The text encoder writes bytea `\x` hex, which is how the text
+            // decoder reads a BYTEA-form column back — whatever bytes it holds.
+            let text = encode_text_array(&elements);
+            let decoded =
+                decode_text_array(&text, WireForm::Bytea).expect("decodes its own output");
+            prop_assert_eq!(&decoded.elements, &elements);
+        }
+
+        /// Both decoders read bytes a client chose, in a session task that
+        /// owns the connection: a panic here is that client crashing its own
+        /// session, and an index or slice off the end of a truncated array is
+        /// the easiest way to write one.
+        #[test]
+        fn the_array_decoders_never_panic_on_arbitrary_bytes(raw in array_bytes()) {
+            let _ = decode_binary_array(&raw);
+            let _ = decode_text_array(&raw, WireForm::Text);
+            let _ = decode_text_array(&raw, WireForm::Bytea);
+        }
+
+        /// The same, on inputs that started out well-formed. Corrupting one
+        /// byte of a real encoding is what reaches the states past the header
+        /// — a length field that now overruns, a quote that never closes.
+        #[test]
+        fn a_corrupted_array_is_rejected_but_never_panics(
+            elements in prop::collection::vec(array_element(), 0..6),
+            at in any::<prop::sample::Index>(),
+            patch in any::<u8>(),
+        ) {
+            let mut binary = encode_binary_array(&elements, 1).expect("encodes");
+            let index = at.index(binary.len());
+            binary[index] = patch;
+            let _ = decode_binary_array(&binary);
+
+            let mut text = encode_text_array(&elements);
+            let index = at.index(text.len());
+            text[index] = patch;
+            let _ = decode_text_array(&text, WireForm::Bytea);
+        }
+
+        /// The fail-closed contract [`index_array`] exists to keep: either the
+        /// parameter is refused whole — `None`, which the caller turns into
+        /// the same `on_unprotected` signal the SQL rewrite raises — or every
+        /// element is the blind index of the element that was there, with the
+        /// NULLs still in their places. A half-indexed array is not a broken
+        /// message the backend rejects; it is a *valid* query that silently
+        /// returns the wrong rows.
+        #[test]
+        fn an_indexed_array_is_all_or_nothing(raw in array_bytes(), binary in any::<bool>()) {
+            use crate::rows::tests::INDEX_KEY;
+
+            let transform = transform(true);
+            let decoded = if binary {
+                decode_binary_array(&raw)
+            } else {
+                decode_text_array(&raw, transform.wire())
+            };
+            let indexed = index_array(&raw, binary, &transform).expect("indexing cannot fail");
+
+            let Some(array) = decoded else {
+                prop_assert!(indexed.is_none(), "an undecodable array must not be indexed");
+                return Ok(());
+            };
+            let indexed = indexed.expect("a decodable array is indexed");
+            let reread = if binary {
+                decode_binary_array(&indexed)
+            } else {
+                decode_text_array(&indexed, WireForm::Bytea)
+            }
+            .expect("the indexed array is itself a well-formed array");
+
+            prop_assert_eq!(reread.elements.len(), array.elements.len(), "element count moved");
+            for (before, after) in array.elements.iter().zip(&reread.elements) {
+                match (before, after) {
+                    (None, None) => {}
+                    (Some(plaintext), Some(token)) => prop_assert_eq!(
+                        token,
+                        &blind_index::compute(&INDEX_KEY, plaintext).to_vec(),
+                        "an element is not its own blind index"
+                    ),
+                    _ => prop_assert!(false, "a NULL element changed places"),
+                }
+            }
+        }
+    }
+
     #[test]
     fn join_cte_and_set_operations_are_traversed() {
         let mut rewriter = rewriter(catalog(true));
@@ -3975,6 +4419,88 @@ mod tests {
             assert!(!rewritten.contains("a@b.io"), "{rewritten}");
             assert!(rewritten.contains("FROM 1 FOR 32"), "{rewritten}");
         }
+    }
+
+    /// `UPDATE ... FROM` and `DELETE ... USING` join a second relation into
+    /// the predicate's scope, and sqlparser keeps it in a field of its own. It
+    /// used to be dropped, so a searchable column of the joined relation
+    /// resolved to nothing: the comparison went upstream verbatim, matched no
+    /// row, and never reached the gate. `DELETE FROM sessions USING users
+    /// WHERE users.email = $1` silently revoked nothing — and its `<>`
+    /// inversion deleted every session there was.
+    #[test]
+    fn the_joined_relation_of_update_from_and_delete_using_is_in_scope() {
+        for sql in [
+            "DELETE FROM sessions USING users \
+             WHERE users.email = 'a@b.io' AND sessions.user_id = users.id",
+            "UPDATE sessions SET valid = false FROM users \
+             WHERE users.email = 'a@b.io' AND sessions.user_id = users.id",
+        ] {
+            let mut permissive = rewriter(catalog(true));
+            let rewritten =
+                rewritten_query(&mut permissive, sql).unwrap_or_else(|| panic!("{sql}"));
+            assert!(!rewritten.contains("a@b.io"), "{rewritten}");
+            assert!(rewritten.contains("FROM 1 FOR 32"), "{rewritten}");
+        }
+
+        // A derived table beside the target is a query of its own, and it was
+        // walked for `SELECT` but not for these two: the equality inside it
+        // went upstream as plaintext, matching nothing and signalling nothing.
+        for sql in [
+            "DELETE FROM sessions USING (SELECT id FROM users WHERE email = 'a@b.io') s \
+             WHERE s.id = sessions.user_id",
+            "UPDATE sessions SET valid = false \
+             FROM (SELECT id FROM users WHERE email = 'a@b.io') s WHERE s.id = sessions.user_id",
+        ] {
+            let mut permissive = rewriter(catalog(true));
+            let rewritten =
+                rewritten_query(&mut permissive, sql).unwrap_or_else(|| panic!("{sql}"));
+            assert!(!rewritten.contains("a@b.io"), "{rewritten}");
+            assert!(rewritten.contains("FROM 1 FOR 32"), "{rewritten}");
+        }
+
+        // The inversion is the dangerous half and no index can answer it, so
+        // it has to reach the gate rather than delete the table.
+        for sql in [
+            "DELETE FROM sessions USING users WHERE users.email <> 'a@b.io'",
+            "UPDATE sessions SET valid = false FROM users WHERE users.email LIKE 'a%'",
+        ] {
+            let mut strict = rewriter(strict_catalog(true));
+            let action = strict.on_frame(b'Q', &query_frame(sql)).unwrap();
+            assert!(refusal(&action).contains("searchable column email"), "{sql}");
+        }
+    }
+
+    /// An unqualified name that two protected relations in scope both carry
+    /// cannot be rewritten — picking one would compare against the wrong
+    /// table's blind index. It used to resolve to nothing at all, which put it
+    /// on the same path as SQL that mentions no protected column: relayed
+    /// verbatim, matching no row, and never refused under `reject`. It is a
+    /// site of its own now.
+    #[test]
+    fn an_ambiguous_unqualified_searchable_column_is_a_signalled_site() {
+        for sql in [
+            "SELECT * FROM users u JOIN accounts a ON u.id = a.uid WHERE email = 'a@b.io'",
+            "SELECT * FROM users u JOIN accounts a ON u.id = a.uid WHERE email IN ('a@b.io')",
+            "SELECT * FROM users u JOIN accounts a ON u.id = a.uid WHERE email LIKE 'a%'",
+        ] {
+            let mut permissive = rewriter(ambiguous_catalog(OnUnprotected::Warn));
+            assert!(rewritten_query(&mut permissive, sql).is_none(), "ambiguity must not guess");
+
+            let mut strict = rewriter(ambiguous_catalog(OnUnprotected::Reject));
+            let action = strict.on_frame(b'Q', &query_frame(sql)).unwrap();
+            let message = refusal(&action);
+            assert!(message.contains("email") && message.contains("qualify it"), "{message}");
+        }
+
+        // Qualifying the name resolves it, and the rewrite goes ahead.
+        let mut permissive = rewriter(ambiguous_catalog(OnUnprotected::Warn));
+        let sql = rewritten_query(
+            &mut permissive,
+            "SELECT * FROM users u JOIN accounts a ON u.id = a.uid WHERE u.email = 'a@b.io'",
+        )
+        .expect("rewritten");
+        assert!(!sql.contains("a@b.io") && sql.contains("FROM 1 FOR 32"), "{sql}");
     }
 
     /// A shape the rewriter cannot express is a refusal site, not a silent
@@ -4208,6 +4734,9 @@ mod tests {
         let captured = CapturedEvents::default();
         let subscriber = tracing_subscriber::registry().with(captured.clone());
         tracing::subscriber::with_default(subscriber, || {
+            // The ambiguity site needs two protected relations in scope, so it
+            // is driven through a catalog of its own.
+            let mut ambiguous = rewriter(ambiguous_catalog(OnUnprotected::Warn));
             let mut rewriter = rewriter(catalog(true));
             for sql in [
                 "INSERT INTO users (email) VALUES (lower('alice@secret.test'))",
@@ -4235,13 +4764,20 @@ mod tests {
                 // Errors are the point of some of these; only the log matters.
                 drop(rewriter.on_frame(b'Q', &query_frame(sql)));
             }
+            drop(ambiguous.on_frame(
+                b'Q',
+                &query_frame(
+                    "SELECT * FROM users u JOIN accounts a ON u.id = a.uid \
+                     WHERE email = 'mona@secret.test'",
+                ),
+            ));
         });
 
         let events = captured.0.lock().unwrap().join("\n");
         assert!(events.contains("passing through unencrypted"), "the sites did emit: {events}");
         for plaintext in [
             "alice", "bob", "carol", "dave", "erin", "fred", "gina", "hank", "ivan", "judy",
-            "kate", "liam", "secret",
+            "kate", "liam", "mona", "secret",
         ] {
             assert!(!events.contains(plaintext), "{plaintext} reached the log:\n{events}");
         }
