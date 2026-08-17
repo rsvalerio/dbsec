@@ -3,9 +3,10 @@ id: TASK-0104
 title: >-
   Row-wise UPDATE SET (a, b) = (...) tuple assignment writes plaintext to a
   protected column and is not an on_unprotected site
-status: Triage
+status: Done
 assignee: []
 created_date: '2026-08-14 18:16'
+updated_date: '2026-08-17 13:25'
 labels:
   - security-review
   - security
@@ -41,8 +42,8 @@ UPDATE users SET (email, id) = ('alice@secret.test', 5)
 
 ## Acceptance Criteria
 <!-- AC:BEGIN -->
-- [ ] #1 `UPDATE t SET (protected, other) = (v1, v2)` seals the protected element (blind index included when searchable)
-- [ ] #2 The same shape inside `INSERT ... ON CONFLICT DO UPDATE` is sealed
-- [ ] #3 A tuple target that cannot be sealed (subquery source, arity mismatch) is an `on_unprotected` site refused under `reject`
-- [ ] #4 A regression test asserts plaintext never reaches the backend for a tuple-assignment write under both `warn` and `reject`
+- [x] #1 `UPDATE t SET (protected, other) = (v1, v2)` seals the protected element (blind index included when searchable)
+- [x] #2 The same shape inside `INSERT ... ON CONFLICT DO UPDATE` is sealed
+- [x] #3 A tuple target that cannot be sealed (subquery source, arity mismatch) is an `on_unprotected` site refused under `reject`
+- [x] #4 A regression test asserts plaintext never reaches the backend for a tuple-assignment write under both `warn` and `reject`
 <!-- AC:END -->

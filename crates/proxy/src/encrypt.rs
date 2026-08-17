@@ -683,12 +683,100 @@ impl QueryRewriter {
     ) -> Result<bool, Rejection> {
         let mut changed = false;
         for Assignment { target, value } in assignments {
-            let AssignmentTarget::ColumnName(column) = target else { continue };
-            let Some(ident) = column.0.last() else { continue };
-            let Some(transform) = columns.get(&normalize(ident)) else { continue };
-            let transform = transform.clone();
-            let name = ident.value.clone();
-            changed |= self.seal_expr(value, &transform, &name, params)?;
+            match target {
+                AssignmentTarget::ColumnName(column) => {
+                    let Some(ident) = column.0.last() else { continue };
+                    let Some(transform) = columns.get(&normalize(ident)) else { continue };
+                    let transform = transform.clone();
+                    let name = ident.value.clone();
+                    changed |= self.seal_expr(value, &transform, &name, params)?;
+                }
+                AssignmentTarget::Tuple(names) => {
+                    changed |= self.seal_tuple_assignment(names, value, columns, params)?;
+                }
+            }
+        }
+        Ok(changed)
+    }
+
+    /// Seals the protected elements of a row-wise `SET (a, b) = (x, y)`.
+    ///
+    /// This shape used to fall out of [`Self::seal_assignments`] on a
+    /// `continue`, which made it the one way to write plaintext into a
+    /// protected column with *no* operator-visible signal at all: not sealed,
+    /// not indexed, and never routed to [`Self::unprotected`], so even
+    /// `on_unprotected = "reject"` relayed it. Everything here therefore either
+    /// seals or signals; nothing returns quietly once a protected column is in
+    /// the target list.
+    ///
+    /// The value side has more shapes than the syntax suggests, all confirmed
+    /// against sqlparser 0.53:
+    ///
+    /// - `(a, b) = (x, y)` is an [`Expr::Tuple`], the ordinary case.
+    /// - `(a) = (x)` is an [`Expr::Nested`] — a one-element parenthesised list
+    ///   is indistinguishable from a grouping paren, so it never becomes a
+    ///   tuple. Missing this would leave single-column row-wise assignment,
+    ///   the easiest form to write, still bypassing the rewrite. It is read as
+    ///   a one-element list whatever the target arity, so that `(a, b) = (x)`
+    ///   is reported as the arity mismatch it is rather than as an
+    ///   unrecognised expression shape.
+    /// - `(a, b) = (SELECT ...)` is an [`Expr::Subquery`] and `(a, b) =
+    ///   ROW(x, y)` an [`Expr::Function`]. Neither can be paired up
+    ///   element-wise, so both are signalled rather than skipped.
+    ///
+    /// Arity is checked rather than zipped. `SET (a, b) = ('one')` parses
+    /// cleanly even though Postgres rejects it at execution time, and pairing
+    /// by the shorter side would seal `a` while silently leaving the statement
+    /// mismatched.
+    fn seal_tuple_assignment(
+        &self,
+        names: &[ObjectName],
+        value: &mut Expr,
+        columns: &Columns,
+        params: &mut ParamTransforms,
+    ) -> Result<bool, Rejection> {
+        // Qualified targets are legal here (`SET (u.email, id) = ...`), so the
+        // last ident names the column, as on the single-column path.
+        let protected: Vec<(usize, String, Arc<dyn FieldTransform>)> = names
+            .iter()
+            .enumerate()
+            .filter_map(|(position, name)| {
+                let ident = name.0.last()?;
+                let transform = columns.get(&normalize(ident))?;
+                Some((position, ident.value.clone(), transform.clone()))
+            })
+            .collect();
+        if protected.is_empty() {
+            return Ok(false);
+        }
+
+        // Signals every protected column in the target, so the operator sees
+        // each one rather than only the first.
+        let signal = |site: &dyn Fn(&str) -> Unprotected<'_>| -> Result<bool, Rejection> {
+            for (_, column, _) in &protected {
+                self.unprotected(&site(column))?;
+            }
+            Ok(false)
+        };
+
+        let elements: &mut [Expr] = match value {
+            Expr::Tuple(exprs) => exprs.as_mut_slice(),
+            Expr::Nested(inner) => std::slice::from_mut(&mut **inner),
+            other => {
+                let shape = expr_shape(other);
+                return signal(&|column| Unprotected::UnsupportedValue { column, shape });
+            }
+        };
+        if elements.len() != names.len() {
+            return signal(&|column| Unprotected::UnsupportedValue {
+                column,
+                shape: "row-wise assignment whose value list does not match the column list",
+            });
+        }
+
+        let mut changed = false;
+        for (position, column, transform) in &protected {
+            changed |= self.seal_expr(&mut elements[*position], transform, column, params)?;
         }
         Ok(changed)
     }
@@ -2646,6 +2734,125 @@ mod tests {
             assert!(message.contains("dbsec refused this statement"), "{what}: {message}");
             let FrameAction::Reply(bytes) = &action else { unreachable!() };
             assert_eq!(bytes[bytes.len() - 6], b'Z', "{what}: ReadyForQuery follows the error");
+        }
+    }
+
+    /// Row-wise `SET (a, b) = (x, y)` is standard Postgres and parses to its
+    /// own `AssignmentTarget::Tuple`, which the assignment loop used to drop on
+    /// a `continue`. The single-element form is covered too: it parses as a
+    /// grouping paren rather than a tuple, so it takes a different arm.
+    #[test]
+    fn row_wise_tuple_assignment_is_sealed() {
+        for sql in [
+            "UPDATE users SET (email, id) = ('alice@secret.test', 5)",
+            "UPDATE users SET (id, email) = (5, 'alice@secret.test')",
+            "UPDATE users SET (email) = ('alice@secret.test')",
+            "UPDATE users SET (u.email, id) = ('alice@secret.test', 5)",
+        ] {
+            let mut rewriter = rewriter(catalog(false));
+            let rewritten = rewritten_query(&mut rewriter, sql)
+                .unwrap_or_else(|| panic!("not rewritten at all: {sql}"));
+            assert!(!rewritten.contains("alice@secret.test"), "plaintext on the wire: {rewritten}");
+            assert_eq!(open_hex_literal(&rewritten, false), b"alice@secret.test", "{sql}");
+        }
+    }
+
+    #[test]
+    fn row_wise_tuple_assignment_gets_the_blind_index_when_searchable() {
+        let mut rewriter = rewriter(catalog(true));
+        let sql =
+            rewritten_query(&mut rewriter, "UPDATE users SET (email, id) = ('bob@secret.test', 5)")
+                .expect("rewritten");
+        assert_eq!(open_hex_literal(&sql, true), b"bob@secret.test");
+
+        let start = sql.find("'\\x").unwrap() + 3;
+        let end = sql[start..].find('\'').unwrap() + start;
+        let stored = hex::decode(&sql[start..end]).unwrap();
+        let (index, _) = blind_index::split(&stored).unwrap();
+        assert_eq!(index, blind_index::compute(&crate::rows::tests::INDEX_KEY, b"bob@secret.test"));
+    }
+
+    /// `seal_assignments` is shared, so the upsert action takes the same path.
+    #[test]
+    fn row_wise_tuple_assignment_in_on_conflict_is_sealed() {
+        let mut rewriter = rewriter(catalog(false));
+        let sql = rewritten_query(
+            &mut rewriter,
+            "INSERT INTO users (id, email) VALUES (1, 'carol@secret.test') \
+             ON CONFLICT (id) DO UPDATE SET (email, id) = ('dave@secret.test', 5)",
+        )
+        .expect("rewritten");
+        assert!(!sql.contains("carol@secret.test"), "the inserted value leaked: {sql}");
+        assert!(!sql.contains("dave@secret.test"), "the upsert value leaked: {sql}");
+        assert_eq!(sql.matches("'\\x").count(), 2, "both values sealed: {sql}");
+    }
+
+    /// A tuple whose value side cannot be paired element-wise. Each of these
+    /// is valid enough to parse, so without an explicit signal it would fall
+    /// through to a plaintext write with nothing in the log.
+    #[test]
+    fn unpairable_tuple_assignment_is_a_site_and_is_refused() {
+        for (sql, expected) in [
+            ("UPDATE users SET (email, id) = (SELECT a, b FROM other)", "subquery"),
+            ("UPDATE users SET (email, id) = ROW('alice@secret.test', 5)", "function call"),
+            // Both parse cleanly; Postgres rejects them at execution time.
+            // Pairing by the shorter side would have sealed `email` regardless.
+            ("UPDATE users SET (email, id) = ('only-one')", "does not match the column list"),
+            (
+                "UPDATE users SET (email) = ('alice@secret.test', 5)",
+                "does not match the column list",
+            ),
+        ] {
+            let mut strict = rewriter(strict_catalog(false));
+            let action = strict.on_frame(b'Q', &query_frame(sql)).unwrap();
+            let refusal = refusal(&action);
+            assert!(refusal.contains(expected), "{sql}\n  refusal was: {refusal}");
+            assert!(!refusal.contains("secret.test"), "the refusal leaked plaintext: {refusal}");
+        }
+    }
+
+    /// A tuple target naming no protected column is left exactly alone — the
+    /// new arm must not turn ordinary row-wise updates into refusals.
+    #[test]
+    fn tuple_assignment_over_unprotected_columns_is_untouched() {
+        let mut strict = rewriter(strict_catalog(false));
+        let action = strict
+            .on_frame(b'Q', &query_frame("UPDATE users SET (id, name) = (5, 'nobody')"))
+            .unwrap();
+        assert!(matches!(action, FrameAction::Relay), "relayed untouched");
+    }
+
+    /// The invariant this finding broke, stated directly: under *either*
+    /// policy the plaintext must not reach the backend. `warn` seals it and
+    /// relays the rewrite; `reject` answers the client instead. Before the
+    /// fix `warn` relayed the plaintext verbatim and `reject` did too, because
+    /// the statement never reached the reject decision.
+    #[test]
+    fn a_tuple_assignment_never_puts_plaintext_on_the_backend_wire() {
+        let sql = "UPDATE users SET (email, id) = ('alice@secret.test', 5)";
+
+        let mut warn = rewriter(catalog(false));
+        match warn.on_frame(b'Q', &query_frame(sql)).unwrap() {
+            FrameAction::Replace(body) => {
+                let text = String::from_utf8_lossy(&body).into_owned();
+                assert!(!text.contains("alice@secret.test"), "warn relayed plaintext: {text}");
+            }
+            other => panic!("warn must rewrite and relay, got {other:?}"),
+        }
+
+        let mut strict = rewriter(strict_catalog(false));
+        match strict.on_frame(b'Q', &query_frame(sql)).unwrap() {
+            // Sealing succeeds under reject too — there is nothing to refuse.
+            FrameAction::Replace(body) => {
+                let text = String::from_utf8_lossy(&body).into_owned();
+                assert!(!text.contains("alice@secret.test"), "reject relayed plaintext: {text}");
+            }
+            FrameAction::Reply(bytes) => {
+                assert_eq!(bytes[0], b'E');
+                let text = String::from_utf8_lossy(&bytes).into_owned();
+                assert!(!text.contains("alice@secret.test"), "the refusal leaked: {text}");
+            }
+            other => panic!("plaintext would reach the backend: {other:?}"),
         }
     }
 
