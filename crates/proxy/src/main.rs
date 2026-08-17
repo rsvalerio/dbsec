@@ -140,6 +140,11 @@ pub enum Error {
     )]
     StaleColumnMap { column: String, table_oid: u32 },
     #[error(
+        "protected column at result position {position} is {len} bytes, over the {max} byte \
+         limit; decrypting it would cost several times that in transient memory"
+    )]
+    ProtectedValueTooLarge { position: usize, len: usize, max: usize },
+    #[error(
         "result column {column} is named like a protected column but carries no table identity, \
          so it cannot be decrypted or masked; it is computed or comes from a subquery, and would \
          be returned in its stored form"
