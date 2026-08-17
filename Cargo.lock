@@ -386,7 +386,7 @@ dependencies = [
 
 [[package]]
 name = "dbsec"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "base64",
  "dbsec-core",
@@ -415,7 +415,7 @@ dependencies = [
 
 [[package]]
 name = "dbsec-core"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "aes",
  "aes-gcm",

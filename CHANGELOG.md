@@ -2,6 +2,12 @@
 All notable changes to this project will be documented in this file. See [conventional commits](https://www.conventionalcommits.org/) for commit guidelines.
 
 - - -
+## v0.1.5 - 2026-08-17
+#### Bug Fixes
+- (**encrypt**) seal every Postgres string-literal syntax, not just '...' - (21be0e4) - Rodrigo Valerio, *Claude Opus 5 (1M context)*
+
+- - -
+
 ## v0.1.4 - 2026-08-16
 #### Bug Fixes
 - (**encrypt**) accept digits in dollar-quote tags, and property-test the split (#8) - (ffa78b7) - Rodrigo Valeri, *Claude Sonnet 4.6*, *Claude Sonnet 4.6*, *Claude Sonnet 4.6*
