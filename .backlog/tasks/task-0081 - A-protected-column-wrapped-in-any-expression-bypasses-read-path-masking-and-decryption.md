@@ -3,9 +3,10 @@ id: TASK-0081
 title: >-
   A protected column wrapped in any expression bypasses read-path masking and
   decryption
-status: Triage
+status: Done
 assignee: []
 created_date: '2026-08-14 14:06'
+updated_date: '2026-08-17 19:55'
 labels:
   - security-review
   - security
@@ -33,7 +34,7 @@ Triggers: `email || ''`, `email::text`, `COALESCE(email,'')`, `SELECT email FROM
 
 ## Acceptance Criteria
 <!-- AC:BEGIN -->
-- [ ] #1 A computed/cast/subquery output over a mask-only column no longer returns the value in the clear
-- [ ] #2 A computed output over an encrypted column is refused or decrypted, never relayed as stored ciphertext
-- [ ] #3 A test drives an expression-wrapped protected column through the read path in both warn and reject modes
+- [x] #1 A computed/cast/subquery output over a mask-only column no longer returns the value in the clear
+- [x] #2 A computed output over an encrypted column is refused or decrypted, never relayed as stored ciphertext
+- [x] #3 A test drives an expression-wrapped protected column through the read path in both warn and reject modes
 <!-- AC:END -->

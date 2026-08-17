@@ -139,6 +139,12 @@ pub enum Error {
          in the resolved column map; the table may have been recreated since startup"
     )]
     StaleColumnMap { column: String, table_oid: u32 },
+    #[error(
+        "result column {column} is named like a protected column but carries no table identity, \
+         so it cannot be decrypted or masked; it is computed or comes from a subquery, and would \
+         be returned in its stored form"
+    )]
+    ComputedProtectedColumn { column: String },
     #[error(transparent)]
     Wire(#[from] dbsec_core::Error),
     #[error(transparent)]

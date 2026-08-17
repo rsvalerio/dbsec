@@ -28,10 +28,14 @@
 //!
 //! # Refusals
 //!
-//! This path has two of them: a DataRow no described statement covers
-//! ([`Error::UndescribedRow`]) and a result column a stale mapping would
-//! under-match under `on_unprotected = "reject"`
-//! ([`Error::StaleColumnMap`]). Both hand the client a PostgreSQL
+//! This path has three of them: a DataRow no described statement covers
+//! ([`Error::UndescribedRow`]), a result column a stale mapping would
+//! under-match ([`Error::StaleColumnMap`]), and a result column named like a
+//! protected one that carries no table identity at all
+//! ([`Error::ComputedProtectedColumn`]) — a cast, an expression or a subquery
+//! output, which PostgreSQL describes with `table_oid = 0` so no mapping can
+//! ever cover it. The last two are gated on `on_unprotected = "reject"`. They
+//! hand the client a PostgreSQL
 //! ErrorResponse (SQLSTATE 42501, the same one a refused write carries) and
 //! then end the session — see [`RowDecryptor::on_frame`] for why the read path
 //! cannot refuse at statement level the way the write path does: its statement
@@ -150,7 +154,13 @@ impl RowContext {
     }
 
     pub fn decryptor(self: &Arc<Self>, portals: Arc<SessionPortals>) -> RowDecryptor {
-        RowDecryptor { ctx: self.clone(), portals, described: None, warned_stale: false }
+        RowDecryptor {
+            ctx: self.clone(),
+            portals,
+            described: None,
+            warned_stale: false,
+            warned_computed: false,
+        }
     }
 }
 
@@ -166,6 +176,7 @@ pub struct RowDecryptor {
     /// session is enough to act on; one per result set would be a log flood
     /// for exactly as long as the migration goes unnoticed.
     warned_stale: bool,
+    warned_computed: bool,
 }
 
 /// Whether an error is a refusal the client can be told about, rather than a
@@ -175,7 +186,12 @@ pub struct RowDecryptor {
 /// ErrorResponse expresses. Anything else (a decrypt failure, a malformed
 /// frame) says the stream is not what it claims to be, and the session ends.
 fn is_refusal(error: &Error) -> bool {
-    matches!(error, Error::UndescribedRow | Error::StaleColumnMap { .. })
+    matches!(
+        error,
+        Error::UndescribedRow
+            | Error::StaleColumnMap { .. }
+            | Error::ComputedProtectedColumn { .. }
+    )
 }
 
 impl RowDecryptor {
@@ -314,11 +330,41 @@ impl RowDecryptor {
         positions: &Positions,
     ) -> Result<(), Error> {
         let covered: HashSet<usize> = positions.iter().map(|(index, _)| *index).collect();
+        let named_like_protected = |field: &pgwire::RowField<'_>| {
+            std::str::from_utf8(field.name)
+                .is_ok_and(|name| resolved.names.contains(&name.to_lowercase()))
+        };
+
+        // A field with no table identity that is still named like a protected
+        // column: a cast or a subquery output, which keeps the column's name
+        // but loses its OID. Nothing to re-resolve — there is no mapping that
+        // could ever cover it — so this is reported on its own terms.
+        //
+        // The write path refuses the shapes it can see in the statement, but
+        // it resolves names against the tables in scope, so a column projected
+        // out of a derived table (`SELECT email FROM (SELECT email FROM users) s`)
+        // is invisible to it and only surfaces here.
+        let computed = fields.iter().enumerate().find(|(index, field)| {
+            field.table_oid == 0 && !covered.contains(index) && named_like_protected(field)
+        });
+        if let Some((_, field)) = computed {
+            let column = String::from_utf8_lossy(field.name).into_owned();
+            if self.ctx.on_unprotected == OnUnprotected::Reject {
+                return Err(Error::ComputedProtectedColumn { column });
+            }
+            if !self.warned_computed {
+                self.warned_computed = true;
+                tracing::warn!(
+                    column,
+                    "a result column named like a protected column carries no table identity; it \
+                     is computed or comes from a subquery, so it cannot be decrypted or masked and \
+                     is being relayed in its stored form"
+                );
+            }
+        }
+
         let suspect = fields.iter().enumerate().find(|(index, field)| {
-            field.table_oid != 0
-                && !covered.contains(index)
-                && std::str::from_utf8(field.name)
-                    .is_ok_and(|name| resolved.names.contains(&name.to_lowercase()))
+            field.table_oid != 0 && !covered.contains(index) && named_like_protected(field)
         });
         let Some((_, field)) = suspect else { return Ok(()) };
         // The refresher settles it either way: a real migration re-resolves
@@ -800,12 +846,70 @@ pub mod tests {
         decryptor.on_frame(b'T', &moved).unwrap();
         assert!(decryptor.warned_stale);
 
-        // A field the map does cover is not suspect, and neither is a computed
-        // column (table_oid 0) that happens to be labelled like one.
+        // A field the map does cover is not suspect. Neither is a computed
+        // column (table_oid 0) — for *this* check: there is no stale mapping
+        // to re-resolve, so it is reported by the computed-column check
+        // instead, which is a separate signal with a separate flag.
         let mut fine = context(false).decryptor(SessionPortals::new());
         fine.on_frame(b'T', &named_row_description(&[("email", 1234, 2)])).unwrap();
         fine.on_frame(b'T', &named_row_description(&[("email", 0, 0)])).unwrap();
         assert!(!fine.warned_stale);
+        assert!(fine.warned_computed, "the computed column is still reported, just not as stale");
+    }
+
+    /// A protected column projected out of a derived table keeps its *name*
+    /// but loses its table OID, so it matches no configured position and used
+    /// to be relayed in its stored form. The write path cannot see this one:
+    /// `SELECT email FROM (SELECT email FROM users) s` resolves `email`
+    /// against the subquery, not against `users`, so the read path is the only
+    /// place left to notice it.
+    #[test]
+    fn a_computed_protected_column_is_reported_rather_than_relayed() {
+        // warn: relayed, but the operator is told, and only once.
+        let mut warn = context(false).decryptor(SessionPortals::new());
+        let computed = named_row_description(&[("email", 0, 0)]);
+        warn.on_frame(b'T', &computed).expect("warn mode relays");
+        assert!(warn.warned_computed, "the session must report it");
+
+        warn.warned_computed = false;
+        warn.on_frame(b'T', &computed).unwrap();
+        assert!(warn.warned_computed, "still reported on a later result set");
+
+        // reject: the client is answered instead of handed stored bytes.
+        let strict = Arc::new(RowContext::new(
+            Resolved {
+                columns: {
+                    let mut columns = ColumnMap::new();
+                    columns.insert(
+                        (1234, 2),
+                        ReadColumn { transform: Some(transform(false)), mask: None },
+                    );
+                    columns
+                },
+                names: HashSet::from(["email".to_owned()]),
+                ..Default::default()
+            },
+            OnUnprotected::Reject,
+        ));
+        let mut decryptor = strict.decryptor(SessionPortals::new());
+        let frames = refused(decryptor.on_frame(b'T', &computed).unwrap());
+        let text = String::from_utf8_lossy(&frames);
+        assert!(text.contains("42501"), "the client gets a SQLSTATE: {text}");
+        assert!(text.contains("carries no table identity"), "{text}");
+    }
+
+    /// The mask-only case is the sharpest form of this: the column is stored
+    /// as plaintext and the mask is the *only* thing protecting it, so a
+    /// computed output hands back exactly what the mask exists to hide.
+    #[test]
+    fn a_computed_mask_only_column_is_reported() {
+        let ctx = context_with(ReadColumn {
+            transform: None,
+            mask: Some(MaskSpec { keep_first: 0, keep_last: 4, mask_with: '*' }),
+        });
+        let mut decryptor = ctx.decryptor(SessionPortals::new());
+        decryptor.on_frame(b'T', &named_row_description(&[("email", 0, 0)])).unwrap();
+        assert!(decryptor.warned_computed, "an unmasked computed value must not pass unreported");
     }
 
     /// Under `on_unprotected = "reject"` the same detection refuses the result
