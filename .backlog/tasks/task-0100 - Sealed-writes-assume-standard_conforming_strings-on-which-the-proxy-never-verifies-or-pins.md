@@ -3,9 +3,11 @@ id: TASK-0100
 title: >-
   Sealed writes assume standard_conforming_strings = on, which the proxy never
   verifies or pins
-status: Triage
-assignee: []
+status: To Do
+assignee:
+  - TASK-0122
 created_date: '2026-08-14 14:06'
+updated_date: '2026-08-17 20:04'
 labels:
   - security-review
   - sql-rewrite

@@ -3,9 +3,11 @@ id: TASK-0111
 title: >-
   A cached prepared statement freezes its described positions, so protection
   added mid-session is not applied and stale-mapping is never re-checked
-status: Triage
-assignee: []
+status: To Do
+assignee:
+  - TASK-0123
 created_date: '2026-08-14 18:16'
+updated_date: '2026-08-17 20:04'
 labels:
   - security-review
   - security

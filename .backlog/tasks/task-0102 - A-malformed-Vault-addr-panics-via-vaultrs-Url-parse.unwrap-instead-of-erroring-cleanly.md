@@ -3,9 +3,11 @@ id: TASK-0102
 title: >-
   A malformed Vault addr panics via vaultrs Url::parse().unwrap() instead of
   erroring cleanly
-status: Triage
-assignee: []
+status: To Do
+assignee:
+  - TASK-0119
 created_date: '2026-08-14 14:06'
+updated_date: '2026-08-17 20:04'
 labels:
   - security-review
   - reliability

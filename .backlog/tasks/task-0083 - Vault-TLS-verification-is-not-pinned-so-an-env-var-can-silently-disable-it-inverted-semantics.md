@@ -3,9 +3,11 @@ id: TASK-0083
 title: >-
   Vault TLS verification is not pinned, so an env var can silently disable it
   (inverted semantics)
-status: Triage
-assignee: []
+status: To Do
+assignee:
+  - TASK-0119
 created_date: '2026-08-14 14:06'
+updated_date: '2026-08-17 20:03'
 labels:
   - security-review
   - security

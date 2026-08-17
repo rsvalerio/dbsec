@@ -3,9 +3,11 @@ id: TASK-0097
 title: >-
   thread_rng GCM nonces are fork-unsafe and the code's rationale for accepting
   thread_rng does not cover fork
-status: Triage
-assignee: []
+status: To Do
+assignee:
+  - TASK-0118
 created_date: '2026-08-14 14:06'
+updated_date: '2026-08-17 20:03'
 labels:
   - security-review
   - crypto

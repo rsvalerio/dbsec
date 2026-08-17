@@ -3,9 +3,11 @@ id: TASK-0095
 title: >-
   No Vault token renewal and grow-only key caches: revocation and token expiry
   are not handled until restart
-status: Triage
-assignee: []
+status: To Do
+assignee:
+  - TASK-0118
 created_date: '2026-08-14 14:06'
+updated_date: '2026-08-17 20:03'
 labels:
   - security-review
   - vault

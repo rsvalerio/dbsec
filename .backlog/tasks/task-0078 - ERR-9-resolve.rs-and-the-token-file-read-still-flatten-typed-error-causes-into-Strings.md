@@ -3,9 +3,11 @@ id: TASK-0078
 title: >-
   ERR-9: resolve.rs and the token-file read still flatten typed error causes
   into Strings
-status: Triage
-assignee: []
+status: To Do
+assignee:
+  - TASK-0126
 created_date: '2026-08-14 12:34'
+updated_date: '2026-08-17 20:04'
 labels:
   - code-review-rust
   - error-handling

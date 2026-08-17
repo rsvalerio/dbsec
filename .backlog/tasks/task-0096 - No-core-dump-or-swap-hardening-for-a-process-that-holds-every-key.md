@@ -1,9 +1,11 @@
 ---
 id: TASK-0096
 title: No core-dump or swap hardening for a process that holds every key
-status: Triage
-assignee: []
+status: To Do
+assignee:
+  - TASK-0120
 created_date: '2026-08-14 14:06'
+updated_date: '2026-08-17 20:04'
 labels:
   - security-review
   - security

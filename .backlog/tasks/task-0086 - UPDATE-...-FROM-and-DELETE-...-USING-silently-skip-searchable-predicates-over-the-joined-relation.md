@@ -3,9 +3,11 @@ id: TASK-0086
 title: >-
   UPDATE ... FROM and DELETE ... USING silently skip searchable predicates over
   the joined relation
-status: Triage
-assignee: []
+status: To Do
+assignee:
+  - TASK-0121
 created_date: '2026-08-14 14:06'
+updated_date: '2026-08-17 20:04'
 labels:
   - security-review
   - security

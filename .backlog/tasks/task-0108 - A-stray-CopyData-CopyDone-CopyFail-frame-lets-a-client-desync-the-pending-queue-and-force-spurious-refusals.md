@@ -3,9 +3,11 @@ id: TASK-0108
 title: >-
   A stray CopyData/CopyDone/CopyFail frame lets a client desync the pending
   queue and force spurious refusals
-status: Triage
-assignee: []
+status: To Do
+assignee:
+  - TASK-0124
 created_date: '2026-08-14 18:16'
+updated_date: '2026-08-17 20:04'
 labels:
   - security-review
   - protocol

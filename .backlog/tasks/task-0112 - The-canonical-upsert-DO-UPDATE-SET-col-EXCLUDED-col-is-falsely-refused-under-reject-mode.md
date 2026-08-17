@@ -3,9 +3,11 @@ id: TASK-0112
 title: >-
   The canonical upsert DO UPDATE SET col = EXCLUDED.col is falsely refused under
   reject mode
-status: Triage
-assignee: []
+status: To Do
+assignee:
+  - TASK-0121
 created_date: '2026-08-14 18:16'
+updated_date: '2026-08-17 20:04'
 labels:
   - security-review
   - availability

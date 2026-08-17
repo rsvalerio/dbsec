@@ -3,9 +3,11 @@ id: TASK-0099
 title: >-
   The WHERE of INSERT ... ON CONFLICT DO UPDATE is never inspected for
   searchable predicates
-status: Triage
-assignee: []
+status: To Do
+assignee:
+  - TASK-0121
 created_date: '2026-08-14 14:06'
+updated_date: '2026-08-17 20:04'
 labels:
   - security-review
   - sql-rewrite

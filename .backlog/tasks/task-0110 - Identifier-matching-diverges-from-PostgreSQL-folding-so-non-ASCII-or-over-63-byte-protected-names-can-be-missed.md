@@ -3,9 +3,11 @@ id: TASK-0110
 title: >-
   Identifier matching diverges from PostgreSQL folding, so non-ASCII or
   over-63-byte protected names can be missed by the write path
-status: Triage
-assignee: []
+status: To Do
+assignee:
+  - TASK-0122
 created_date: '2026-08-14 18:16'
+updated_date: '2026-08-17 20:04'
 labels:
   - security-review
   - security

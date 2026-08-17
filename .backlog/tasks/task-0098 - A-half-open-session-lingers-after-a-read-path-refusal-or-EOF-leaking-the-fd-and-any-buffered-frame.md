@@ -3,9 +3,11 @@ id: TASK-0098
 title: >-
   A half-open session lingers after a read-path refusal or EOF, leaking the fd
   and any buffered frame
-status: Triage
-assignee: []
+status: To Do
+assignee:
+  - TASK-0124
 created_date: '2026-08-14 14:06'
+updated_date: '2026-08-17 20:04'
 labels:
   - security-review
   - reliability

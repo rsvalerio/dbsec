@@ -3,9 +3,11 @@ id: TASK-0091
 title: >-
   set_config('search_path', ...) and SET SCHEMA bypass search_path tracking,
   causing silent wrong-table sealing
-status: Triage
-assignee: []
+status: To Do
+assignee:
+  - TASK-0122
 created_date: '2026-08-14 14:06'
+updated_date: '2026-08-17 20:04'
 labels:
   - security-review
   - security

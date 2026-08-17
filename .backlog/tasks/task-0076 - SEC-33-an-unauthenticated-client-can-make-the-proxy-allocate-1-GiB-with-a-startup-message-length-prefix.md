@@ -3,9 +3,11 @@ id: TASK-0076
 title: >-
   SEC-33: an unauthenticated client can make the proxy allocate 1 GiB with a
   startup-message length prefix
-status: Triage
-assignee: []
+status: To Do
+assignee:
+  - TASK-0125
 created_date: '2026-08-14 12:33'
+updated_date: '2026-08-17 20:04'
 labels:
   - code-review-rust
   - security

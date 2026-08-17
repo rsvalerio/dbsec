@@ -3,9 +3,11 @@ id: TASK-0103
 title: >-
   Auth passthrough breaks SCRAM channel binding and always refuses GSS
   encryption
-status: Triage
-assignee: []
+status: To Do
+assignee:
+  - TASK-0124
 created_date: '2026-08-14 14:06'
+updated_date: '2026-08-17 20:04'
 labels:
   - security-review
   - protocol

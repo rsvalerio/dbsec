@@ -1,9 +1,11 @@
 ---
 id: TASK-0093
 title: The AES-GCM key schedule inside Cipher is never zeroized on drop
-status: Triage
-assignee: []
+status: To Do
+assignee:
+  - TASK-0118
 created_date: '2026-08-14 14:06'
+updated_date: '2026-08-17 20:03'
 labels:
   - security-review
   - crypto

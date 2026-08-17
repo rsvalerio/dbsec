@@ -3,9 +3,11 @@ id: TASK-0069
 title: >-
   ERR-11: TlsContext::from_config takes an unvalidated Config, so the downstream
   key permission check is only enforced by convention
-status: Triage
-assignee: []
+status: To Do
+assignee:
+  - TASK-0126
 created_date: '2026-08-12 19:12'
+updated_date: '2026-08-17 20:04'
 labels:
   - code-review-rust
   - error-handling

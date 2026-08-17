@@ -3,9 +3,11 @@ id: TASK-0085
 title: >-
   COPY (SELECT ...) TO STDOUT streams protected columns to the client and
   escapes reject mode
-status: Triage
-assignee: []
+status: To Do
+assignee:
+  - TASK-0123
 created_date: '2026-08-14 14:06'
+updated_date: '2026-08-17 20:04'
 labels:
   - security-review
   - security

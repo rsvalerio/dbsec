@@ -1,9 +1,11 @@
 ---
 id: TASK-0092
 title: 'A plain http:// Vault address is accepted with no validation or warning'
-status: Triage
-assignee: []
+status: To Do
+assignee:
+  - TASK-0119
 created_date: '2026-08-14 14:06'
+updated_date: '2026-08-17 20:04'
 labels:
   - security-review
   - security

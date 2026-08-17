@@ -3,9 +3,11 @@ id: TASK-0079
 title: >-
   ERR-5: process-wide key caches panic forever on a poisoned lock while session
   state deliberately recovers
-status: Triage
-assignee: []
+status: To Do
+assignee:
+  - TASK-0126
 created_date: '2026-08-14 12:34'
+updated_date: '2026-08-17 20:05'
 labels:
   - code-review-rust
   - error-handling

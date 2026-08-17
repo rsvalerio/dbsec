@@ -1,9 +1,11 @@
 ---
 id: TASK-0094
 title: Vault DEK base64 plaintext and the legacy index-key map are left un-zeroized
-status: Triage
-assignee: []
+status: To Do
+assignee:
+  - TASK-0118
 created_date: '2026-08-14 14:06'
+updated_date: '2026-08-17 20:03'
 labels:
   - security-review
   - security

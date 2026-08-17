@@ -3,9 +3,11 @@ id: TASK-0101
 title: >-
   Key material type derives Debug, so an accidental debug-print would log raw
   key bytes
-status: Triage
-assignee: []
+status: To Do
+assignee:
+  - TASK-0118
 created_date: '2026-08-14 14:06'
+updated_date: '2026-08-17 20:03'
 labels:
   - security-review
   - security

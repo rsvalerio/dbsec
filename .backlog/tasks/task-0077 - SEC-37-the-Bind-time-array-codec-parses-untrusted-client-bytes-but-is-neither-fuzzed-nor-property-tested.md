@@ -3,9 +3,11 @@ id: TASK-0077
 title: >-
   SEC-37: the Bind-time array codec parses untrusted client bytes but is neither
   fuzzed nor property-tested
-status: Triage
-assignee: []
+status: To Do
+assignee:
+  - TASK-0121
 created_date: '2026-08-14 12:34'
+updated_date: '2026-08-17 20:04'
 labels:
   - code-review-rust
   - security

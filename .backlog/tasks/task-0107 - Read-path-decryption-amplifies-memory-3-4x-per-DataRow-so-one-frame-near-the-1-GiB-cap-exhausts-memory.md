@@ -3,9 +3,11 @@ id: TASK-0107
 title: >-
   Read-path decryption amplifies memory ~3-4x per DataRow, so one frame near the
   1 GiB cap exhausts memory
-status: Triage
-assignee: []
+status: To Do
+assignee:
+  - TASK-0125
 created_date: '2026-08-14 18:16'
+updated_date: '2026-08-17 20:04'
 labels:
   - security-review
   - security

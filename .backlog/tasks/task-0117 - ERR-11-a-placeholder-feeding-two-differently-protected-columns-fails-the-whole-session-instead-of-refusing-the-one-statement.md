@@ -3,9 +3,11 @@ id: TASK-0117
 title: >-
   ERR-11: a placeholder feeding two differently-protected columns fails the
   whole session instead of refusing the one statement
-status: Triage
-assignee: []
+status: To Do
+assignee:
+  - TASK-0124
 created_date: '2026-08-14 16:49'
+updated_date: '2026-08-17 20:04'
 labels:
   - code-review-rust
   - idioms-correctness
