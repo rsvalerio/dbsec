@@ -25,6 +25,13 @@
 //! `(table oid, attnum)` and never sees a primary key). Cross-column and
 //! cross-table relocation are detected; cross-row within one column is not.
 //!
+//! The context is the configured `schema.table.column` string, so **renaming a
+//! protected column or table makes every value already stored under the old
+//! name unreadable** — the new name is a different AAD, and authentication
+//! fails exactly as it would for a relocated value. A rename is therefore a
+//! re-encryption, in the same shape as the `DBS1` upgrade below: read under the
+//! old name, write back under the new one. `plans/PLAN.md` carries it.
+//!
 //! # Format versions and migration
 //!
 //! [`MAGIC_V1`] (`"DBS1"`) is the pre-context format: identical header layout,

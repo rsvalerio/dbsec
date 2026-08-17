@@ -317,6 +317,23 @@ proxy — nothing else has the DEK and the column context together:
 Rotating the DEK does not do this for you: DEKs roll per start, but existing rows are not
 rewritten, and an old `DBS1` row keeps its old key id and its old (unbound) tag.
 
+### Renaming a bound column is a re-encryption
+
+The bound context is the configured `schema.table.column` string, so renaming a protected
+column or table — in the database and in `[[column]]` — makes every `DBS2` value already
+stored under the old name fail authentication. The proxy cannot tell that from a relocated
+value, and it should not: "this ciphertext was written somewhere else" is exactly what the
+binding is for.
+
+So a rename is the same sweep as the `DBS1` upgrade above, in the opposite order: while
+the proxy still has the **old** name configured, read the column out (it decrypts) and
+hold the plaintext; rename; then write it back through a proxy configured with the new
+name. Doing it the other way round leaves an unreadable column. Deterministic keys are
+named the same way, so a rename also means the blind index / FPE / token key for that
+column is looked up under a new name — copy the old key's material into the new name's
+secret first, or the column is re-indexed under a freshly minted key and every stored
+token stops matching.
+
 ### Retiring the shared-map layout
 
 Deployments predating the per-name layout kept every deterministic key in one shared KV
