@@ -17,13 +17,16 @@ Three settings decide how much of the "a protected column is never at rest in
 plaintext" invariant the proxy can actually enforce. All are documented in full
 in `crates/proxy/src/config.rs`; the short version:
 
-**`on_unprotected`** — what happens to a statement the SQL rewrite cannot cover,
-so a protected column would take a plaintext write (or a searchable predicate
-would match nothing). The sites are non-UTF-8 and unparseable SQL, `INSERT`
-without a column list, `INSERT ... SELECT`, `COPY`, `MERGE`, `PREPARE` of a
-write, a non-literal expression assigned to a protected column, an unqualified
-name under a changed `search_path`, and a predicate over a searchable column
-that no blind-index match can express.
+**`on_unprotected`** — what happens when the proxy cannot cover a protected
+column: it would take a plaintext write, a searchable predicate would match
+nothing, or a read would hand back the stored form. The sites are non-UTF-8 and
+unparseable SQL, `INSERT` without a column list, `INSERT ... SELECT`, `COPY`,
+`MERGE`, `PREPARE` of a write, a non-literal expression assigned to a protected
+column, an unqualified name under a changed `search_path`, a predicate over a
+searchable column that no blind-index match can express, and a protected column
+projected through an expression — `email::text`, `ccnum || ''`,
+`coalesce(email, '')` — whose result PostgreSQL describes with no table
+identity, so the read path cannot decrypt or mask it.
 
 ```toml
 on_unprotected = "warn"    # default: log and relay — fail *open*

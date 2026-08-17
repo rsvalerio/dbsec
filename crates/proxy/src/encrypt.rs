@@ -861,6 +861,14 @@ impl QueryRewriter {
         // carry their own FROM, so they are walked by `rewrite_query` against
         // their own scope; the predicate pass above deliberately stops at the
         // subquery boundary, which is what keeps each query rewritten once.
+        // A protected column computed over in the projection loses its table
+        // identity on the way back, so the read path cannot act on it. Decided
+        // here, where the statement still says which column it was.
+        for item in &select.projection {
+            if let Some((column, expr)) = computed_protected_column(item, &scope) {
+                self.unprotected(&Unprotected::ComputedColumn { column, shape: expr_shape(expr) })?;
+            }
+        }
         for expr in select_expressions(select) {
             changed |= self.rewrite_nested_queries(expr, params)?;
         }
@@ -1339,6 +1347,102 @@ fn column_ref<'a>(scope: &'a TableScope<'_>, expr: &Expr) -> Option<&'a Arc<dyn 
         Expr::CompoundIdentifier(idents) => scope.resolve(idents),
         _ => None,
     }
+}
+
+/// The direct sub-expressions of `expr`, for read-only walks.
+///
+/// The mutable twin of this lives in
+/// [`QueryRewriter::rewrite_nested_queries`]; it stops at query boundaries
+/// because it hands them to `rewrite_query`, whereas this one descends into
+/// them, since a protected column referenced inside a subquery is still
+/// projected out of it.
+fn expr_operands(expr: &Expr) -> Vec<&Expr> {
+    match expr {
+        Expr::BinaryOp { left, right, .. }
+        | Expr::AnyOp { left, right, .. }
+        | Expr::AllOp { left, right, .. }
+        | Expr::IsDistinctFrom(left, right)
+        | Expr::IsNotDistinctFrom(left, right) => vec![left, right],
+        Expr::UnaryOp { expr: inner, .. }
+        | Expr::Nested(inner)
+        | Expr::Cast { expr: inner, .. }
+        | Expr::IsNull(inner)
+        | Expr::IsNotNull(inner)
+        | Expr::IsTrue(inner)
+        | Expr::IsNotTrue(inner)
+        | Expr::IsFalse(inner)
+        | Expr::IsNotFalse(inner)
+        | Expr::Collate { expr: inner, .. } => vec![inner],
+        Expr::InList { expr: operand, list, .. } => {
+            std::iter::once(operand.as_ref()).chain(list.iter()).collect()
+        }
+        Expr::Between { expr: operand, low, high, .. } => vec![operand, low, high],
+        Expr::Like { expr: operand, pattern, .. }
+        | Expr::ILike { expr: operand, pattern, .. }
+        | Expr::SimilarTo { expr: operand, pattern, .. } => vec![operand, pattern],
+        Expr::Tuple(items) => items.iter().collect(),
+        Expr::Case { operand, conditions, results, else_result } => operand
+            .iter()
+            .map(AsRef::as_ref)
+            .chain(else_result.iter().map(AsRef::as_ref))
+            .chain(conditions.iter())
+            .chain(results.iter())
+            .collect(),
+        Expr::Function(function) => match &function.args {
+            sqlparser::ast::FunctionArguments::List(list) => list
+                .args
+                .iter()
+                .filter_map(|argument| {
+                    let (FunctionArg::Named { arg, .. }
+                    | FunctionArg::ExprNamed { arg, .. }
+                    | FunctionArg::Unnamed(arg)) = argument;
+                    match arg {
+                        FunctionArgExpr::Expr(inner) => Some(inner),
+                        _ => None,
+                    }
+                })
+                .collect(),
+            _ => Vec::new(),
+        },
+        _ => Vec::new(),
+    }
+}
+
+/// The first protected column an expression references, however deeply.
+fn protected_reference(expr: &Expr, scope: &TableScope<'_>) -> Option<String> {
+    if column_ref(scope, expr).is_some() {
+        return column_name(expr);
+    }
+    expr_operands(expr).into_iter().find_map(|child| protected_reference(child, scope))
+}
+
+/// A projection item that computes over a protected column rather than
+/// selecting it directly.
+///
+/// PostgreSQL fills `table_oid` and `attnum` in a `RowDescription` only for a
+/// *direct* base-table column reference. Wrap the column in anything at all —
+/// `email::text`, `ccnum || ''`, `coalesce(email, '')` — and the field arrives
+/// as `(0, 0)`, which the read path matches against nothing and relays
+/// untouched. For a mask-only column that hands back the very value the mask
+/// exists to hide; for an encrypted one it hands back the raw stored form.
+///
+/// The read path cannot recover from this on its own: an expression output is
+/// named `?column?` unless the client aliases it, so there is nothing left to
+/// match on. The statement, however, still says plainly which column is being
+/// computed over, so the decision is made here while that is still knowable.
+fn computed_protected_column<'a>(
+    item: &'a SelectItem,
+    scope: &TableScope<'_>,
+) -> Option<(String, &'a Expr)> {
+    let expr = match item {
+        SelectItem::UnnamedExpr(expr) | SelectItem::ExprWithAlias { expr, .. } => expr,
+        SelectItem::QualifiedWildcard(..) | SelectItem::Wildcard(_) => return None,
+    };
+    // A bare column reference is the case the read path handles correctly.
+    if column_ref(scope, expr).is_some() {
+        return None;
+    }
+    Some((protected_reference(expr, scope)?, expr))
 }
 
 fn column_name(expr: &Expr) -> Option<String> {
@@ -2096,6 +2200,11 @@ enum Unprotected<'a> {
     Unsupported { table: &'a ObjectName, shape: &'static str },
     /// A non-literal expression assigned to a protected column.
     UnsupportedValue { column: &'a str, shape: &'static str },
+    /// A protected column projected through an expression rather than
+    /// selected directly. The result has no table OID, so the read path
+    /// cannot recognise it and relays the stored form — or, for a mask-only
+    /// column, the plaintext the mask exists to hide.
+    ComputedColumn { column: String, shape: &'static str },
     /// A predicate over a searchable column that no index match can express.
     Predicate { column: String, shape: &'static str },
     /// A predicate over a protected column that has no equality index at all,
@@ -2149,6 +2258,12 @@ impl Unprotected<'_> {
                 shape,
                 "unsupported expression for a protected column; passing through unencrypted"
             ),
+            Self::ComputedColumn { column, shape } => tracing::warn!(
+                column,
+                shape,
+                "protected column projected through an expression; the result has no table OID, \
+                 so the read path cannot decrypt or mask it and will relay the stored value"
+            ),
             Self::Predicate { column, shape } => tracing::warn!(
                 column,
                 shape,
@@ -2200,6 +2315,11 @@ impl Unprotected<'_> {
             }
             Self::UnsupportedValue { column, shape } => format!(
                 "protected column {column} was assigned a {shape}, which cannot be encrypted"
+            ),
+            Self::ComputedColumn { column, shape } => format!(
+                "protected column {column} was projected through a {shape}; the result carries no \
+                 table identity, so it cannot be decrypted or masked and would be returned in its \
+                 stored form; select the column directly instead"
             ),
             Self::Predicate { column, shape } => format!(
                 "searchable column {column} was used in a {shape}, which cannot be matched \
@@ -3151,6 +3271,57 @@ mod tests {
             "SELECT * FROM orders WHERE user_id = (SELECT id FROM other WHERE name = 'x')",
             "SELECT * FROM orders WHERE EXISTS (SELECT 1 FROM other WHERE id > 4)",
             "SELECT (SELECT id FROM other WHERE name = 'x') FROM t",
+        ] {
+            assert!(
+                matches!(strict.on_frame(b'Q', &query_frame(sql)).unwrap(), FrameAction::Relay),
+                "{sql}"
+            );
+        }
+    }
+
+    /// PostgreSQL fills a RowDescription's table OID only for a direct column
+    /// reference, so anything wrapped around a protected column comes back as
+    /// `(0, 0)` and the read path cannot act on it. For a mask-only column
+    /// that returns the value the mask exists to hide; for an encrypted one it
+    /// returns the raw stored form. The statement still names the column, so
+    /// the decision is made here.
+    #[test]
+    fn a_protected_column_computed_over_in_the_projection_is_signalled() {
+        for sql in [
+            "SELECT email || '' FROM users",
+            "SELECT email::text FROM users",
+            "SELECT coalesce(email, '') FROM users",
+            "SELECT lower(email) FROM users",
+            "SELECT max(email) FROM users",
+            "SELECT CASE WHEN id > 1 THEN email ELSE '' END FROM users",
+            // Aliasing it back to the column's own name changes nothing.
+            "SELECT email || '' AS email FROM users",
+        ] {
+            let mut strict = rewriter(strict_catalog(false));
+            let action = strict.on_frame(b'Q', &query_frame(sql)).unwrap();
+            let refusal = refusal(&action);
+            assert!(
+                refusal.contains("projected through") && refusal.contains("email"),
+                "{sql}\n  got: {refusal}"
+            );
+        }
+    }
+
+    /// The shapes that must keep working: selecting the column directly is
+    /// exactly what the read path handles, and expressions over other columns
+    /// are none of this check's business.
+    #[test]
+    fn selecting_a_protected_column_directly_is_not_a_computed_column() {
+        let mut strict = rewriter(strict_catalog(false));
+        for sql in [
+            "SELECT email FROM users",
+            "SELECT u.email FROM users u",
+            "SELECT email AS e FROM users",
+            "SELECT * FROM users",
+            "SELECT id + 1 FROM users",
+            "SELECT lower(name) FROM users",
+            "SELECT count(*) FROM users",
+            "SELECT lower(email) FROM other",
         ] {
             assert!(
                 matches!(strict.on_frame(b'Q', &query_frame(sql)).unwrap(), FrameAction::Relay),
