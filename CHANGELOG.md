@@ -2,6 +2,12 @@
 All notable changes to this project will be documented in this file. See [conventional commits](https://www.conventionalcommits.org/) for commit guidelines.
 
 - - -
+## v0.1.7 - 2026-08-17
+#### Bug Fixes
+- (**encrypt**) traverse subqueries in expression positions - (cc1a169) - Rodrigo Valerio, *Claude Opus 5 (1M context)*
+
+- - -
+
 ## v0.1.6 - 2026-08-17
 #### Bug Fixes
 - (**encrypt**) seal row-wise UPDATE SET (a, b) = (x, y) tuple assignment - (e8f3a01) - Rodrigo Valerio, *Claude Opus 5 (1M context)*
