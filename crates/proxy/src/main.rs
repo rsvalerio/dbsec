@@ -5,6 +5,7 @@
 mod columns;
 mod config;
 mod encrypt;
+mod hardening;
 mod portal;
 mod resolve;
 mod rows;
@@ -12,6 +13,7 @@ mod session;
 mod tls;
 mod vault;
 
+use std::ffi::OsString;
 use std::future::Future;
 use std::io::{ErrorKind, IsTerminal};
 use std::net::SocketAddr;
@@ -74,19 +76,50 @@ const REFUSAL_LOG_INTERVAL: Duration = Duration::from_secs(5);
 /// filter completely and can put `vaultrs=debug` back in.
 const DEFAULT_LOG_FILTER: &str = "info,vaultrs=off,rustify=off";
 
+/// Config file loaded when no path is given on the command line.
+const DEFAULT_CONFIG: &str = "dbsec.toml";
+
+/// Opt-in for running with no config at all — see [`load_config`].
+const PLAIN_RELAY_FLAG: &str = "--plain-relay";
+
+/// Opt-in for leaving core dumps enabled — see [`hardening`].
+const ALLOW_CORE_DUMPS_FLAG: &str = "--allow-core-dumps";
+
+const USAGE: &str = "usage: dbsec [--plain-relay] [--allow-core-dumps] [config.toml]";
+
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
+    #[error("{message}; {USAGE}")]
+    Usage { message: String },
+    #[error(
+        "no config path was given and {path} does not exist; refusing to start as a plaintext \
+         relay with no encryption, no TLS and no protected columns — pass a config path, or \
+         {PLAIN_RELAY_FLAG} to run without one deliberately"
+    )]
+    NoConfig { path: PathBuf },
     #[error("reading config {path}: {source}")]
     ConfigRead {
         path: PathBuf,
         #[source]
         source: std::io::Error,
     },
-    #[error("parsing config {path}: {source}")]
-    ConfigParse {
-        path: PathBuf,
+    /// Deliberately carries a rendered `reason` rather than the `toml` error
+    /// itself: that error's `Display` embeds the offending source line
+    /// verbatim, so a lost quote on an inline `[vault] token` or a
+    /// `control_dsn` password would print the credential to stderr — the one
+    /// leak [`config::Secret`] and [`config::Dsn`] cannot cover, because they
+    /// only ever hold values that parsed. [`config::describe_parse_error`]
+    /// builds the reason, and the `toml` error is not kept as a `#[source]`
+    /// either: anything walking the chain would print the snippet back.
+    #[error("parsing config {path}: {reason}")]
+    ConfigParse { path: PathBuf, reason: String },
+    #[error(
+        "{what}: {source}; pass {ALLOW_CORE_DUMPS_FLAG} to start with core dumps left enabled"
+    )]
+    Hardening {
+        what: &'static str,
         #[source]
-        source: toml::de::Error,
+        source: std::io::Error,
     },
     #[error("connecting to upstream {addr}: timed out")]
     ConnectTimeout { addr: String },
@@ -173,7 +206,7 @@ fn main() -> ExitCode {
         )
         .init();
 
-    let config = match load_config() {
+    let config = match start(std::env::args_os().skip(1)) {
         Ok(config) => config,
         Err(e) => {
             tracing::error!(error = %e, "startup failed");
@@ -197,19 +230,88 @@ fn main() -> ExitCode {
     }
 }
 
-/// `dbsec [config.toml]` — a missing default file just means defaults.
-fn load_config() -> Result<ValidatedConfig, Error> {
-    match std::env::args_os().nth(1) {
-        Some(path) => Config::load(Path::new(&path)),
-        None => {
-            let default = Path::new("dbsec.toml");
-            if default.exists() {
-                Config::load(default)
-            } else {
-                Config::default().validated()
+/// The command line: an optional config path and the two opt-ins that relax a
+/// default the proxy is otherwise strict about.
+#[derive(Debug, Default, PartialEq, Eq)]
+struct Args {
+    /// Explicit config path. `None` means "discover [`DEFAULT_CONFIG`]".
+    config: Option<PathBuf>,
+    /// Run with no config at all — see [`load_config`].
+    plain_relay: bool,
+    /// Leave core dumps enabled — see [`hardening::disable_core_dumps`].
+    allow_core_dumps: bool,
+}
+
+impl Args {
+    /// Parses the arguments after `argv[0]`.
+    ///
+    /// An unrecognised `-`-prefixed argument is refused rather than taken as a
+    /// config path: a mistyped `--plan-relay` would otherwise be reported as a
+    /// missing config file, which sends the operator looking for the wrong
+    /// problem — and this argument set is exactly the one where getting it
+    /// wrong changes what the proxy protects.
+    fn parse(args: impl IntoIterator<Item = OsString>) -> Result<Self, Error> {
+        let mut parsed = Self::default();
+        for arg in args {
+            // A path that is not UTF-8 is `None` here and lands in the config
+            // slot below, which is where a path belongs.
+            match arg.to_str() {
+                Some(PLAIN_RELAY_FLAG) => parsed.plain_relay = true,
+                Some(ALLOW_CORE_DUMPS_FLAG) => parsed.allow_core_dumps = true,
+                Some(unknown) if unknown.starts_with('-') => {
+                    return Err(Error::Usage { message: format!("unknown option {unknown}") })
+                }
+                _ => {
+                    if parsed.config.replace(PathBuf::from(&arg)).is_some() {
+                        return Err(Error::Usage {
+                            message: "more than one config path was given".to_owned(),
+                        });
+                    }
+                }
             }
         }
+        Ok(parsed)
     }
+}
+
+/// Everything that happens before the runtime exists: the command line, the
+/// process hardening that has to be in place before any key material is read,
+/// and the config itself.
+fn start(args: impl IntoIterator<Item = OsString>) -> Result<ValidatedConfig, Error> {
+    let args = Args::parse(args)?;
+    if !args.allow_core_dumps {
+        hardening::disable_core_dumps()?;
+    }
+    load_config(&args, Path::new(DEFAULT_CONFIG))
+}
+
+/// `dbsec [config.toml]` — with no path on the command line, `default`, which
+/// is [`DEFAULT_CONFIG`] in the working directory for every caller but the
+/// tests.
+///
+/// A missing default file is a refusal, not a fallback to built-in defaults.
+/// Those defaults configure no columns and no TLS, so falling back to them
+/// turns the proxy into a transparent plaintext relay whose only evidence is
+/// `protected_columns=0` in one INFO line — and the ways to get there are
+/// mundane: a systemd unit whose `WorkingDirectory` moved, a container whose
+/// config volume mounted somewhere else. A deployment that genuinely wants the
+/// relay says so with [`PLAIN_RELAY_FLAG`].
+fn load_config(args: &Args, default: &Path) -> Result<ValidatedConfig, Error> {
+    if let Some(path) = &args.config {
+        return Config::load(path);
+    }
+    if default.exists() {
+        return Config::load(default);
+    }
+    if !args.plain_relay {
+        return Err(Error::NoConfig { path: default.to_owned() });
+    }
+    tracing::warn!(
+        config = %default.display(),
+        "no config file and {PLAIN_RELAY_FLAG} was given: relaying in plaintext with no protected \
+         columns"
+    );
+    Config::default().validated()
 }
 
 async fn serve(validated: ValidatedConfig) -> Result<(), Error> {
@@ -531,6 +633,75 @@ fn is_key_backend_failure(e: &Error) -> bool {
 mod tests {
     use super::*;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    fn args(argv: &[&str]) -> Result<Args, Error> {
+        Args::parse(argv.iter().map(OsString::from))
+    }
+
+    #[test]
+    fn the_command_line_is_a_config_path_and_two_opt_ins() {
+        assert_eq!(args(&[]).unwrap(), Args::default());
+        assert_eq!(
+            args(&["dbsec.toml"]).unwrap(),
+            Args { config: Some(PathBuf::from("dbsec.toml")), ..Args::default() }
+        );
+        // Order-independent, and a flag is never mistaken for the path.
+        assert_eq!(
+            args(&[PLAIN_RELAY_FLAG, "a.toml", ALLOW_CORE_DUMPS_FLAG]).unwrap(),
+            Args {
+                config: Some(PathBuf::from("a.toml")),
+                plain_relay: true,
+                allow_core_dumps: true
+            }
+        );
+    }
+
+    /// A mistyped opt-in must not be read as a config path: it would be
+    /// reported as a missing file and send the operator after the wrong
+    /// problem, on the one argument that decides what the proxy protects.
+    #[test]
+    fn a_mistyped_option_is_refused_rather_than_taken_for_a_path() {
+        let Err(Error::Usage { message }) = args(&["--plan-relay"]) else {
+            panic!("an unknown option must be refused");
+        };
+        assert!(message.contains("--plan-relay"), "{message}");
+
+        assert!(matches!(args(&["a.toml", "b.toml"]), Err(Error::Usage { .. })));
+    }
+
+    /// TASK-0088: no argument and no `dbsec.toml` is a refusal, and the
+    /// refusal names both the file it looked for and the way to say "yes,
+    /// really".
+    #[test]
+    fn a_missing_config_refuses_to_start_unless_the_plain_relay_opt_in_is_given() {
+        let dir = tempfile::tempdir().unwrap();
+        let absent = dir.path().join(DEFAULT_CONFIG);
+
+        let Err(err) = load_config(&Args::default(), &absent) else {
+            panic!("a missing config must not fall back to a zero-protection relay");
+        };
+        let rendered = err.to_string();
+        assert!(rendered.contains(DEFAULT_CONFIG), "name the file it looked for: {rendered}");
+        assert!(rendered.contains(PLAIN_RELAY_FLAG), "name the opt-in: {rendered}");
+
+        let opted_in = Args { plain_relay: true, ..Args::default() };
+        let relay =
+            load_config(&opted_in, &absent).expect("the opt-in starts on built-in defaults");
+        assert!(relay.protected.is_none(), "a plain relay protects no columns");
+        assert_eq!(relay.config.listen, "127.0.0.1:6432");
+    }
+
+    /// The opt-in only covers a *missing* file: a discovered config is still
+    /// loaded, and still has to be valid.
+    #[test]
+    fn the_plain_relay_opt_in_never_overrides_a_config_that_is_there() {
+        let dir = tempfile::tempdir().unwrap();
+        let discovered = dir.path().join(DEFAULT_CONFIG);
+        std::fs::write(&discovered, "max_sessions = 0\n").unwrap();
+
+        let opted_in = Args { plain_relay: true, ..Args::default() };
+        assert!(matches!(load_config(&opted_in, &discovered), Err(Error::InvalidConfig(_))));
+    }
 
     /// SSLRequest: the cheapest client message the proxy answers on its own,
     /// used here as proof that a connection reached a session task.

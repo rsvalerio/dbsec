@@ -18,6 +18,11 @@ use std::time::Duration;
 /// The listen address a run with no config must fall back to.
 const DEFAULT_LISTEN: &str = "127.0.0.1:6432";
 
+/// The opt-in that turns a missing config file from a refusal back into
+/// built-in defaults. Spelled out here rather than imported: this suite drives
+/// the binary as an operator does, so the flag is part of what it pins.
+const PLAIN_RELAY_FLAG: &str = "--plain-relay";
+
 /// `max_sessions` for a config with no argument-passing ambiguity: the
 /// default is 256, so any of these values proves *which* file was read.
 const EXPLICIT_SESSIONS: usize = 7;
@@ -151,9 +156,27 @@ fn no_argument_picks_up_the_config_in_the_working_directory() {
     assert_eq!(proxy.stop(), "", "diagnostics must not reach stdout");
 }
 
-/// No argument and no `dbsec.toml`: a missing default file is not an error,
-/// it means built-in defaults — so startup gets all the way to binding the
-/// default listen address.
+/// No argument and no `dbsec.toml`: the proxy refuses to start rather than
+/// falling back to built-in defaults, which configure no columns and no TLS
+/// and would make it a transparent plaintext relay (TASK-0088). The refusal
+/// has to name both the file it looked for and the opt-in, because the way
+/// this case is reached — a moved `WorkingDirectory`, a config volume mounted
+/// elsewhere — leaves no other clue.
+#[test]
+fn no_argument_and_no_config_file_refuses_to_start() {
+    let dir = tempfile::tempdir().unwrap();
+    let output = dbsec(dir.path()).output().expect("the dbsec binary must be runnable");
+    let stderr = String::from_utf8(output.stderr).unwrap();
+
+    assert_eq!(output.status.code(), Some(1), "stderr: {stderr}");
+    assert!(stderr.contains("dbsec.toml"), "the file it looked for: {stderr}");
+    assert!(stderr.contains(PLAIN_RELAY_FLAG), "the opt-in: {stderr}");
+    assert!(stderr.contains("startup failed"), "{stderr}");
+    assert!(output.stdout.is_empty(), "stdout: {:?}", String::from_utf8_lossy(&output.stdout));
+}
+
+/// The opt-in itself: with it, a missing default file means built-in defaults
+/// again, so startup gets all the way to binding the default listen address.
 ///
 /// Observed by taking that address away first, rather than by letting the
 /// proxy bind it: a fixed global port cannot be claimed by a test suite that
@@ -162,18 +185,36 @@ fn no_argument_picks_up_the_config_in_the_working_directory() {
 /// under test — that the run fell back to the default rather than erroring
 /// out on the missing file.
 #[test]
-fn no_argument_and_no_config_file_falls_back_to_the_default_listen_address() {
+fn the_plain_relay_opt_in_falls_back_to_the_default_listen_address() {
     let occupied = std::net::TcpListener::bind(DEFAULT_LISTEN).ok();
 
     let dir = tempfile::tempdir().unwrap();
-    let output = dbsec(dir.path()).output().expect("the dbsec binary must be runnable");
+    let output = dbsec(dir.path())
+        .arg(PLAIN_RELAY_FLAG)
+        .output()
+        .expect("the dbsec binary must be runnable");
     let stderr = String::from_utf8(output.stderr).unwrap();
     drop(occupied);
 
     assert_eq!(output.status.code(), Some(1), "stderr: {stderr}");
     assert!(stderr.contains(&format!("binding listen address {DEFAULT_LISTEN}")), "{stderr}");
-    // The missing `dbsec.toml` itself must not be what failed.
-    assert!(!stderr.contains("dbsec.toml"), "{stderr}");
+    assert!(output.stdout.is_empty(), "stdout: {:?}", String::from_utf8_lossy(&output.stdout));
+}
+
+/// A mistyped option is refused with the usage line rather than treated as a
+/// config path — on this command line the difference between `--plain-relay`
+/// and a typo is the difference between an intended plaintext relay and an
+/// unintended one.
+#[test]
+fn an_unknown_option_exits_non_zero_with_the_usage_line() {
+    let dir = tempfile::tempdir().unwrap();
+    let output =
+        dbsec(dir.path()).arg("--plan-relay").output().expect("the dbsec binary must be runnable");
+    let stderr = String::from_utf8(output.stderr).unwrap();
+
+    assert_eq!(output.status.code(), Some(1), "stderr: {stderr}");
+    assert!(stderr.contains("--plan-relay"), "{stderr}");
+    assert!(stderr.contains("usage: dbsec"), "{stderr}");
     assert!(output.stdout.is_empty(), "stdout: {:?}", String::from_utf8_lossy(&output.stdout));
 }
 

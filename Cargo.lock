@@ -395,6 +395,7 @@ dependencies = [
  "proptest",
  "rand 0.8.7",
  "rcgen",
+ "rustix",
  "rustls",
  "rustls-pki-types",
  "serde",

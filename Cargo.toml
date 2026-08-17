@@ -38,6 +38,12 @@ rustls-pki-types = "1"
 vaultrs = "0.7"
 base64 = "0.22"
 
+# process hardening (unix only): `RLIMIT_CORE` and `prctl(PR_SET_DUMPABLE)`.
+# rustix rather than libc because the workspace forbids `unsafe_code` — these
+# are the two syscalls the proxy makes directly, and rustix exposes both behind
+# a safe signature. It is already in the graph via `tempfile`.
+rustix = { version = "1", features = ["process"] }
+
 # config / errors / logging
 serde = { version = "1", features = ["derive"] }
 toml = "0.8"

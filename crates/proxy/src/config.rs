@@ -20,6 +20,7 @@
 //!   leaves as its unmasked stored value. Both are `on_unprotected` sites.
 
 use std::fmt;
+use std::ops::Range;
 use std::path::{Path, PathBuf};
 
 use serde::Deserialize;
@@ -102,6 +103,21 @@ impl Dsn {
             return format!("<unparseable control_dsn {REDACTED}>");
         }
         redact_dsn(&self.0)
+    }
+
+    /// Whether this DSN carries a password, in either accepted shape.
+    ///
+    /// Decided by `tokio_postgres`' own parser rather than by re-scanning the
+    /// string, so it cannot disagree with what the control connection will
+    /// actually send. A value that does not parse answers `true`: it is not a
+    /// connection string this proxy understands, so what is in it is unknown,
+    /// and the only use of this answer is deciding whether the file holding it
+    /// has to be owner-only.
+    pub fn carries_password(&self) -> bool {
+        match self.0.parse::<tokio_postgres::Config>() {
+            Ok(dsn) => dsn.get_password().is_some(),
+            Err(_) => true,
+        }
     }
 }
 
@@ -234,8 +250,14 @@ fn mask_password_parameters(input: &str, out: &mut String) {
 /// A file that cannot be stat'ed is left alone. The read that follows reports
 /// the real I/O error with its path (ERR-13), which is a better message than
 /// anything this check could invent for a path that may not exist yet.
+///
+/// `holds` names the credential in the refusal, because the file this is
+/// applied to is not always obviously a secret: the config file itself gets
+/// the same check once it carries an inline `[vault] token` or a
+/// password-bearing `control_dsn`, and "dbsec.toml is readable beyond its
+/// owner" without saying *why* reads as a bug rather than as the thing to fix.
 #[cfg(unix)]
-fn check_secret_file_mode(path: &Path) -> Result<(), Error> {
+fn check_secret_file_mode(path: &Path, holds: &str) -> Result<(), Error> {
     use std::os::unix::fs::PermissionsExt as _;
 
     let Ok(metadata) = std::fs::metadata(path) else {
@@ -244,7 +266,7 @@ fn check_secret_file_mode(path: &Path) -> Result<(), Error> {
     let mode = metadata.permissions().mode();
     if mode & 0o077 != 0 {
         return Err(Error::InvalidConfig(format!(
-            "{} is readable beyond its owner (mode {:04o}); it holds secret material — chmod 600 {}",
+            "{} is readable beyond its owner (mode {:04o}); it holds {holds} — chmod 600 {}",
             path.display(),
             mode & 0o7777,
             path.display()
@@ -258,8 +280,85 @@ fn check_secret_file_mode(path: &Path) -> Result<(), Error> {
 /// build failure. Secret-file permissions on those platforms are the
 /// deployment's responsibility.
 #[cfg(not(unix))]
-fn check_secret_file_mode(_path: &Path) -> Result<(), Error> {
+fn check_secret_file_mode(_path: &Path, _holds: &str) -> Result<(), Error> {
     Ok(())
+}
+
+/// Key-name fragments whose value is, or may contain, a credential.
+///
+/// Used only by [`describe_parse_error`], which is asking about text that did
+/// *not* parse and so has to guess — deliberately over-broadly. `keys_file`
+/// matches on `key` though it holds a path rather than a secret; withholding
+/// one parse message too many costs a diagnostic, and the alternative costs a
+/// credential. [`Config::inline_secret`] answers the same question exactly,
+/// because by then the config has parsed.
+const SECRET_KEY_MARKERS: [&str; 5] = ["token", "password", "secret", "dsn", "key"];
+
+/// Renders a `toml` parse failure *without* the offending source line.
+///
+/// `toml::de::Error`'s own `Display` quotes the input around the failure, so
+/// `error!("{e}")` on a config with a lost closing quote on `token = "…"`
+/// prints the Vault token — the credential that unwraps every DEK — into
+/// stderr and every log pipeline collecting it. [`Secret`] and [`Dsn`] cannot
+/// help: they only ever hold values that parsed.
+///
+/// What survives is `message()` (the parser's own words, with no input in
+/// them) plus the position, which is what an operator needs to find the line.
+/// The message is withheld too when the parser pointed at a line that
+/// configures a credential, since serde's message for a *type* mismatch quotes
+/// the offending value ("invalid type: integer 1234, expected a string") and
+/// on those lines that value is the secret.
+fn describe_parse_error(err: &toml::de::Error, raw: &str) -> String {
+    let Some(span) = err.span() else {
+        // No position: the failure is about the document as a whole (a
+        // missing table, a duplicated key reported without a span), so there
+        // is no source text behind it to quote.
+        return err.message().to_owned();
+    };
+    let (line, column) = position(raw, span.start);
+    if spans_a_secret_line(raw, &span) {
+        return format!(
+            "invalid TOML at line {line}, column {column}; the parser's message is withheld \
+             because that line configures a credential"
+        );
+    }
+    format!("{} (at line {line}, column {column})", err.message())
+}
+
+/// One-based line and byte-column of `offset`. Counted over bytes so a span
+/// landing inside a multi-byte character cannot panic.
+fn position(raw: &str, offset: usize) -> (usize, usize) {
+    let head = &raw.as_bytes()[..offset.min(raw.len())];
+    let line = head.iter().filter(|byte| **byte == b'\n').count() + 1;
+    let column =
+        head.iter().rposition(|byte| *byte == b'\n').map_or(head.len(), |i| head.len() - i - 1) + 1;
+    (line, column)
+}
+
+/// Whether any line the span touches assigns a [`SECRET_KEY_MARKERS`] key.
+fn spans_a_secret_line(raw: &str, span: &Range<usize>) -> bool {
+    let bytes = raw.as_bytes();
+    // Widened to whole lines in both directions: a span may start mid-value,
+    // and a value the parser could not terminate runs past the line it began
+    // on. Both ends land on a `\n` or on an end of input, so slicing `raw`
+    // with them cannot split a character.
+    let start = bytes[..span.start.min(bytes.len())]
+        .iter()
+        .rposition(|byte| *byte == b'\n')
+        .map_or(0, |i| i + 1);
+    let from = span.end.min(bytes.len());
+    let end =
+        bytes[from..].iter().position(|byte| *byte == b'\n').map_or(bytes.len(), |i| from + i);
+    raw[start..end].lines().any(assigns_a_secret)
+}
+
+/// Whether a config line is `<key> = …` for a key that names a credential.
+fn assigns_a_secret(line: &str) -> bool {
+    let Some((key, _)) = line.split_once('=') else {
+        return false;
+    };
+    let key = key.trim().trim_matches('"').to_ascii_lowercase();
+    SECRET_KEY_MARKERS.iter().any(|marker| key.contains(marker))
 }
 
 #[derive(Debug, Deserialize)]
@@ -431,7 +530,7 @@ impl VaultConfig {
         match (&self.token, &self.token_file) {
             (Some(token), None) => Ok(token.clone()),
             (None, Some(path)) => {
-                check_secret_file_mode(path)?;
+                check_secret_file_mode(path, "the Vault token")?;
                 // The file contents are the token: read into a buffer that is
                 // wiped on drop, and hand the trimmed copy straight to
                 // `Secret`, which is wiped in turn.
@@ -598,9 +697,35 @@ impl Config {
             std::fs::read_to_string(path)
                 .map_err(|source| Error::ConfigRead { path: path.to_owned(), source })?,
         );
-        let config: Self = toml::from_str(&raw)
-            .map_err(|source| Error::ConfigParse { path: path.to_owned(), source })?;
+        let config: Self = toml::from_str(&raw).map_err(|source| Error::ConfigParse {
+            path: path.to_owned(),
+            reason: describe_parse_error(&source, &raw),
+        })?;
+        // The config file joins the keyfile, the token file and the TLS key as
+        // a secret file the moment it carries one of those credentials inline
+        // (SEC-29). Checked here rather than in `validate` because it is a
+        // property of the file this config was read from, and a config built
+        // programmatically — in a test, or by a future embedder — has no file
+        // behind it to check.
+        if let Some(holds) = config.inline_secret() {
+            check_secret_file_mode(path, holds)?;
+        }
         config.validated()
+    }
+
+    /// What credential this config carries in the file itself, if any.
+    ///
+    /// `token_file` is deliberately not one: that path is checked on its own
+    /// (`VaultConfig::resolve_token`), and naming a file is not holding its
+    /// contents.
+    fn inline_secret(&self) -> Option<&'static str> {
+        if self.vault.as_ref().is_some_and(|vault| vault.token.is_some()) {
+            return Some("an inline [vault] token");
+        }
+        if self.control_dsn.as_ref().is_some_and(Dsn::carries_password) {
+            return Some("a control_dsn password");
+        }
+        None
     }
 
     /// Validates and hands back the resolved form. The only way to obtain a
@@ -624,7 +749,7 @@ impl Config {
         // a secret on the same footing as `keys_file` (SEC-29). The cert beside
         // it is public and is deliberately not checked.
         if let Some(downstream) = &self.tls.downstream {
-            check_secret_file_mode(&downstream.key)?;
+            check_secret_file_mode(&downstream.key, "the proxy's TLS private key")?;
         }
         // Resolved before the `[[column]]` branch below, and only here: a
         // `[vault]` section is validated whether or not a column uses it, and
@@ -646,7 +771,7 @@ impl Config {
         } else {
             let keys = match (&self.keys_file, vault) {
                 (Some(keys_file), None) => {
-                    check_secret_file_mode(keys_file)?;
+                    check_secret_file_mode(keys_file, "every master key")?;
                     KeySourceConfig::File(keys_file.clone())
                 }
                 (None, Some(setup)) => KeySourceConfig::Vault(Box::new(setup)),
@@ -974,6 +1099,114 @@ mod tests {
         // Nothing reads the file again, so removing it changes nothing.
         std::fs::remove_file(&token).unwrap();
         assert_eq!(setup.token.expose(), "s3cr3t");
+    }
+
+    /// The parse error an operator meets most often is a lost quote, and the
+    /// line it lands on is as likely as not the one holding the Vault token or
+    /// the DSN password. `toml`'s own `Display` quotes that line back; nothing
+    /// this crate renders may.
+    #[cfg(unix)]
+    #[test]
+    fn a_parse_failure_never_echoes_the_line_it_failed_on() {
+        let dir = tempfile::tempdir().unwrap();
+        let cases = [
+            // A lost closing quote on the token: the classic fat-finger.
+            ("token.toml", "[vault]\naddr = \"a\"\ntoken = \"s3cr3t-token\n", "s3cr3t-token"),
+            // A value serde rejects by *type*, whose message quotes it.
+            ("typed.toml", "[vault]\naddr = \"a\"\ntoken = 31337\n", "31337"),
+            // The other credential in the file.
+            (
+                "dsn.toml",
+                "control_dsn = \"postgres://dbsec:hunter2@db/app\"\nmax_sessions = \n",
+                "hunter2",
+            ),
+        ];
+
+        for (name, text, secret) in cases {
+            let path = write_mode(dir.path(), name, text, 0o600);
+            let Err(err) = Config::load(&path) else {
+                panic!("{name} must not parse");
+            };
+            assert!(matches!(err, Error::ConfigParse { .. }), "{name}: got {err:?}");
+            let rendered = format!("{err}");
+            assert!(!rendered.contains(secret), "{name} leaked {secret}: {rendered}");
+            assert!(!format!("{err:?}").contains(secret), "{name} leaked via Debug: {err:?}");
+            assert!(
+                std::error::Error::source(&err).is_none(),
+                "{name}: keeping the toml error as a source would print the snippet back"
+            );
+            assert!(rendered.contains("line"), "{name} must still say where: {rendered}");
+        }
+    }
+
+    /// A parse failure that touches nothing sensitive keeps the parser's own
+    /// words — withholding every message would trade one leak for a config
+    /// nobody can debug.
+    #[cfg(unix)]
+    #[test]
+    fn a_parse_failure_on_an_ordinary_line_keeps_its_message() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_mode(dir.path(), "typo.toml", "listne = \"oops\"\n", 0o600);
+
+        let Err(err) = Config::load(&path) else {
+            panic!("an unknown field must not parse");
+        };
+        let rendered = format!("{err}");
+        assert!(rendered.contains("unknown field"), "{rendered}");
+        assert!(rendered.contains("line 1"), "{rendered}");
+    }
+
+    /// SEC-29 for the config file itself: it is a secret file whenever it
+    /// carries the credential inline, and `0644` on it hands every local user
+    /// the token that unwraps every DEK.
+    #[cfg(unix)]
+    #[test]
+    fn a_config_holding_an_inline_secret_must_be_readable_only_by_its_owner() {
+        let dir = tempfile::tempdir().unwrap();
+        let inline_token = "[vault]\naddr = \"https://bao.internal:8200\"\ntoken = \"s3cr3t\"\n";
+
+        let tight = write_mode(dir.path(), "tight.toml", inline_token, 0o600);
+        Config::load(&tight).unwrap();
+
+        for (name, mode) in [("group.toml", 0o640), ("world.toml", 0o644)] {
+            let loose = write_mode(dir.path(), name, inline_token, mode);
+            let Err(err) = Config::load(&loose) else {
+                panic!("a {mode:04o} config holding an inline token must not be accepted");
+            };
+            assert!(matches!(err, Error::InvalidConfig(_)), "got {err:?}");
+            assert!(err.to_string().contains(&format!("{mode:04o}")), "name the mode: {err}");
+            assert!(err.to_string().contains("[vault] token"), "name the credential: {err}");
+        }
+
+        // A password in the control DSN is the same credential class.
+        let dsn = write_mode(
+            dir.path(),
+            "dsn.toml",
+            "control_dsn = \"postgres://dbsec:hunter2@db.internal/app\"\n",
+            0o644,
+        );
+        let Err(err) = Config::load(&dsn) else {
+            panic!("a world-readable config holding a DSN password must not be accepted");
+        };
+        assert!(err.to_string().contains("control_dsn password"), "{err}");
+        assert!(!err.to_string().contains("hunter2"), "the refusal itself must not leak it: {err}");
+    }
+
+    /// The other half: a config that holds no credential is an ordinary file
+    /// and keeps working at the mode a checkout or a config-management run
+    /// gives it.
+    #[cfg(unix)]
+    #[test]
+    fn a_config_with_no_inline_secret_is_unaffected_by_its_mode() {
+        let dir = tempfile::tempdir().unwrap();
+        let token_file = write_mode(dir.path(), "token", "s3cr3t\n", 0o600);
+        let text = format!(
+            "listen = \"127.0.0.1:6432\"\ncontrol_dsn = \"postgres://dbsec@db.internal/app\"\n\n\
+             [vault]\naddr = \"a\"\ntoken_file = {token_file:?}\n"
+        );
+
+        let world_readable = write_mode(dir.path(), "public.toml", &text, 0o644);
+        Config::load(&world_readable).unwrap();
     }
 
     #[test]

@@ -270,6 +270,12 @@ mask = {{ keep_first = 2 }}
     );
     let config_path = dir.join("dbsec.toml");
     std::fs::File::create(&config_path).unwrap().write_all(config.as_bytes()).unwrap();
+    // This config carries a `control_dsn` password — and in Vault mode an
+    // inline token — so the proxy holds it to the same mode as the keyfile
+    // beside it (SEC-29), and `File::create` inherits the umask.
+    #[cfg(unix)]
+    std::fs::set_permissions(&config_path, std::os::unix::fs::PermissionsExt::from_mode(0o600))
+        .unwrap();
 
     spawn_with_config(&config_path, opts.port).await
 }
