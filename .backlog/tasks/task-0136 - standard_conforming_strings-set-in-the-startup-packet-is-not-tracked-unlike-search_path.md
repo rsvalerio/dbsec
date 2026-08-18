@@ -3,9 +3,11 @@ id: TASK-0136
 title: >-
   standard_conforming_strings set in the startup packet is not tracked, unlike
   search_path
-status: Triage
-assignee: []
+status: To Do
+assignee:
+  - TASK-0140
 created_date: '2026-08-18 09:37'
+updated_date: '2026-08-18 09:59'
 labels:
   - code-review-rust
   - security

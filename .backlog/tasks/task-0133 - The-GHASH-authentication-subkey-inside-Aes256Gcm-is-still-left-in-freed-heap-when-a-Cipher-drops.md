@@ -3,9 +3,11 @@ id: TASK-0133
 title: >-
   The GHASH authentication subkey inside Aes256Gcm is still left in freed heap
   when a Cipher drops
-status: Triage
-assignee: []
+status: To Do
+assignee:
+  - TASK-0141
 created_date: '2026-08-17 20:44'
+updated_date: '2026-08-18 09:59'
 labels:
   - code-review-rust
   - security

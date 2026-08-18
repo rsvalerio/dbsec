@@ -3,9 +3,11 @@ id: TASK-0128
 title: >-
   SEC-33: the relay buffers and SQL-parses 1 GiB frames before the backend has
   authenticated the client
-status: Triage
-assignee: []
+status: To Do
+assignee:
+  - TASK-0143
 created_date: '2026-08-17 20:23'
+updated_date: '2026-08-18 10:00'
 labels:
   - code-review-rust
   - security

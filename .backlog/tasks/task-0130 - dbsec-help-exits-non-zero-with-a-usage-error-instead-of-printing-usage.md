@@ -1,9 +1,11 @@
 ---
 id: TASK-0130
 title: dbsec --help exits non-zero with a usage error instead of printing usage
-status: Triage
-assignee: []
+status: To Do
+assignee:
+  - TASK-0142
 created_date: '2026-08-17 20:31'
+updated_date: '2026-08-18 09:59'
 labels:
   - code-review-rust
   - cli

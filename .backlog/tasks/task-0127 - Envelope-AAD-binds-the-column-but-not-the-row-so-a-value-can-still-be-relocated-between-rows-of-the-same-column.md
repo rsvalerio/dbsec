@@ -3,9 +3,11 @@ id: TASK-0127
 title: >-
   Envelope AAD binds the column but not the row, so a value can still be
   relocated between rows of the same column
-status: Triage
-assignee: []
+status: To Do
+assignee:
+  - TASK-0141
 created_date: '2026-08-17 20:22'
+updated_date: '2026-08-18 09:59'
 labels:
   - code-review-rust
   - security

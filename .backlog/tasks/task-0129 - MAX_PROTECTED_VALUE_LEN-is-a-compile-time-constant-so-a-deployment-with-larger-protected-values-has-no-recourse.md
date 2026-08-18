@@ -3,9 +3,11 @@ id: TASK-0129
 title: >-
   MAX_PROTECTED_VALUE_LEN is a compile-time constant, so a deployment with
   larger protected values has no recourse
-status: Triage
-assignee: []
+status: To Do
+assignee:
+  - TASK-0143
 created_date: '2026-08-17 20:23'
+updated_date: '2026-08-18 10:00'
 labels:
   - code-review-rust
   - api

@@ -3,9 +3,11 @@ id: TASK-0131
 title: >-
   A config file with no [[column]] entries starts a plaintext relay with only an
   INFO line
-status: Triage
-assignee: []
+status: To Do
+assignee:
+  - TASK-0142
 created_date: '2026-08-17 20:31'
+updated_date: '2026-08-18 10:00'
 labels:
   - code-review-rust
   - security

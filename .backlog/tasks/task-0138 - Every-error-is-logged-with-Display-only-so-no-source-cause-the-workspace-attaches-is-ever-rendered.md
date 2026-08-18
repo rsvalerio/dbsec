@@ -3,9 +3,11 @@ id: TASK-0138
 title: >-
   Every error is logged with Display only, so no #[source] cause the workspace
   attaches is ever rendered
-status: Triage
-assignee: []
+status: To Do
+assignee:
+  - TASK-0142
 created_date: '2026-08-18 09:44'
+updated_date: '2026-08-18 10:00'
 labels:
   - code-review-rust
   - error-handling

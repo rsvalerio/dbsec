@@ -3,9 +3,11 @@ id: TASK-0135
 title: >-
   A searchable predicate inside a COPY (query) TO STDOUT is never rewritten, so
   it silently matches no rows
-status: Triage
-assignee: []
+status: To Do
+assignee:
+  - TASK-0139
 created_date: '2026-08-17 20:58'
+updated_date: '2026-08-18 09:59'
 labels:
   - code-review-rust
   - correctness

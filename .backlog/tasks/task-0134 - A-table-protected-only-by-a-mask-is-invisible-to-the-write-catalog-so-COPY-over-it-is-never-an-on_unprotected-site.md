@@ -3,9 +3,11 @@ id: TASK-0134
 title: >-
   A table protected only by a mask is invisible to the write catalog, so COPY
   over it is never an on_unprotected site
-status: Triage
-assignee: []
+status: To Do
+assignee:
+  - TASK-0139
 created_date: '2026-08-17 20:58'
+updated_date: '2026-08-18 09:59'
 labels:
   - code-review-rust
   - security

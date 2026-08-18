@@ -3,9 +3,11 @@ id: TASK-0137
 title: >-
   Every rewritten statement is tokenized twice: once for session settings, once
   by the parser
-status: Triage
-assignee: []
+status: To Do
+assignee:
+  - TASK-0140
 created_date: '2026-08-18 09:37'
+updated_date: '2026-08-18 09:59'
 labels:
   - code-review-rust
   - performance

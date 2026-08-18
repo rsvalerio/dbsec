@@ -3,9 +3,11 @@ id: TASK-0132
 title: >-
   A parenthesized (nested) join hides its protected tables from the predicate
   scope
-status: Triage
-assignee: []
+status: To Do
+assignee:
+  - TASK-0139
 created_date: '2026-08-17 20:35'
+updated_date: '2026-08-18 09:59'
 labels:
   - code-review-rust
   - security
