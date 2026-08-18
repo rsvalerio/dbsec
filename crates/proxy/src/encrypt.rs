@@ -654,9 +654,33 @@ impl QueryRewriter {
                 Ok(changed)
             }
             Statement::Copy { source, to, .. } => {
-                if let sqlparser::ast::CopySource::Table { table_name, .. } = source {
-                    if self.table(table_name)?.is_some() {
-                        self.unprotected(&Unprotected::Copy { table: table_name, to: *to })?;
+                match source {
+                    sqlparser::ast::CopySource::Table { table_name, .. } => {
+                        if self.table(table_name)?.is_some() {
+                            self.unprotected(&Unprotected::Copy { table: table_name, to: *to })?;
+                        }
+                    }
+                    // `COPY (SELECT ...) TO STDOUT`. PostgreSQL only allows a
+                    // query source in the *out* direction, and its rows leave
+                    // as `CopyData` frames — which the read path relays
+                    // verbatim, because only `DataRow` carries the column
+                    // identity decryption needs. So this form streams the
+                    // stored value of every protected column it projects, and
+                    // it used to do so with no signal at all: the classifier
+                    // looked at `CopySource::Table` only, so `reject` refused
+                    // `COPY users TO STDOUT` and relayed
+                    // `COPY (SELECT email FROM users) TO STDOUT`.
+                    //
+                    // The query is classified, not rewritten. Rewriting it
+                    // would mean re-rendering a `COPY` through sqlparser's
+                    // `Display`, and `COPY ... FROM STDIN` has no wire-valid
+                    // rendering (see [`parse_sql`]) — so a searchable
+                    // predicate inside a COPY query is still left matching
+                    // nothing under `warn`, which is tracked separately.
+                    sqlparser::ast::CopySource::Query(query) => {
+                        for table in self.copied_protected_tables(query)? {
+                            self.unprotected(&Unprotected::CopyQuery { table })?;
+                        }
                     }
                 }
                 Ok(false)
@@ -1145,6 +1169,127 @@ impl QueryRewriter {
             }
         }
         Ok(TableScope { tables })
+    }
+
+    /// Every protected table a `COPY (query) TO STDOUT` would read, gathered
+    /// from the query's own FROM clauses, its derived tables, its CTE bodies
+    /// and both branches of a set operation. Names are reported once each,
+    /// however many times the query mentions them.
+    ///
+    /// The *table* is what is reported, not the column. A COPY query's
+    /// projection is arbitrary SQL — `SELECT *`, a function call, a reference
+    /// to a CTE that selects the column three levels down — so "does this
+    /// stream a protected column" is not answerable from the statement text,
+    /// and answering "no" wrongly is the failure that leaks. Naming the table
+    /// is also what the table-form `COPY t TO STDOUT` already does, so the two
+    /// forms of one statement now behave alike.
+    ///
+    /// This walk recognises two table shapes [`Self::scope`] does not — a
+    /// parenthesised join and the `PIVOT`/`UNPIVOT`/`MATCH_RECOGNIZE` wrappers
+    /// — because the consequence of missing one differs. There, a missed table
+    /// leaves a predicate unrewritten, which the client sees as an empty
+    /// result; here it hands the client a protected column's stored bytes.
+    fn copied_protected_tables(&self, query: &Query) -> Result<Vec<String>, Rejection> {
+        let mut found = Vec::new();
+        self.collect_copied_tables(query, &mut found)?;
+        Ok(found)
+    }
+
+    fn collect_copied_tables(
+        &self,
+        query: &Query,
+        found: &mut Vec<String>,
+    ) -> Result<(), Rejection> {
+        if let Some(with) = query.with.as_ref() {
+            for cte in &with.cte_tables {
+                self.collect_copied_tables(&cte.query, found)?;
+            }
+        }
+        self.collect_copied_tables_in(&query.body, found)
+    }
+
+    fn collect_copied_tables_in(
+        &self,
+        body: &SetExpr,
+        found: &mut Vec<String>,
+    ) -> Result<(), Rejection> {
+        match body {
+            SetExpr::Select(select) => {
+                for table in &select.from {
+                    let factors = std::iter::once(&table.relation)
+                        .chain(table.joins.iter().map(|join| &join.relation));
+                    for factor in factors {
+                        self.collect_copied_tables_from(factor, found)?;
+                    }
+                }
+            }
+            SetExpr::Query(query) => self.collect_copied_tables(query, found)?,
+            SetExpr::SetOperation { left, right, .. } => {
+                self.collect_copied_tables_in(left, found)?;
+                self.collect_copied_tables_in(right, found)?;
+            }
+            // `TABLE t`, the shorthand for `SELECT * FROM t`, which the parser
+            // keeps as a pair of bare strings rather than an `ObjectName`.
+            //
+            // sqlparser 0.53 cannot actually reach this arm from a COPY
+            // source: `parse_as_table` reads three tokens unconditionally and
+            // so overruns the closing paren, leaving `COPY (TABLE t) TO
+            // STDOUT` unparseable — which is a site of its own, so the shape
+            // is refused under `reject` today by a different name. The arm is
+            // here so a later parser fix cannot quietly open a hole.
+            SetExpr::Table(table) => {
+                let Some(name) = table.table_name.as_ref() else { return Ok(()) };
+                let parts = table.schema_name.iter().chain(std::iter::once(name));
+                let name = ObjectName(parts.map(|part| Ident::new(part.as_str())).collect());
+                self.record_copied_table(&name, found)?;
+            }
+            // A data-modifying CTE writes; it is the write path's own sites
+            // that cover it, and its rows are not what COPY streams.
+            SetExpr::Insert(_) | SetExpr::Update(_) | SetExpr::Values(_) => {}
+        }
+        Ok(())
+    }
+
+    fn collect_copied_tables_from(
+        &self,
+        factor: &TableFactor,
+        found: &mut Vec<String>,
+    ) -> Result<(), Rejection> {
+        match factor {
+            TableFactor::Table { name, .. } => self.record_copied_table(name, found),
+            TableFactor::Derived { subquery, .. } => self.collect_copied_tables(subquery, found),
+            TableFactor::NestedJoin { table_with_joins, .. } => {
+                let factors = std::iter::once(&table_with_joins.relation)
+                    .chain(table_with_joins.joins.iter().map(|join| &join.relation));
+                for factor in factors {
+                    self.collect_copied_tables_from(factor, found)?;
+                }
+                Ok(())
+            }
+            TableFactor::Pivot { table, .. }
+            | TableFactor::Unpivot { table, .. }
+            | TableFactor::MatchRecognize { table, .. } => {
+                self.collect_copied_tables_from(table, found)
+            }
+            // Set-returning functions, `UNNEST`, `JSON_TABLE`: none of them
+            // names a table the catalog could resolve.
+            _ => Ok(()),
+        }
+    }
+
+    fn record_copied_table(
+        &self,
+        name: &ObjectName,
+        found: &mut Vec<String>,
+    ) -> Result<(), Rejection> {
+        if self.table(name)?.is_none() {
+            return Ok(());
+        }
+        let name = name.to_string();
+        if !found.contains(&name) {
+            found.push(name);
+        }
+        Ok(())
     }
 
     /// Rewrites the equality shapes that a blind index can answer, and turns
@@ -2389,6 +2534,11 @@ enum Unprotected<'a> {
     InsertFromSelect(&'a ObjectName),
     /// `COPY`, whose payload is a `CopyData` stream the proxy does not parse.
     Copy { table: &'a ObjectName, to: bool },
+    /// `COPY (query) TO STDOUT` over a protected table. Kept apart from
+    /// [`Self::Copy`] because the remedy differs — there is no table to bulk
+    /// load differently, only a query to run as an ordinary `SELECT` so its
+    /// rows come back as `DataRow` frames the read path can decrypt and mask.
+    CopyQuery { table: String },
     /// A statement shape that writes a protected table but is not rewritten.
     Unsupported { table: &'a ObjectName, shape: &'static str },
     /// A non-literal expression assigned to a protected column.
@@ -2445,6 +2595,12 @@ impl Unprotected<'_> {
                 table = %table,
                 direction = if *to { "to" } else { "from" },
                 "COPY on a protected table is not encrypted by the proxy"
+            ),
+            Self::CopyQuery { table } => tracing::warn!(
+                table,
+                direction = "to",
+                "COPY of a query over a protected table streams its rows as CopyData, which the \
+                 read path cannot decrypt or mask"
             ),
             Self::Unsupported { table, shape } => tracing::warn!(
                 table = %table,
@@ -2514,6 +2670,10 @@ impl Unprotected<'_> {
             Self::Copy { table, to } => format!(
                 "COPY {} protected table {table} bypasses the proxy's encryption",
                 if *to { "from" } else { "into" }
+            ),
+            Self::CopyQuery { table } => format!(
+                "COPY of a query reading protected table {table} returns its rows as CopyData, \
+                 which cannot be decrypted or masked; run the query as an ordinary SELECT instead"
             ),
             Self::Unsupported { table, shape } => {
                 format!("{shape} writing protected table {table} cannot be encrypted")
@@ -3579,6 +3739,69 @@ mod tests {
         // Genuinely unparseable SQL is still reported as such.
         let action = strict.on_frame(b'Q', &query_frame("this is not SQL at all")).unwrap();
         assert!(refusal(&action).contains("could not be parsed"), "{}", refusal(&action));
+    }
+
+    /// The query-source form of the same statement. `COPY (SELECT email FROM
+    /// users) TO STDOUT` is a `CopySource::Query`, so the classifier — which
+    /// looked at `CopySource::Table` only — never saw it, and its rows leave
+    /// as `CopyData` frames the read path relays verbatim. The table form was
+    /// refused under `reject` and this one was not, which is the strict
+    /// setting being escaped by rewriting the statement.
+    #[test]
+    fn a_query_source_copy_out_over_a_protected_table_is_a_site_in_both_modes() {
+        use tracing_subscriber::layer::SubscriberExt as _;
+
+        let statements = [
+            "COPY (SELECT email FROM users) TO STDOUT",
+            "COPY (SELECT * FROM users WHERE id = 1) TO STDOUT",
+            // The shapes a walk of the top-level FROM clause alone would miss.
+            "COPY (SELECT e FROM (SELECT email AS e FROM users) s) TO STDOUT",
+            "COPY (WITH c AS (SELECT email FROM users) SELECT * FROM c) TO STDOUT",
+            "COPY (SELECT id FROM other UNION ALL SELECT id FROM users) TO STDOUT",
+            "COPY (SELECT * FROM (other JOIN users ON other.id = users.id)) TO STDOUT",
+        ];
+
+        let mut strict = rewriter(strict_catalog(false));
+        for sql in statements {
+            let action = strict.on_frame(b'Q', &query_frame(sql)).unwrap();
+            assert!(
+                refusal(&action).contains("protected table users"),
+                "{sql}: {}",
+                refusal(&action)
+            );
+        }
+
+        // `COPY (TABLE users) TO STDOUT` is the one query source sqlparser
+        // 0.53 cannot parse (`parse_as_table` overruns the closing paren), so
+        // it lands on the unparseable-SQL site instead — refused all the same,
+        // which is what keeps the parser quirk from being a hole.
+        let action = strict.on_frame(b'Q', &query_frame("COPY (TABLE users) TO STDOUT")).unwrap();
+        assert!(refusal(&action).contains("could not be parsed"), "{}", refusal(&action));
+
+        // Under warn the same statements relay, each with one warning naming
+        // the table — and a query over nothing protected stays silent.
+        let _capture = crate::log_capture();
+        let captured = CapturedEvents::default();
+        let subscriber = tracing_subscriber::registry().with(captured.clone());
+        tracing::subscriber::with_default(subscriber, || {
+            let mut permissive = rewriter(catalog(false));
+            for sql in statements.iter().chain(&["COPY (SELECT id FROM other) TO STDOUT"]) {
+                assert!(
+                    matches!(
+                        permissive.on_frame(b'Q', &query_frame(sql)).unwrap(),
+                        FrameAction::Relay
+                    ),
+                    "{sql}"
+                );
+            }
+        });
+
+        let events = captured.0.lock().expect("captured events");
+        assert_eq!(events.len(), statements.len(), "one warning each: {events:?}");
+        for event in events.iter() {
+            assert!(event.contains("read path cannot decrypt or mask"), "{event}");
+            assert!(event.contains("users"), "{event}");
+        }
     }
 
     /// A refusal inside a transaction reports the aborted state, so the
@@ -4731,6 +4954,7 @@ mod tests {
     fn no_event_from_the_write_path_carries_a_plaintext_value() {
         use tracing_subscriber::layer::SubscriberExt as _;
 
+        let _capture = crate::log_capture();
         let captured = CapturedEvents::default();
         let subscriber = tracing_subscriber::registry().with(captured.clone());
         tracing::subscriber::with_default(subscriber, || {
