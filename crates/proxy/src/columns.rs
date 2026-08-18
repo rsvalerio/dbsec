@@ -139,11 +139,11 @@ mod tests {
         let ssn = columns[0].transform.as_ref().expect("encrypt column has a transform");
         let card = columns[1].transform.as_ref().expect("encrypt column has a transform");
 
-        let stored = ssn.seal(b"078-05-1120").unwrap();
+        let stored = ssn.seal(b"078-05-1120", None).unwrap();
         assert!(
-            matches!(card.open(&stored), Err(dbsec_core::Error::Decrypt)),
+            matches!(card.open(&stored, None), Err(dbsec_core::Error::Decrypt)),
             "an ssn value pasted into credit_card must not authenticate"
         );
-        assert_eq!(ssn.open(&stored).unwrap().unwrap(), b"078-05-1120");
+        assert_eq!(ssn.open(&stored, None).unwrap().unwrap(), b"078-05-1120");
     }
 }

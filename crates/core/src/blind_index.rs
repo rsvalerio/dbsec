@@ -51,7 +51,9 @@ mod tests {
     #[test]
     fn prepend_split_roundtrip() {
         let context = envelope::CellContext::new("public.users.email");
-        let ct = envelope::encrypt(&[7u8; 32], &[1u8; 16], &context, b"alice").unwrap();
+        let ct =
+            envelope::encrypt(&[7u8; 32], &[1u8; 16], &envelope::Binding::cell(&context), b"alice")
+                .unwrap();
         let index = compute(&INDEX_KEY, b"alice");
         let stored = prepend(&index, &ct);
         let (idx, env) = split(&stored).unwrap();

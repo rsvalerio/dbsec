@@ -566,7 +566,7 @@ impl QueryRewriter {
             let Some(Some(value)) = values.get_mut(*index) else { continue };
             let replacement = match action {
                 ParamAction::Seal(transform) => {
-                    encode_param(transform.seal(value)?, transform.wire(), binary)
+                    encode_param(transform.seal(value, None)?, transform.wire(), binary)
                 }
                 ParamAction::SearchIndex(transform) => {
                     let Some(token) = transform.search_index(value)? else {
@@ -1845,7 +1845,7 @@ impl QueryRewriter {
             self.unprotected(&Unprotected::UnsupportedValue { column, shape: expr_shape(expr) })?;
             return Ok(false);
         };
-        let sealed = transform.seal(&plaintext).map_err(Error::Wire)?;
+        let sealed = transform.seal(&plaintext, None).map_err(Error::Wire)?;
         *expr = match transform.wire() {
             WireForm::Bytea => bytea_literal(&sealed),
             // FPE digits and HMAC hex carry no backslash, so an ordinary
@@ -3528,7 +3528,7 @@ mod tests {
     /// opens it.
     fn open_hex_literal(sql: &str, searchable: bool) -> Vec<u8> {
         let stored = hex::decode(sealed_hex(sql).expect("hex literal")).unwrap();
-        transform(searchable).open(&stored).unwrap().expect("opens")
+        transform(searchable).open(&stored, None).unwrap().expect("opens")
     }
 
     /// The hex digits of the first sealed literal in a rewritten statement.
@@ -3696,7 +3696,7 @@ mod tests {
         assert_eq!(bound.params[0], Some(b"1".as_slice()));
         let sealed_hex = bound.params[1].unwrap();
         let stored = hex::decode(sealed_hex.strip_prefix(b"\\x").unwrap()).unwrap();
-        assert_eq!(transform(false).open(&stored).unwrap().unwrap(), b"carol@example.com");
+        assert_eq!(transform(false).open(&stored, None).unwrap().unwrap(), b"carol@example.com");
 
         // Binary-format params stay raw bytes.
         let bind = pgwire::encode_bind(
@@ -3715,7 +3715,7 @@ mod tests {
         };
         let bound = pgwire::parse_bind(&rewritten).unwrap();
         assert_eq!(
-            transform(false).open(bound.params[1].unwrap()).unwrap().unwrap(),
+            transform(false).open(bound.params[1].unwrap(), None).unwrap().unwrap(),
             b"dave@example.com"
         );
 
@@ -3768,11 +3768,11 @@ mod tests {
         let pseudonym = sql.split('\'').nth(1).expect("first literal");
         assert_eq!(pseudonym.len(), 12);
         assert_eq!(&pseudonym[3..4], "-");
-        assert_eq!(fpe.open(pseudonym.as_bytes()).unwrap().unwrap(), b"555-867-5309");
+        assert_eq!(fpe.open(pseudonym.as_bytes(), None).unwrap().unwrap(), b"555-867-5309");
         // Token literal is the 64-char hex HMAC.
         let token_literal = sql.split('\'').nth(3).expect("second literal");
         assert_eq!(token_literal.len(), 64);
-        assert_eq!(token_literal.as_bytes(), token.seal(b"abc").unwrap().as_slice());
+        assert_eq!(token_literal.as_bytes(), token.seal(b"abc", None).unwrap().as_slice());
 
         // Bound text-format param for an FPE column stays digit-shaped.
         let parse = pgwire::encode_parse(
@@ -3798,7 +3798,7 @@ mod tests {
         let bound = pgwire::parse_bind(&rewritten).unwrap();
         let sealed = bound.params[0].unwrap();
         assert!(!sealed.starts_with(b"\\x"));
-        assert_eq!(fpe.open(sealed).unwrap().unwrap(), b"555-867-5309");
+        assert_eq!(fpe.open(sealed, None).unwrap().unwrap(), b"555-867-5309");
         assert_eq!(bound.params[1], Some(b"7".as_slice()));
     }
 
@@ -4064,7 +4064,7 @@ mod tests {
         let bound = pgwire::parse_bind(&rewritten).unwrap();
         let stored = hex::decode(bound.params[0].unwrap().strip_prefix(b"\\x").unwrap()).unwrap();
         // A double seal would open to the inner ciphertext, not the plaintext.
-        assert_eq!(transform(false).open(&stored).unwrap().unwrap(), b"alice@example.com");
+        assert_eq!(transform(false).open(&stored, None).unwrap().unwrap(), b"alice@example.com");
 
         // The simple protocol seals each literal from the plaintext already.
         let mut simple = rewriter(catalog(false));
@@ -4075,7 +4075,7 @@ mod tests {
         .expect("rewritten");
         for literal in sql.split(SEALED_PREFIX).skip(1) {
             let stored = hex::decode(&literal[..literal.find('\'').unwrap()]).unwrap();
-            assert_eq!(transform(false).open(&stored).unwrap().unwrap(), b"bob@x.io");
+            assert_eq!(transform(false).open(&stored, None).unwrap().unwrap(), b"bob@x.io");
         }
     }
 
@@ -4791,7 +4791,7 @@ mod tests {
         for (index, expected) in [(1, b"a@b.io".as_slice()), (2, b"c@d.io".as_slice())] {
             let stored =
                 hex::decode(bound.params[index].unwrap().strip_prefix(b"\\x").unwrap()).unwrap();
-            assert_eq!(transform(false).open(&stored).unwrap().unwrap(), expected);
+            assert_eq!(transform(false).open(&stored, None).unwrap().unwrap(), expected);
         }
     }
 

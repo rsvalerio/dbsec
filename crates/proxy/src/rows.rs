@@ -681,7 +681,7 @@ impl RowDecryptor {
                     None => (Cow::Borrowed(&**value), false),
                 };
                 let opened = match &column.transform {
-                    Some(transform) => transform.open(&stored)?,
+                    Some(transform) => transform.open(&stored, None)?,
                     None => None,
                 };
                 // Mask what the client would otherwise see: the opened
@@ -749,7 +749,7 @@ fn hex_text_form(value: &[u8]) -> Vec<u8> {
 #[cfg(test)]
 pub mod tests {
     use super::*;
-    use dbsec_core::envelope::{self, CellContext, KeyId, KEY_ID_LEN};
+    use dbsec_core::envelope::{self, Binding, CellContext, KeyId, KEY_ID_LEN};
     use dbsec_core::keys::{Key, KeySource};
     use dbsec_core::{blind_index, Error as CoreError};
 
@@ -922,7 +922,9 @@ pub mod tests {
         let desc = row_description(&[(1234, 1), (1234, 2)]);
         assert!(decryptor.on_frame(b'T', &desc).unwrap().body().is_none());
 
-        let ct = envelope::encrypt(&KEY, &KEY_ID, &cell_context(), b"alice@example.com").unwrap();
+        let ct =
+            envelope::encrypt(&KEY, &KEY_ID, &Binding::cell(&cell_context()), b"alice@example.com")
+                .unwrap();
         let row = data_row(&[Some(b"42"), Some(&ct)]);
         let rewritten = decryptor.on_frame(b'D', &row).unwrap().body().unwrap();
         assert_eq!(
@@ -952,7 +954,8 @@ pub mod tests {
         let mut decryptor = ctx.decryptor(SessionPortals::new());
         decryptor.on_frame(b'T', &row_description(&[(1234, 1), (1234, 2)])).unwrap();
 
-        let ct = envelope::encrypt(&KEY, &KEY_ID, &cell_context(), b"alice").unwrap();
+        let ct =
+            envelope::encrypt(&KEY, &KEY_ID, &Binding::cell(&cell_context()), b"alice").unwrap();
         let index = blind_index::compute(&INDEX_KEY, b"alice");
         let stored = blind_index::prepend(&index, &ct);
         let row = data_row(&[Some(b"42"), Some(&stored)]);
@@ -966,7 +969,8 @@ pub mod tests {
         let mut decryptor = ctx.decryptor(SessionPortals::new());
         decryptor.on_frame(b'T', &row_description(&[(9999, 1)])).unwrap();
 
-        let ct = envelope::encrypt(&KEY, &KEY_ID, &cell_context(), b"secret").unwrap();
+        let ct =
+            envelope::encrypt(&KEY, &KEY_ID, &Binding::cell(&cell_context()), b"secret").unwrap();
         let row = data_row(&[Some(&ct)]);
         assert!(decryptor.on_frame(b'D', &row).unwrap().body().is_none());
     }
@@ -977,7 +981,9 @@ pub mod tests {
         let mut decryptor = ctx.decryptor(SessionPortals::new());
         decryptor.on_frame(b'T', &row_description(&[(1234, 2)])).unwrap();
 
-        let ct = envelope::encrypt(&KEY, &[9u8; KEY_ID_LEN], &cell_context(), b"secret").unwrap();
+        let ct =
+            envelope::encrypt(&KEY, &[9u8; KEY_ID_LEN], &Binding::cell(&cell_context()), b"secret")
+                .unwrap();
         let row = data_row(&[Some(&ct)]);
         assert!(decryptor.on_frame(b'D', &row).is_err());
     }
@@ -990,7 +996,9 @@ pub mod tests {
         decryptor.on_frame(b'T', &row_description(&[(1234, 1), (1234, 2)])).unwrap();
 
         // Decrypted value is masked before it reaches the client.
-        let ct = envelope::encrypt(&KEY, &KEY_ID, &cell_context(), b"4111111111111111").unwrap();
+        let ct =
+            envelope::encrypt(&KEY, &KEY_ID, &Binding::cell(&cell_context()), b"4111111111111111")
+                .unwrap();
         let row = data_row(&[Some(b"42"), Some(&ct)]);
         let rewritten = decryptor.on_frame(b'D', &row).unwrap().body().unwrap();
         assert_eq!(
@@ -1014,7 +1022,9 @@ pub mod tests {
         let mut decryptor = ctx.decryptor(SessionPortals::new());
         decryptor.on_frame(b'T', &row_description(&[(1234, 2)])).unwrap();
 
-        let ct = envelope::encrypt(&KEY, &KEY_ID, &cell_context(), b"4111111111111111").unwrap();
+        let ct =
+            envelope::encrypt(&KEY, &KEY_ID, &Binding::cell(&cell_context()), b"4111111111111111")
+                .unwrap();
         let row = data_row(&[Some(format!("\\x{}", hex::encode(&ct)).as_bytes())]);
         let rewritten = decryptor.on_frame(b'D', &row).unwrap().body().unwrap();
         assert_eq!(
@@ -1058,7 +1068,9 @@ pub mod tests {
 
         // Re-executing A out of the driver's cache sends no Describe at all.
         execute(&mut rewriter, b"a");
-        let ct = envelope::encrypt(&KEY, &KEY_ID, &cell_context(), b"alice@example.com").unwrap();
+        let ct =
+            envelope::encrypt(&KEY, &KEY_ID, &Binding::cell(&cell_context()), b"alice@example.com")
+                .unwrap();
         let rewritten = decryptor
             .on_frame(b'D', &data_row(&[Some(b"42"), Some(&ct)]))
             .unwrap()
@@ -1102,7 +1114,9 @@ pub mod tests {
 
         // Nothing is protected yet, so the column relays. That is the state
         // the window opens in, and where it used to stay.
-        let ct = envelope::encrypt(&KEY, &KEY_ID, &cell_context(), b"alice@example.com").unwrap();
+        let ct =
+            envelope::encrypt(&KEY, &KEY_ID, &Binding::cell(&cell_context()), b"alice@example.com")
+                .unwrap();
         execute(&mut rewriter, b"a");
         let row = data_row(&[Some(b"42"), Some(&ct)]);
         assert!(decryptor.on_frame(b'D', &row).unwrap().body().is_none());
@@ -1156,7 +1170,9 @@ pub mod tests {
         });
 
         execute(&mut rewriter, b"a");
-        let ct = envelope::encrypt(&KEY, &KEY_ID, &cell_context(), b"alice@example.com").unwrap();
+        let ct =
+            envelope::encrypt(&KEY, &KEY_ID, &Binding::cell(&cell_context()), b"alice@example.com")
+                .unwrap();
         let rewritten = decryptor
             .on_frame(b'D', &data_row(&[Some(b"42"), Some(&ct)]))
             .unwrap()
@@ -1191,7 +1207,9 @@ pub mod tests {
             )
             .unwrap();
         execute(&mut rewriter, b"a");
-        let ct = envelope::encrypt(&KEY, &KEY_ID, &cell_context(), b"alice@example.com").unwrap();
+        let ct =
+            envelope::encrypt(&KEY, &KEY_ID, &Binding::cell(&cell_context()), b"alice@example.com")
+                .unwrap();
         let row = data_row(&[Some(&ct)]);
         let error = refused(decryptor.on_frame(b'D', &row).unwrap());
         let text = String::from_utf8_lossy(&error);
@@ -1223,7 +1241,9 @@ pub mod tests {
             .unwrap();
         execute(&mut rewriter, b"a");
 
-        let ct = envelope::encrypt(&KEY, &KEY_ID, &cell_context(), b"alice@example.com").unwrap();
+        let ct =
+            envelope::encrypt(&KEY, &KEY_ID, &Binding::cell(&cell_context()), b"alice@example.com")
+                .unwrap();
         let row = data_row(&[Some(&ct)]);
         let action = decryptor.on_frame(b'D', &row).unwrap();
 
@@ -1365,7 +1385,8 @@ pub mod tests {
 
         // Before: nothing is protected at the new position.
         decryptor.on_frame(b'T', &row_description(&[(5678, 2)])).unwrap();
-        let ct = envelope::encrypt(&KEY, &KEY_ID, &cell_context(), b"alice").unwrap();
+        let ct =
+            envelope::encrypt(&KEY, &KEY_ID, &Binding::cell(&cell_context()), b"alice").unwrap();
         assert!(decryptor.on_frame(b'D', &data_row(&[Some(&ct)])).unwrap().body().is_none());
 
         // The refresher re-resolves the column to where it moved to.
@@ -1392,7 +1413,8 @@ pub mod tests {
         let mut decryptor = ctx.decryptor(SessionPortals::new());
         decryptor.on_frame(b'T', &row_description(&[(1234, 2)])).unwrap();
 
-        let mut ct = envelope::encrypt(&KEY, &KEY_ID, &cell_context(), b"secret").unwrap();
+        let mut ct =
+            envelope::encrypt(&KEY, &KEY_ID, &Binding::cell(&cell_context()), b"secret").unwrap();
         let last = ct.len() - 1;
         ct[last] ^= 0xff;
         let row = data_row(&[Some(&ct)]);
@@ -1452,7 +1474,8 @@ pub mod tests {
         assert!(decryptor.on_frame(b'D', &row).unwrap().body().is_none());
 
         let plaintext = vec![b'x'; 64 * 1024];
-        let ct = envelope::encrypt(&KEY, &KEY_ID, &cell_context(), &plaintext).unwrap();
+        let ct =
+            envelope::encrypt(&KEY, &KEY_ID, &Binding::cell(&cell_context()), &plaintext).unwrap();
         let row = data_row(&[Some(&ct)]);
         let rewritten = decryptor.on_frame(b'D', &row).unwrap().body().unwrap();
         assert_eq!(pgwire::parse_data_row(&rewritten).unwrap()[0], Some(plaintext.as_slice()));

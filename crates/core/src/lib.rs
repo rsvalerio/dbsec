@@ -20,6 +20,13 @@ pub enum Error {
     Malformed,
     #[error("decryption failed (wrong key or tampered data)")]
     Decrypt,
+    /// A row-bound envelope reached the opener without the row's declared key.
+    /// Distinct from [`Self::Decrypt`] on purpose: nothing is wrong with the
+    /// ciphertext, the caller simply cannot prove where it belongs, and the two
+    /// need different operator responses — this one means the query did not
+    /// carry the row key, not that a value was tampered with.
+    #[error("row-bound value needs its table's row key, which this result does not carry")]
+    RowKeyMissing,
     #[error("encryption failed")]
     Encrypt,
     /// The active DEK has spent its random-nonce invocation budget and the key

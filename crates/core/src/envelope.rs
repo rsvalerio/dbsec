@@ -107,12 +107,17 @@ use crate::keys::KeySource;
 use crate::sync::Unpoisoned as _;
 use crate::Error;
 
-/// The current envelope version: associated data is the key id *and* the cell
-/// context (see the module docs).
+/// Cell-bound envelopes: associated data is the key id *and* the cell context.
+/// Written for a column with no configured row key.
 pub const MAGIC: &[u8; 4] = b"DBS2";
 /// The pre-context envelope version: same header layout, key id alone as
 /// associated data. Read-only — nothing writes it any more.
 pub const MAGIC_V1: &[u8; 4] = b"DBS1";
+/// Row-bound envelopes: associated data is the key id, the cell context *and*
+/// the row's declared key, so a ciphertext moved to another row of the same
+/// column stops authenticating. Written only for a column whose table declares
+/// a `row_key`; see [`RowKey`].
+pub const MAGIC_V3: &[u8; 4] = b"DBS3";
 pub const KEY_ID_LEN: usize = 16;
 pub const NONCE_LEN: usize = 12;
 const HEADER_LEN: usize = MAGIC.len() + KEY_ID_LEN + NONCE_LEN;
@@ -147,6 +152,82 @@ impl CellContext {
         aad.extend_from_slice(self.0.as_bytes());
         aad
     }
+
+    /// The AAD for [`MAGIC_V3`] envelopes: key id, cell context, and the row's
+    /// declared key.
+    ///
+    /// Every variable-length field is length-prefixed, which the two-field
+    /// [`Self::aad`] did not need to be. A third field makes plain
+    /// concatenation forgeable: column `users.ssn` with row `42`, and column
+    /// `users.ssn4` with row `2`, produce identical bytes — so a value could be
+    /// moved between two cells whose names and keys straddle the seam
+    /// differently. The row key is very often attacker-chosen (it is their own
+    /// row's id), which turns that from a curiosity into a way to defeat
+    /// exactly the binding this version adds.
+    fn aad_with_row(&self, key_id: &[u8], row: &RowKey) -> Vec<u8> {
+        let column = self.0.as_bytes();
+        let key = row.as_bytes();
+        let mut aad = Vec::with_capacity(key_id.len() + 8 + column.len() + key.len());
+        aad.extend_from_slice(key_id);
+        aad.extend_from_slice(&(column.len() as u32).to_be_bytes());
+        aad.extend_from_slice(column);
+        aad.extend_from_slice(&(key.len() as u32).to_be_bytes());
+        aad.extend_from_slice(key);
+        aad
+    }
+}
+
+/// The canonical bytes of one row's declared key, as bound into a
+/// [`MAGIC_V3`] envelope.
+///
+/// *Canonical* is the whole difficulty. The same row key reaches the proxy as
+/// different bytes depending on the client: `id = 42` arrives as `b"42"` from a
+/// text-format client and as four big-endian bytes from a binary one, and both
+/// appear in this workspace's own e2e suite. Binding raw wire bytes would mean
+/// a row written through one driver could not be read through another, so the
+/// proxy canonicalises per type before constructing this (see the proxy's
+/// `rowkey` module) and this type is the proof that it did.
+///
+/// Not a secret: it is a primary key, and it is reconstructed on read from the
+/// row the value came back in rather than stored in the envelope. Storing it
+/// would defeat the point — an identifier carried inside the ciphertext travels
+/// with it and pins nothing.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RowKey(Vec<u8>);
+
+impl RowKey {
+    pub fn new(canonical: impl Into<Vec<u8>>) -> Self {
+        Self(canonical.into())
+    }
+
+    pub fn as_bytes(&self) -> &[u8] {
+        &self.0
+    }
+}
+
+/// Where a value lives: its column, and — when the table declares a row key —
+/// which row.
+///
+/// Carried as one argument rather than two so the version choice stays a single
+/// decision: `row: Some(_)` writes [`MAGIC_V3`], `None` writes [`MAGIC`]. A
+/// caller cannot accidentally supply a row key that the encryptor then ignores,
+/// or omit one the decryptor silently tolerates.
+#[derive(Debug, Clone, Copy)]
+pub struct Binding<'a> {
+    pub context: &'a CellContext,
+    pub row: Option<&'a RowKey>,
+}
+
+impl<'a> Binding<'a> {
+    /// A column with no configured row key: cell-bound only.
+    pub fn cell(context: &'a CellContext) -> Self {
+        Self { context, row: None }
+    }
+
+    /// A column whose table declares a row key.
+    pub fn row(context: &'a CellContext, row: &'a RowKey) -> Self {
+        Self { context, row: Some(row) }
+    }
 }
 
 /// How many values one DEK may encrypt under random 96-bit nonces.
@@ -162,7 +243,8 @@ pub const MAX_ENCRYPTIONS_PER_KEY: u64 = 1 << 32;
 
 /// Returns true if `data` carries a dbsec envelope magic — either version.
 pub fn is_enveloped(data: &[u8]) -> bool {
-    data.len() > HEADER_LEN && (data.starts_with(MAGIC) || data.starts_with(MAGIC_V1))
+    data.len() > HEADER_LEN
+        && (data.starts_with(MAGIC) || data.starts_with(MAGIC_V1) || data.starts_with(MAGIC_V3))
 }
 
 /// AES-256-GCM bound to one DEK: the key schedule is built once, and the
@@ -199,7 +281,7 @@ impl Cipher {
     pub fn encrypt(
         &self,
         key_id: &KeyId,
-        context: &CellContext,
+        binding: &Binding<'_>,
         plaintext: &[u8],
     ) -> Result<Vec<u8>, Error> {
         if self.used.fetch_add(1, Ordering::Relaxed) >= self.budget {
@@ -245,16 +327,19 @@ impl Cipher {
         // pgwire::MAX_MESSAGE_LEN (1 GiB) already precludes that — so this is a
         // violated internal invariant, not a wrong key or tampering, and must
         // not be reported as Error::Decrypt.
+        // The version is the binding's shape, not a separate flag, so a
+        // row-bound value can never be written under a cell-only AAD.
+        let (magic, aad) = match binding.row {
+            Some(row) => (MAGIC_V3, binding.context.aad_with_row(key_id, row)),
+            None => (MAGIC, binding.context.aad(key_id)),
+        };
         let ciphertext = self
             .gcm
-            .encrypt(
-                Nonce::from_slice(&nonce),
-                Payload { msg: plaintext, aad: &context.aad(key_id) },
-            )
+            .encrypt(Nonce::from_slice(&nonce), Payload { msg: plaintext, aad: &aad })
             .map_err(|_| Error::Encrypt)?;
 
         let mut out = Vec::with_capacity(HEADER_LEN + ciphertext.len());
-        out.extend_from_slice(MAGIC);
+        out.extend_from_slice(magic);
         out.extend_from_slice(key_id);
         out.extend_from_slice(&nonce);
         out.extend_from_slice(&ciphertext);
@@ -265,16 +350,27 @@ impl Cipher {
     /// key id is bound as AAD — and, for [`MAGIC`] envelopes, the context too —
     /// so a value written under a different id, or in a different column, fails
     /// authentication here rather than decrypting into the wrong cell.
-    pub fn decrypt(&self, context: &CellContext, data: &[u8]) -> Result<Vec<u8>, Error> {
+    pub fn decrypt(&self, binding: &Binding<'_>, data: &[u8]) -> Result<Vec<u8>, Error> {
         if !is_enveloped(data) {
             return Err(Error::Malformed);
         }
         let id = &data[MAGIC.len()..MAGIC.len() + KEY_ID_LEN];
         let nonce = &data[MAGIC.len() + KEY_ID_LEN..HEADER_LEN];
-        // A `DBS1` value predates the context binding, so its AAD is the key id
-        // alone. Nothing is downgraded by that: a `DBS2` tag was computed over
-        // the longer AAD, so rewriting its magic only makes it fail here.
-        let aad = if data.starts_with(MAGIC_V1) { id.to_vec() } else { context.aad(id) };
+        // The stored value decides which AAD verifies it, so an older value
+        // keeps opening after its table gains a row key. Rewriting a header to
+        // an earlier version downgrades nothing: each tag was computed over its
+        // own AAD, so relabelling only makes verification fail here.
+        //
+        // A `DBS3` value with no row key in hand is reported as such rather
+        // than as a decryption failure — it is a query that did not project the
+        // key, not a tampered value.
+        let aad = if data.starts_with(MAGIC_V1) {
+            id.to_vec()
+        } else if data.starts_with(MAGIC_V3) {
+            binding.context.aad_with_row(id, binding.row.ok_or(Error::RowKeyMissing)?)
+        } else {
+            binding.context.aad(id)
+        };
         self.gcm
             .decrypt(Nonce::from_slice(nonce), Payload { msg: &data[HEADER_LEN..], aad: &aad })
             .map_err(|_| Error::Decrypt)
@@ -318,12 +414,12 @@ impl Ciphers {
     /// that key's invocation budget is spent the key source is asked for a
     /// fresh one; if it offers the same key id, the write fails closed rather
     /// than reusing an exhausted key.
-    pub fn seal(&self, context: &CellContext, plaintext: &[u8]) -> Result<Vec<u8>, Error> {
+    pub fn seal(&self, binding: &Binding<'_>, plaintext: &[u8]) -> Result<Vec<u8>, Error> {
         let (key_id, cipher) = self.active()?;
-        match cipher.encrypt(&key_id, context, plaintext) {
+        match cipher.encrypt(&key_id, binding, plaintext) {
             Err(Error::KeyExhausted(_)) => {
                 let (key_id, cipher) = self.roll_active(&key_id)?;
-                cipher.encrypt(&key_id, context, plaintext)
+                cipher.encrypt(&key_id, binding, plaintext)
             }
             result => result,
         }
@@ -331,9 +427,9 @@ impl Ciphers {
 
     /// Opens an enveloped value read out of `context`'s column, under the DEK
     /// its header names.
-    pub fn open(&self, context: &CellContext, enveloped: &[u8]) -> Result<Vec<u8>, Error> {
+    pub fn open(&self, binding: &Binding<'_>, enveloped: &[u8]) -> Result<Vec<u8>, Error> {
         let id = key_id(enveloped)?;
-        self.for_id(&id)?.decrypt(context, enveloped)
+        self.for_id(&id)?.decrypt(binding, enveloped)
     }
 
     /// Both caches recover from a poisoned lock rather than panicking on it
@@ -387,10 +483,10 @@ impl Ciphers {
 pub fn encrypt(
     key: &[u8; 32],
     key_id: &KeyId,
-    context: &CellContext,
+    binding: &Binding<'_>,
     plaintext: &[u8],
 ) -> Result<Vec<u8>, Error> {
-    Cipher::new(key).encrypt(key_id, context, plaintext)
+    Cipher::new(key).encrypt(key_id, binding, plaintext)
 }
 
 /// Extracts the key id from an enveloped value so the caller can look up the key.
@@ -405,8 +501,8 @@ pub fn key_id(data: &[u8]) -> Result<KeyId, Error> {
 
 /// Decrypts one enveloped value from `context`'s column under `key`.
 /// [`Ciphers::open`] is the cached equivalent for values arriving in bulk.
-pub fn decrypt(key: &[u8; 32], context: &CellContext, data: &[u8]) -> Result<Vec<u8>, Error> {
-    Cipher::new(key).decrypt(context, data)
+pub fn decrypt(key: &[u8; 32], binding: &Binding<'_>, data: &[u8]) -> Result<Vec<u8>, Error> {
+    Cipher::new(key).decrypt(binding, data)
 }
 
 #[cfg(test)]
@@ -485,51 +581,113 @@ mod tests {
 
     #[test]
     fn roundtrip() {
-        let ct = encrypt(&KEY, &KEY_ID, &ssn(), b"secret").unwrap();
+        let ct = encrypt(&KEY, &KEY_ID, &Binding::cell(&ssn()), b"secret").unwrap();
         assert!(is_enveloped(&ct));
         assert!(ct.starts_with(MAGIC), "new writes carry the current version");
         assert_eq!(key_id(&ct).unwrap(), KEY_ID);
-        assert_eq!(decrypt(&KEY, &ssn(), &ct).unwrap(), b"secret");
+        assert_eq!(decrypt(&KEY, &Binding::cell(&ssn()), &ct).unwrap(), b"secret");
+    }
+
+    fn row(id: &str) -> RowKey {
+        RowKey::new(id.as_bytes())
+    }
+
+    /// The finding this version exists for: the same column, a different row.
+    #[test]
+    fn a_value_never_opens_in_another_row() {
+        let ct = encrypt(&KEY, &KEY_ID, &Binding::row(&ssn(), &row("42")), b"secret").unwrap();
+        assert!(ct.starts_with(MAGIC_V3), "a row-bound write carries DBS3");
+        assert_eq!(decrypt(&KEY, &Binding::row(&ssn(), &row("42")), &ct).unwrap(), b"secret");
+        assert!(
+            matches!(decrypt(&KEY, &Binding::row(&ssn(), &row("43")), &ct), Err(Error::Decrypt)),
+            "a ciphertext pasted into another row must not authenticate"
+        );
+    }
+
+    /// A row-bound value reaching the opener with no key is a query that did
+    /// not project it, not a tampered value, and the two want different
+    /// operator responses.
+    #[test]
+    fn a_row_bound_value_without_its_key_is_reported_as_such() {
+        let ct = encrypt(&KEY, &KEY_ID, &Binding::row(&ssn(), &row("42")), b"secret").unwrap();
+        assert!(matches!(decrypt(&KEY, &Binding::cell(&ssn()), &ct), Err(Error::RowKeyMissing)));
+    }
+
+    /// Length-prefixing the AAD's variable fields is load-bearing, not tidiness.
+    /// Concatenated, `column="a.b.c" + row="42"` and `column="a.b.c4" + row="2"`
+    /// are the same bytes — and the row key is usually the attacker's own row
+    /// id, so they could pick one that straddles the seam and move a value into
+    /// a cell it was never written for.
+    #[test]
+    fn the_aad_cannot_be_re_split_between_column_and_row() {
+        let short = CellContext::new("a.b.c");
+        let long = CellContext::new("a.b.c4");
+        let ct = encrypt(&KEY, &KEY_ID, &Binding::row(&short, &row("42")), b"secret").unwrap();
+        assert!(
+            matches!(decrypt(&KEY, &Binding::row(&long, &row("2")), &ct), Err(Error::Decrypt)),
+            "column and row must not be re-splittable across the seam"
+        );
+    }
+
+    /// Older values keep opening after a table gains a row key, and relabelling
+    /// a header to an earlier version downgrades nothing — each tag was
+    /// computed over its own AAD.
+    #[test]
+    fn versions_do_not_downgrade_into_each_other() {
+        let bound = encrypt(&KEY, &KEY_ID, &Binding::row(&ssn(), &row("42")), b"secret").unwrap();
+        let cell = encrypt(&KEY, &KEY_ID, &Binding::cell(&ssn()), b"secret").unwrap();
+        assert_eq!(decrypt(&KEY, &Binding::cell(&ssn()), &cell).unwrap(), b"secret");
+
+        let mut downgraded = bound.clone();
+        downgraded[..MAGIC.len()].copy_from_slice(MAGIC);
+        assert!(matches!(decrypt(&KEY, &Binding::cell(&ssn()), &downgraded), Err(Error::Decrypt)));
+
+        let mut upgraded = cell.clone();
+        upgraded[..MAGIC.len()].copy_from_slice(MAGIC_V3);
+        assert!(matches!(
+            decrypt(&KEY, &Binding::row(&ssn(), &row("42")), &upgraded),
+            Err(Error::Decrypt)
+        ));
     }
 
     #[test]
     fn tampering_is_detected() {
-        let mut ct = encrypt(&KEY, &KEY_ID, &ssn(), b"secret").unwrap();
+        let mut ct = encrypt(&KEY, &KEY_ID, &Binding::cell(&ssn()), b"secret").unwrap();
         let last = ct.len() - 1;
         ct[last] ^= 0xff;
-        assert!(matches!(decrypt(&KEY, &ssn(), &ct), Err(Error::Decrypt)));
+        assert!(matches!(decrypt(&KEY, &Binding::cell(&ssn()), &ct), Err(Error::Decrypt)));
     }
 
     #[test]
     fn wrong_key_fails() {
-        let ct = encrypt(&KEY, &KEY_ID, &ssn(), b"secret").unwrap();
-        assert!(matches!(decrypt(&[8u8; 32], &ssn(), &ct), Err(Error::Decrypt)));
+        let ct = encrypt(&KEY, &KEY_ID, &Binding::cell(&ssn()), b"secret").unwrap();
+        assert!(matches!(decrypt(&[8u8; 32], &Binding::cell(&ssn()), &ct), Err(Error::Decrypt)));
     }
 
     #[test]
     fn plaintext_passes_through_detection() {
         assert!(!is_enveloped(b"just a plain value"));
-        assert!(matches!(decrypt(&KEY, &ssn(), b"plain"), Err(Error::Malformed)));
+        assert!(matches!(decrypt(&KEY, &Binding::cell(&ssn()), b"plain"), Err(Error::Malformed)));
     }
 
     /// The relocation attack the context binding exists to stop: stored bytes
     /// copied into another column of the same row, under the very same DEK.
     #[test]
     fn a_ciphertext_moved_to_another_column_fails_authentication() {
-        let stored = encrypt(&KEY, &KEY_ID, &ssn(), b"078-05-1120").unwrap();
+        let stored = encrypt(&KEY, &KEY_ID, &Binding::cell(&ssn()), b"078-05-1120").unwrap();
 
         assert!(
-            matches!(decrypt(&KEY, &credit_card(), &stored), Err(Error::Decrypt)),
+            matches!(decrypt(&KEY, &Binding::cell(&credit_card()), &stored), Err(Error::Decrypt)),
             "the same key must not open an ssn blob pasted into credit_card"
         );
         assert!(
             matches!(
-                decrypt(&KEY, &CellContext::new("public.audit.ssn"), &stored),
+                decrypt(&KEY, &Binding::cell(&CellContext::new("public.audit.ssn")), &stored),
                 Err(Error::Decrypt)
             ),
             "nor the same column name in another table"
         );
-        assert_eq!(decrypt(&KEY, &ssn(), &stored).unwrap(), b"078-05-1120");
+        assert_eq!(decrypt(&KEY, &Binding::cell(&ssn()), &stored).unwrap(), b"078-05-1120");
     }
 
     /// Cross-column relocation is caught through the cached path too, not only
@@ -537,10 +695,13 @@ mod tests {
     #[test]
     fn ciphers_reject_a_value_opened_under_another_column() {
         let ciphers = Ciphers::new(Arc::new(OneKey));
-        let stored = ciphers.seal(&ssn(), b"078-05-1120").unwrap();
+        let stored = ciphers.seal(&Binding::cell(&ssn()), b"078-05-1120").unwrap();
 
-        assert!(matches!(ciphers.open(&credit_card(), &stored), Err(Error::Decrypt)));
-        assert_eq!(ciphers.open(&ssn(), &stored).unwrap(), b"078-05-1120");
+        assert!(matches!(
+            ciphers.open(&Binding::cell(&credit_card()), &stored),
+            Err(Error::Decrypt)
+        ));
+        assert_eq!(ciphers.open(&Binding::cell(&ssn()), &stored).unwrap(), b"078-05-1120");
     }
 
     /// Rows written before the context binding keep opening, so an upgrade
@@ -551,21 +712,24 @@ mod tests {
 
         assert!(is_enveloped(&legacy));
         assert_eq!(key_id(&legacy).unwrap(), KEY_ID);
-        assert_eq!(decrypt(&KEY, &ssn(), &legacy).unwrap(), b"secret");
+        assert_eq!(decrypt(&KEY, &Binding::cell(&ssn()), &legacy).unwrap(), b"secret");
         // Which is exactly the exposure re-encryption closes: the old format
         // binds no column, so it opens wherever the DEK reaches.
-        assert_eq!(decrypt(&KEY, &credit_card(), &legacy).unwrap(), b"secret");
+        assert_eq!(decrypt(&KEY, &Binding::cell(&credit_card()), &legacy).unwrap(), b"secret");
     }
 
     /// Relabelling a current envelope as the pre-context version does not strip
     /// its binding — the tag was computed over the longer associated data.
     #[test]
     fn downgrading_the_header_to_the_legacy_version_fails() {
-        let mut stored = encrypt(&KEY, &KEY_ID, &ssn(), b"secret").unwrap();
+        let mut stored = encrypt(&KEY, &KEY_ID, &Binding::cell(&ssn()), b"secret").unwrap();
         stored[..MAGIC.len()].copy_from_slice(MAGIC_V1);
 
-        assert!(matches!(decrypt(&KEY, &ssn(), &stored), Err(Error::Decrypt)));
-        assert!(matches!(decrypt(&KEY, &credit_card(), &stored), Err(Error::Decrypt)));
+        assert!(matches!(decrypt(&KEY, &Binding::cell(&ssn()), &stored), Err(Error::Decrypt)));
+        assert!(matches!(
+            decrypt(&KEY, &Binding::cell(&credit_card()), &stored),
+            Err(Error::Decrypt)
+        ));
     }
 
     /// The DEK bytes are `Zeroizing`, but `Aes256Gcm::new` expands them into a
@@ -586,8 +750,8 @@ mod tests {
         // And the schedule is inside the value that drops: rolling to a fresh
         // key replaces the whole `Cipher`, so nothing outlives the drop.
         let ciphers = Ciphers::with_budget(Arc::new(RollingKeys::default()), 1);
-        let first = key_id(&ciphers.seal(&ssn(), b"one").unwrap()).unwrap();
-        let second = key_id(&ciphers.seal(&ssn(), b"two").unwrap()).unwrap();
+        let first = key_id(&ciphers.seal(&Binding::cell(&ssn()), b"one").unwrap()).unwrap();
+        let second = key_id(&ciphers.seal(&Binding::cell(&ssn()), b"two").unwrap()).unwrap();
         assert_ne!(first, second, "the spent cipher was dropped, not reused");
     }
 
@@ -595,49 +759,61 @@ mod tests {
     fn invocation_budget_is_spent_exactly_once_per_encryption() {
         let cipher = Cipher::with_budget(&KEY, 2);
         assert_eq!(cipher.remaining(), 2);
-        let ct = cipher.encrypt(&KEY_ID, &ssn(), b"one").unwrap();
+        let ct = cipher.encrypt(&KEY_ID, &Binding::cell(&ssn()), b"one").unwrap();
         assert_eq!(cipher.remaining(), 1);
-        cipher.encrypt(&KEY_ID, &ssn(), b"two").unwrap();
+        cipher.encrypt(&KEY_ID, &Binding::cell(&ssn()), b"two").unwrap();
         assert_eq!(cipher.remaining(), 0);
 
         // At the boundary the key is retired rather than reused.
-        assert!(matches!(cipher.encrypt(&KEY_ID, &ssn(), b"three"), Err(Error::KeyExhausted(_))));
-        assert!(matches!(cipher.encrypt(&KEY_ID, &ssn(), b"four"), Err(Error::KeyExhausted(_))));
+        assert!(matches!(
+            cipher.encrypt(&KEY_ID, &Binding::cell(&ssn()), b"three"),
+            Err(Error::KeyExhausted(_))
+        ));
+        assert!(matches!(
+            cipher.encrypt(&KEY_ID, &Binding::cell(&ssn()), b"four"),
+            Err(Error::KeyExhausted(_))
+        ));
         // Reading is not rationed: only encryption draws nonces.
-        assert_eq!(cipher.decrypt(&ssn(), &ct).unwrap(), b"one");
+        assert_eq!(cipher.decrypt(&Binding::cell(&ssn()), &ct).unwrap(), b"one");
     }
 
     #[test]
     fn spent_budget_rolls_to_a_fresh_dek() {
         let ciphers = Ciphers::with_budget(Arc::new(RollingKeys::default()), 1);
-        let first = ciphers.seal(&ssn(), b"one").unwrap();
-        let second = ciphers.seal(&ssn(), b"two").unwrap();
+        let first = ciphers.seal(&Binding::cell(&ssn()), b"one").unwrap();
+        let second = ciphers.seal(&Binding::cell(&ssn()), b"two").unwrap();
         assert_ne!(key_id(&first).unwrap(), key_id(&second).unwrap());
-        assert_eq!(ciphers.open(&ssn(), &first).unwrap(), b"one");
-        assert_eq!(ciphers.open(&ssn(), &second).unwrap(), b"two");
+        assert_eq!(ciphers.open(&Binding::cell(&ssn()), &first).unwrap(), b"one");
+        assert_eq!(ciphers.open(&Binding::cell(&ssn()), &second).unwrap(), b"two");
     }
 
     #[test]
     fn spent_budget_fails_closed_when_the_key_source_cannot_roll() {
         let ciphers = Ciphers::with_budget(Arc::new(OneKey), 1);
-        ciphers.seal(&ssn(), b"one").unwrap();
-        assert!(matches!(ciphers.seal(&ssn(), b"two"), Err(Error::KeyExhausted(_))));
+        ciphers.seal(&Binding::cell(&ssn()), b"one").unwrap();
+        assert!(matches!(
+            ciphers.seal(&Binding::cell(&ssn()), b"two"),
+            Err(Error::KeyExhausted(_))
+        ));
     }
 
     #[test]
     fn ciphers_open_rejects_unknown_key_ids() {
         let ciphers = Ciphers::new(Arc::new(OneKey));
-        let foreign = encrypt(&KEY, &[9u8; KEY_ID_LEN], &ssn(), b"secret").unwrap();
-        assert!(matches!(ciphers.open(&ssn(), &foreign), Err(Error::UnknownKey(_))));
-        assert!(matches!(ciphers.open(&ssn(), b"plain"), Err(Error::Malformed)));
+        let foreign = encrypt(&KEY, &[9u8; KEY_ID_LEN], &Binding::cell(&ssn()), b"secret").unwrap();
+        assert!(matches!(
+            ciphers.open(&Binding::cell(&ssn()), &foreign),
+            Err(Error::UnknownKey(_))
+        ));
+        assert!(matches!(ciphers.open(&Binding::cell(&ssn()), b"plain"), Err(Error::Malformed)));
     }
 
     #[test]
     fn ciphers_reuse_one_instance_per_key_id() {
         let ciphers = Ciphers::new(Arc::new(OneKey));
-        let sealed = ciphers.seal(&ssn(), b"secret").unwrap();
-        assert_eq!(ciphers.open(&ssn(), &sealed).unwrap(), b"secret");
-        assert_eq!(ciphers.open(&ssn(), &sealed).unwrap(), b"secret");
+        let sealed = ciphers.seal(&Binding::cell(&ssn()), b"secret").unwrap();
+        assert_eq!(ciphers.open(&Binding::cell(&ssn()), &sealed).unwrap(), b"secret");
+        assert_eq!(ciphers.open(&Binding::cell(&ssn()), &sealed).unwrap(), b"secret");
         assert_eq!(ciphers.by_id.read().unpoisoned().len(), 1);
     }
 
@@ -649,9 +825,9 @@ mod tests {
     #[test]
     fn a_poisoned_cache_keeps_serving() {
         let ciphers = Arc::new(Ciphers::new(Arc::new(OneKey)));
-        let sealed = ciphers.seal(&ssn(), b"secret").unwrap();
+        let sealed = ciphers.seal(&Binding::cell(&ssn()), b"secret").unwrap();
         // Populates `by_id` too, so both locks are holding real state.
-        assert_eq!(ciphers.open(&ssn(), &sealed).unwrap(), b"secret");
+        assert_eq!(ciphers.open(&Binding::cell(&ssn()), &sealed).unwrap(), b"secret");
 
         let poisoner = Arc::clone(&ciphers);
         let panicked = std::thread::spawn(move || {
@@ -664,8 +840,8 @@ mod tests {
         assert!(ciphers.active.is_poisoned() && ciphers.by_id.is_poisoned());
 
         // Every path a live session takes still works.
-        assert_eq!(ciphers.open(&ssn(), &sealed).unwrap(), b"secret");
-        let again = ciphers.seal(&ssn(), b"another").unwrap();
-        assert_eq!(ciphers.open(&ssn(), &again).unwrap(), b"another");
+        assert_eq!(ciphers.open(&Binding::cell(&ssn()), &sealed).unwrap(), b"secret");
+        let again = ciphers.seal(&Binding::cell(&ssn()), b"another").unwrap();
+        assert_eq!(ciphers.open(&Binding::cell(&ssn()), &again).unwrap(), b"another");
     }
 }
