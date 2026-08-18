@@ -3,9 +3,10 @@ id: TASK-0144
 title: >-
   dbsec --help panics on a closed pipe, the exact usage its own comment
   advertises
-status: Triage
+status: Done
 assignee: []
 created_date: '2026-08-18 14:25'
+updated_date: '2026-08-18 21:11'
 labels:
   - code-review-rust
   - cli
@@ -42,6 +43,12 @@ the binary as a command and can pin it.
 
 ## Acceptance Criteria
 <!-- AC:BEGIN -->
-- [ ] #1 dbsec --help piped into a consumer that closes the pipe early exits without a panic
-- [ ] #2 A CLI test pins the closed-pipe exit status and asserts no panic text reaches stderr
+- [x] #1 dbsec --help piped into a consumer that closes the pipe early exits without a panic
+- [x] #2 A CLI test pins the closed-pipe exit status and asserts no panic text reaches stderr
 <!-- AC:END -->
+
+## Implementation Notes
+
+<!-- SECTION:NOTES:BEGIN -->
+Fixed on fix/task-0144-help-broken-pipe. print_help takes a writer and treats ErrorKind::BrokenPipe as success; any other write error is reported and exits non-zero. AC #2 is covered by two tests, deliberately: a CLI test drives a real `--help | head -1` through a shell, and a unit test pins the exit code against a writer that always returns BrokenPipe — the help text is far smaller than a pipe buffer, so a real pipe usually completes its write before the reader closes and never reaches the branch.
+<!-- SECTION:NOTES:END -->

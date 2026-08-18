@@ -17,7 +17,7 @@ mod vault;
 
 use std::ffi::OsString;
 use std::future::Future;
-use std::io::{ErrorKind, IsTerminal};
+use std::io::{self, ErrorKind, IsTerminal, Write};
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
@@ -151,7 +151,7 @@ pub enum Error {
     ConfigRead {
         path: PathBuf,
         #[source]
-        source: std::io::Error,
+        source: io::Error,
     },
     /// Deliberately carries a rendered `reason` rather than the `toml` error
     /// itself: that error's `Display` embeds the offending source line
@@ -169,7 +169,7 @@ pub enum Error {
     Hardening {
         what: &'static str,
         #[source]
-        source: std::io::Error,
+        source: io::Error,
     },
     #[error("connecting to upstream {addr}: timed out")]
     ConnectTimeout { addr: String },
@@ -196,7 +196,7 @@ pub enum Error {
     Listen {
         addr: String,
         #[source]
-        source: std::io::Error,
+        source: io::Error,
     },
     /// The `[vault] token_file` read. Shaped like [`Error::ConfigRead`] rather
     /// than flattened into a string: the file is config-adjacent, so the same
@@ -207,7 +207,7 @@ pub enum Error {
     VaultToken {
         path: PathBuf,
         #[source]
-        source: std::io::Error,
+        source: io::Error,
     },
     /// The control connection is the most failure-prone startup step, and the
     /// part an operator needs — "connection refused" vs "certificate verify
@@ -272,7 +272,7 @@ pub enum Error {
     #[error(transparent)]
     Wire(#[from] dbsec_core::Error),
     #[error(transparent)]
-    Io(#[from] std::io::Error),
+    Io(#[from] io::Error),
 }
 
 fn main() -> ExitCode {
@@ -284,8 +284,8 @@ fn main() -> ExitCode {
     // reasoning: escape sequences are for a terminal, not for the journal or
     // log file a redirected stderr usually is.
     tracing_subscriber::fmt()
-        .with_writer(std::io::stderr)
-        .with_ansi(std::io::stderr().is_terminal())
+        .with_writer(io::stderr)
+        .with_ansi(io::stderr().is_terminal())
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
                 .unwrap_or_else(|_| DEFAULT_LOG_FILTER.into()),
@@ -301,8 +301,7 @@ fn main() -> ExitCode {
             // operator actually does with it. Diagnostics from a *running*
             // proxy stay on stderr, unchanged — `tests/cli.rs` pins both
             // halves of that split (TEST-31).
-            println!("{USAGE}\n\n{OPTIONS}");
-            return ExitCode::SUCCESS;
+            return print_help(&mut io::stdout().lock());
         }
         Ok(Startup::Serve(config)) => config,
         Err(e) => {
@@ -395,6 +394,34 @@ impl Args {
 /// Everything that happens before the runtime exists: the command line, the
 /// process hardening that has to be in place before any key material is read,
 /// and the config itself.
+/// Writes the help text, treating a closed pipe as success.
+///
+/// Rust's std sets `SIGPIPE` to `SIG_IGN` before `main`, so a write to a pipe
+/// nobody is reading returns `EPIPE` instead of killing the process — and
+/// `println!` turns that into a panic. `dbsec --help | head -1` would therefore
+/// exit non-zero with `failed printing to stdout` on stderr, while plain
+/// `dbsec --help` exits 0.
+///
+/// That is worth handling rather than tolerating: a CLI that fails on `--help`
+/// is the first thing an operator tries and the first thing that looks broken,
+/// which is the whole reason the help path exists as its own outcome. A reader
+/// that closed the pipe early — `head`, a `less` the reader quit — has read
+/// what it wanted, so the help *succeeded*. Any other write error is real and
+/// is reported.
+///
+/// Taking a writer rather than reaching for `stdout` directly is what lets the
+/// broken-pipe branch be tested without a pipe.
+fn print_help(out: &mut impl Write) -> ExitCode {
+    match writeln!(out, "{USAGE}\n\n{OPTIONS}").and_then(|()| out.flush()) {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(error) if error.kind() == ErrorKind::BrokenPipe => ExitCode::SUCCESS,
+        Err(error) => {
+            eprintln!("dbsec: writing help: {error}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
 fn start(args: impl IntoIterator<Item = OsString>) -> Result<Startup, Error> {
     let args = Args::parse(args)?;
     // Answered before the hardening and the config: `--help` must work in a
@@ -623,11 +650,11 @@ async fn drain_sessions(sessions: &mut JoinSet<()>, deadline: Duration) -> (usiz
 /// can inject the transient `accept()` failures the kernel produces under
 /// descriptor pressure, which are otherwise unreachable from a test.
 trait Accept {
-    fn accept(&mut self) -> impl Future<Output = std::io::Result<(TcpStream, SocketAddr)>>;
+    fn accept(&mut self) -> impl Future<Output = io::Result<(TcpStream, SocketAddr)>>;
 }
 
 impl Accept for TcpListener {
-    async fn accept(&mut self) -> std::io::Result<(TcpStream, SocketAddr)> {
+    async fn accept(&mut self) -> io::Result<(TcpStream, SocketAddr)> {
         TcpListener::accept(self).await
     }
 }
@@ -646,13 +673,13 @@ impl Accept for TcpListener {
 /// exhaustion errnos has a stable `ErrorKind`, so the consecutive-failure
 /// ceiling in [`accept_loop`] is what catches a listener failing in a way
 /// this predicate cannot name.
-fn is_fatal_accept_error(e: &std::io::Error) -> bool {
+fn is_fatal_accept_error(e: &io::Error) -> bool {
     matches!(e.kind(), ErrorKind::InvalidInput | ErrorKind::Unsupported)
 }
 
 /// Accept errors that concern only the connection being accepted, so the next
 /// `accept()` is worth attempting immediately with no backoff.
-fn is_per_connection_accept_error(e: &std::io::Error) -> bool {
+fn is_per_connection_accept_error(e: &io::Error) -> bool {
     matches!(
         e.kind(),
         ErrorKind::ConnectionAborted
@@ -818,6 +845,44 @@ mod tests {
     /// spellings are recognised, and the answer is a `Startup::Help` rather
     /// than an `Error::Usage` — which is what keeps the exit code at 0 and the
     /// text out of a `tracing` ERROR record.
+    /// A reader that hangs up mid-help — `dbsec --help | head -1` — must not
+    /// turn a successful help into a panic and a non-zero exit. Deterministic
+    /// here in a way a real pipe is not: the help text is far smaller than a
+    /// pipe buffer, so a spawned `| head -1` usually completes its write before
+    /// the reader closes and never reaches the branch at all.
+    #[test]
+    fn a_closed_pipe_makes_help_succeed_rather_than_fail() {
+        /// Refuses every write the way a pipe with no reader does.
+        struct ClosedPipe;
+        impl Write for ClosedPipe {
+            fn write(&mut self, _: &[u8]) -> io::Result<usize> {
+                Err(io::Error::new(ErrorKind::BrokenPipe, "broken pipe"))
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+        assert_eq!(print_help(&mut ClosedPipe), ExitCode::SUCCESS);
+
+        /// Any other failure is real and must not be reported as success.
+        struct FullDisk;
+        impl Write for FullDisk {
+            fn write(&mut self, _: &[u8]) -> io::Result<usize> {
+                Err(io::Error::new(ErrorKind::StorageFull, "no space"))
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+        assert_eq!(print_help(&mut FullDisk), ExitCode::FAILURE);
+
+        // The ordinary path still writes the whole thing.
+        let mut out = Vec::new();
+        assert_eq!(print_help(&mut out), ExitCode::SUCCESS);
+        let text = String::from_utf8(out).unwrap();
+        assert!(text.contains("usage: dbsec") && text.contains(PLAIN_RELAY_FLAG), "{text}");
+    }
+
     #[test]
     fn help_is_a_startup_outcome_rather_than_a_usage_error() {
         for flag in HELP_FLAGS {
@@ -921,11 +986,11 @@ mod tests {
     /// when the process is out of descriptors, then behaves normally.
     struct FlakyListener {
         inner: TcpListener,
-        fail_once: Option<std::io::Error>,
+        fail_once: Option<io::Error>,
     }
 
     impl Accept for FlakyListener {
-        async fn accept(&mut self) -> std::io::Result<(TcpStream, SocketAddr)> {
+        async fn accept(&mut self) -> io::Result<(TcpStream, SocketAddr)> {
             match self.fail_once.take() {
                 Some(e) => Err(e),
                 None => self.inner.accept().await,
@@ -967,8 +1032,7 @@ mod tests {
         let addr = inner.local_addr().unwrap();
         // EMFILE: the process is out of descriptors. Transient and about this
         // connection only — the listener is still bound.
-        let listener =
-            FlakyListener { inner, fail_once: Some(std::io::Error::from_raw_os_error(24)) };
+        let listener = FlakyListener { inner, fail_once: Some(io::Error::from_raw_os_error(24)) };
         let mut sessions = JoinSet::new();
 
         let client = async {
@@ -987,8 +1051,8 @@ mod tests {
     async fn accept_loop_gives_up_when_the_listener_is_invalid() {
         struct DeadListener;
         impl Accept for DeadListener {
-            async fn accept(&mut self) -> std::io::Result<(TcpStream, SocketAddr)> {
-                Err(std::io::Error::from(ErrorKind::InvalidInput))
+            async fn accept(&mut self) -> io::Result<(TcpStream, SocketAddr)> {
+                Err(io::Error::from(ErrorKind::InvalidInput))
             }
         }
 
@@ -1002,16 +1066,16 @@ mod tests {
 
     #[tokio::test]
     async fn accept_error_classification_matches_the_documented_split() {
-        let emfile = std::io::Error::from_raw_os_error(24);
+        let emfile = io::Error::from_raw_os_error(24);
         assert!(!is_fatal_accept_error(&emfile), "descriptor exhaustion is not fatal");
         assert!(!is_per_connection_accept_error(&emfile), "descriptor exhaustion backs off");
 
-        let aborted = std::io::Error::from(ErrorKind::ConnectionAborted);
+        let aborted = io::Error::from(ErrorKind::ConnectionAborted);
         assert!(!is_fatal_accept_error(&aborted));
         assert!(is_per_connection_accept_error(&aborted), "retry immediately");
 
-        assert!(is_fatal_accept_error(&std::io::Error::from(ErrorKind::InvalidInput)));
-        assert!(is_fatal_accept_error(&std::io::Error::from(ErrorKind::Unsupported)));
+        assert!(is_fatal_accept_error(&io::Error::from(ErrorKind::InvalidInput)));
+        assert!(is_fatal_accept_error(&io::Error::from(ErrorKind::Unsupported)));
     }
 
     #[tokio::test]
@@ -1062,7 +1126,7 @@ mod tests {
     fn a_key_backend_failure_is_the_one_session_error_logged_at_error() {
         let revoked = Error::Wire(dbsec_core::Error::KeyBackend {
             context: "reading index key public.users.email".to_owned(),
-            source: Box::new(std::io::Error::from(ErrorKind::PermissionDenied)),
+            source: Box::new(io::Error::from(ErrorKind::PermissionDenied)),
         });
         assert!(is_key_backend_failure(&revoked));
         assert!(is_key_backend_failure(&Error::Wire(dbsec_core::Error::KeySource(
@@ -1074,7 +1138,7 @@ mod tests {
             "stored data written under a lost DEK is not an operator-actionable backend fault"
         );
         assert!(!is_key_backend_failure(&Error::UndescribedRow));
-        assert!(!is_key_backend_failure(&Error::Io(std::io::Error::from(ErrorKind::BrokenPipe))));
+        assert!(!is_key_backend_failure(&Error::Io(io::Error::from(ErrorKind::BrokenPipe))));
     }
 
     /// TASK-0138: `KeyBackend`'s `Display` is `key source: {context}` and says
@@ -1087,7 +1151,7 @@ mod tests {
     fn a_key_backend_failure_reports_the_cause_the_vault_target_is_silenced_for() {
         let revoked = Error::Wire(dbsec_core::Error::KeyBackend {
             context: "reading index key public.users.email".to_owned(),
-            source: Box::new(std::io::Error::from(ErrorKind::PermissionDenied)),
+            source: Box::new(io::Error::from(ErrorKind::PermissionDenied)),
         });
         let top = revoked.to_string();
         assert!(!top.contains("permission denied"), "precondition: Display drops it: {top}");
