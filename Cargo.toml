@@ -27,8 +27,36 @@ sqlparser = "0.53"
 # original key is recoverable — is left intact in freed heap when a DEK rolls
 # and its `Cipher` drops, while the `Zeroizing` key bytes it was derived from
 # are wiped. Cargo unifies features per package, so enabling it here covers
-# every `Aes256` in the graph. `envelope::tests::the_aes_key_schedule_is_wiped_on_drop`
-# fails if it is ever dropped.
+# every `Aes256` in the graph.
+# `envelope::tests::the_aes_key_schedule_is_wiped_when_a_cipher_drops` fails if
+# it is ever dropped.
+#
+# The round-key schedule is not the only key-derived state inside
+# `Aes256Gcm`: it also holds `ghash: GHash`, built from the authentication
+# subkey `H = E_K(0^128)`, and that copy is *not* wiped when a `Cipher` drops.
+# `ghash` and `polyval` are deliberately NOT added here to close it, because
+# adding them would not close it. Checked against ghash 0.5.1 / polyval 0.6.2,
+# the versions aes-gcm 0.10 resolves:
+#
+#   * `ghash`'s `zeroize` feature wipes two *construction-time locals* in
+#     `GHash::new_with_init_block` (`h`, `h_polyval`) and nothing else. It does
+#     not forward to `polyval` — `ghash`'s only feature forwarding is
+#     `std = ["polyval/std"]`.
+#   * `polyval`'s `zeroize` feature adds `impl Drop` to its `soft` and `clmul`
+#     backends. On x86/x86_64 and aarch64 — every target dbsec ships on —
+#     `polyval::Polyval` is `backend::autodetect::Polyval`, which holds its
+#     backend in a `union Inner` of `ManuallyDrop`. A union never runs drop
+#     glue on its fields and `autodetect::Polyval` has no `Drop` of its own, so
+#     those backend destructors are unreachable. The `pmull` (aarch64) backend
+#     does not even have one — it is a TODO in the upstream source.
+#
+# So the trade is not "two unused direct dependencies for a wipe"; it is two
+# unused direct dependencies, version-coupled to whatever aes-gcm 0.10 pins,
+# for no wipe at all on the platforms that matter. The only builds it would
+# reach are `--cfg polyval_force_soft` ones, which give up hardware GHASH on
+# the data path to wipe 16 bytes. Revisit if upstream gives
+# `autodetect::Polyval` a `Drop`; until then `H` is accepted as surviving in
+# freed heap, and the module docs in `crates/core/src/envelope.rs` say so.
 aes = { version = "0.8", features = ["zeroize"] }
 aes-gcm = "0.10"
 hmac = "0.12"

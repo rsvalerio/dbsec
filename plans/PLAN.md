@@ -35,8 +35,9 @@ id; binding only that would authenticate a blob anywhere the key reaches, lettin
 who can write stored bytes paste one column's ciphertext into another and have it decrypt
 cleanly. Binding the column means a relocated value fails authentication instead. The
 binding is per column, not per cell — moving a value between two rows of the *same* column
-is still undetected, because neither data path knows a row's identity (the read path
-matches result columns by `(table oid, attnum)` and never sees a primary key).
+is still undetected. Closing that needs the row's primary key on both data paths, which
+costs a format bump and deployment rules the proxy cannot impose on its own; "Why the row
+half is not bound" works through it.
 
 `"DBS1"` is the pre-context version: same header, key id alone as associated data. See
 "Upgrading DBS1 rows to the bound envelope" below.
@@ -187,10 +188,9 @@ TLS: `MaybeTls` stream enum both hops. Downstream handles `SSLRequest` from clie
   the configured `[[column]]` names, so the two sides of a name comparison cannot drift.
 - **Ciphertext relocation is detected across columns, not across rows.** The envelope AAD
   binds `schema.table.column`, so pasting a stored value into a different column or table
-  fails authentication; pasting it into the *same* column of another row does not. Binding
-  a row identity would need a primary key on both paths, and the read path has none — it
-  matches result columns by `(table oid, attnum)` and never sees the key. Rows written
-  before the binding (`DBS1`) have neither guarantee until they are re-encrypted.
+  fails authentication; pasting it into the *same* column of another row does not. Rows
+  written before the binding (`DBS1`) have neither guarantee until they are re-encrypted.
+  See "Why the row half is not bound" for what closing it would actually cost.
 - **Authentication is relayed, not terminated, so `SCRAM-SHA-256-PLUS` cannot work and
   GSSAPI encryption is always refused.** The proxy never speaks the auth exchange itself:
   it forwards the SASL frames verbatim between two independent TLS sessions. Channel
@@ -366,6 +366,84 @@ named the same way, so a rename also means the blind index / FPE / token key for
 column is looked up under a new name — copy the old key's material into the new name's
 secret first, or the column is re-indexed under a freshly minted key and every stored
 token stops matching.
+
+### Why the row half is not bound
+
+The envelope binds `schema.table.column`, so cross-column and cross-table relocation
+fail authentication. Cross-*row* relocation within one column does not, and this section
+records why — it is a design decision above the envelope, not a missing line of code, and
+the shape of the fix is expensive enough that it should be chosen deliberately.
+
+Start from what relocation detection needs. The verifier has to know, **independently of
+the copied bytes**, where those bytes are supposed to be. Any identifier that travels with
+the ciphertext — a salt in the header, a token in a sibling column — is copied along with
+it, so it proves nothing. The identity must therefore be something the *application*
+already treats as the row's name: the primary key. That is not a limitation of this
+codebase; it is why a key works at all. An attacker who rewrites the primary key has not
+relocated a value, they have renamed the row.
+
+So the identity is the primary key, and it must reach both paths. Neither path has it, for
+different and more specific reasons than "the proxy does not track rows":
+
+**Write path.** The seal happens in two places, and both are missing a different half.
+For an inline literal, `rewrite_insert_values` holds the whole `Insert` node — the full
+column list and every `VALUES` row — so a sibling `id` expression is in scope. For a bound
+parameter, `QueryRewriter::bind` holds the entire parameter array, so a sibling `$3` is in
+scope as bytes. What does not survive Parse→Bind is the *mapping*: the only state carried
+across is `Vec<(usize, ParamAction)>`, index → what to do, with no column or table on it.
+Threading a "the row key is at index N" entry through is mechanical. The blockers are
+semantic:
+
+- **Server-generated keys.** `INSERT INTO users (ssn) VALUES ($1)` with `id serial` has no
+  row key anywhere in the statement — the value the proxy would need does not exist until
+  after the statement it is rewriting has run. This is the ordinary case, not an edge one.
+- **Multi-row `UPDATE`.** `UPDATE users SET ssn = $1 WHERE dept = 'x'` must produce a
+  *different* ciphertext per target row, and a Bind parameter is one byte string. No
+  rewrite of that statement can satisfy row binding; it can only be refused.
+- **`ON CONFLICT DO UPDATE`.** The conflicting row's key need not be the key the `INSERT`
+  proposed, and the proxy cannot know which branch ran.
+
+**Read path.** This half is closer than the earlier note claimed. `Described::fields`
+already holds `(table_oid, attnum)` for *every* field of a described statement, in order,
+and `decrypt_row` already has every field's bytes in hand — so if the client projected the
+row key, the proxy can find it. Two things still block using it:
+
+- **The value is untyped and format-ambiguous.** `parse_row_description` discards the type
+  OID and the format code (twelve bytes it deliberately skips), and the result format is a
+  per-query client choice. `id = 42` arrives as `b"42"` from a text-format client and as
+  four big-endian bytes from a binary-format one. Binding raw wire bytes means a row
+  written through psycopg cannot be read through sqlx. Binding the *logical* value means
+  retaining `atttypid` and the format codes and canonicalising per type — a
+  PostgreSQL-type-decoding surface the proxy does not have anywhere today, and the one
+  thing the read path has consistently avoided (`decode_wire` sniffs a `\x` prefix rather
+  than consulting a type).
+- **The key is usually not projected.** `SELECT ssn FROM users WHERE id = $1` is the normal
+  shape and does not return `id`. Under row binding that query cannot be answered at all —
+  the proxy would have to fail it. Injecting the key into the target list and stripping it
+  before relay would mean parsing and rewriting `SELECT`s, which this path exists to avoid:
+  it matches on catalog OIDs precisely so that `SELECT *`, CTEs, unions and cached prepared
+  statements without a fresh `RowDescription` need no SQL understanding.
+
+That leaves one viable design, and its cost is in deployment rules rather than code:
+
+> **Declared row key.** A per-table `row_key` in config, resolved to its `attnum` by the
+> same catalog query that resolves protected columns, bound into a new `DBS3` AAD as
+> `key_id || schema.table.column || canonical(row_key)`. `DBS2` stays readable, so the
+> migration is the same re-encryption sweep as the `DBS1` upgrade. In exchange the
+> deployment must accept: client-generated keys only (no `serial`/`identity`/`DEFAULT`) on
+> protected tables; single-row `UPDATE ... WHERE row_key = ?` only; and every query reading
+> a protected column must project that table's row key. Plus the proxy takes on type-aware
+> decoding of the key column.
+
+The alternative that keeps application queries untouched — a proxy-maintained side table
+of per-cell MACs keyed by `(table, row key, column)` — needs the same row key on the same
+two paths, so it inherits every blocker above and adds transactional consistency with the
+user's own writes on top. It is strictly worse and is not on the table.
+
+Until that decision is made, the exposure stands and is stated plainly in the caveats: an
+attacker who can write stored bytes can move a high-privilege row's `users.ssn` into their
+own row and read it back. Cross-column and cross-table relocation are detected;
+cross-row within one column is not.
 
 ### Retiring the shared-map layout
 

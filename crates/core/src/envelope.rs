@@ -20,10 +20,22 @@
 //! authenticate only where it was written.
 //!
 //! The binding is per *column*, not per *cell*: relocating a value between two
-//! rows of the same column still authenticates, because neither data path here
-//! knows a row's identity (the read path matches result columns by
-//! `(table oid, attnum)` and never sees a primary key). Cross-column and
-//! cross-table relocation are detected; cross-row within one column is not.
+//! rows of the same column still authenticates. Cross-column and cross-table
+//! relocation are detected; cross-row within one column is not.
+//!
+//! That gap is a deliberate open decision, not an oversight, and it cannot be
+//! closed here. Detecting relocation requires the opener to know where the
+//! bytes belong *independently of the bytes themselves*, so any identifier
+//! carried inside the envelope is copied along with it and proves nothing —
+//! the identity has to be the row's primary key, supplied from outside. Making
+//! that key reach both data paths costs a `DBS3` format bump plus deployment
+//! rules the proxy cannot impose on its own: client-generated keys on
+//! protected tables (a `serial` key does not exist yet when the write path
+//! rewrites the statement), single-row `UPDATE`s (one bound parameter cannot
+//! become a different ciphertext per target row), and every read projecting
+//! its table's key in a type the proxy can canonicalise. `plans/PLAN.md`,
+//! "Why the row half is not bound", carries the full analysis and the one
+//! viable design.
 //!
 //! The context is the configured `schema.table.column` string, so **renaming a
 //! protected column or table makes every value already stored under the old
@@ -60,6 +72,28 @@
 //! pre-forking supervisor**. See the comment on the nonce draw in
 //! [`Cipher::encrypt`] for what that would cost and what supporting it would
 //! take.
+//!
+//! # What a dropped `Cipher` leaves behind
+//!
+//! The DEK bytes are `Zeroizing` and the expanded AES round-key schedule inside
+//! `Aes256Gcm` is wiped on drop (the workspace enables `aes/zeroize`, and
+//! `the_aes_key_schedule_is_wiped_when_a_cipher_drops` below fails if that is
+//! ever dropped). One piece of key-derived state is **not** wiped: the GHASH
+//! authentication subkey `H = E_K(0^128)`, which `Aes256Gcm` keeps as a
+//! `ghash::GHash` for the life of the cipher. When a spent DEK rolls, `H` is
+//! freed intact.
+//!
+//! That is accepted, not overlooked. `H` decrypts nothing, but an attacker who
+//! recovered it from a heap disclosure (core dump, swap, cold boot) could
+//! forge tags for ciphertexts under that DEK, since the `E_K(J0)` term cancels
+//! between two messages sharing a nonce. The reason it stands is that the
+//! obvious fix does not work: enabling `zeroize` on `ghash`/`polyval` leaves
+//! the persistent copy of `H` untouched on x86 and aarch64, because
+//! `polyval`'s autodetect backend stores it in a `union` of `ManuallyDrop`
+//! whose destructors never run. The workspace `Cargo.toml` carries the full
+//! reasoning next to the `aes` entry, and says what would have to change
+//! upstream. The proxy's process hardening (`RLIMIT_CORE = 0`,
+//! `PR_SET_DUMPABLE = 0`) is what actually narrows this exposure today.
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
