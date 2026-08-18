@@ -3,11 +3,11 @@ id: TASK-0129
 title: >-
   MAX_PROTECTED_VALUE_LEN is a compile-time constant, so a deployment with
   larger protected values has no recourse
-status: To Do
+status: Done
 assignee:
   - TASK-0143
 created_date: '2026-08-17 20:23'
-updated_date: '2026-08-18 10:00'
+updated_date: '2026-08-18 14:28'
 labels:
   - code-review-rust
   - api
@@ -48,7 +48,22 @@ one, and the wave kept the change to a constant.
 
 ## Acceptance Criteria
 <!-- AC:BEGIN -->
-- [ ] #1 The per-value read-path ceiling is settable from the config file, defaulting to the current 16 MiB
-- [ ] #2 The value is validated at load time and rejected if zero or above the frame limit
-- [ ] #3 A test asserts the configured ceiling is what decrypt_row enforces
+- [x] #1 The per-value read-path ceiling is settable from the config file, defaulting to the current 16 MiB
+- [x] #2 The value is validated at load time and rejected if zero or above the frame limit
+- [x] #3 A test asserts the configured ceiling is what decrypt_row enforces
 <!-- AC:END -->
+
+## Implementation Notes
+
+<!-- SECTION:NOTES:BEGIN -->
+Fixed on code-review/TASK-0143.
+
+`rows::MAX_PROTECTED_VALUE_LEN` is now `rows::DEFAULT_MAX_PROTECTED_VALUE_LEN`
+and is only the default for the new `max_protected_value_bytes` config key.
+`Config::validate` refuses 0 and anything above `pgwire::MAX_MESSAGE_LEN`; the
+value is carried on `RowContext` beside `on_unprotected` and reaches
+`decrypt_row` through a `Bounds { max_value, max_body }` struct, so the two size
+bounds the row rewriter enforces travel as one policy rather than as two bare
+`usize` parameters (FN-3). Logged at startup with the other admission knobs and
+documented in README's "Operating the proxy" section.
+<!-- SECTION:NOTES:END -->

@@ -1,11 +1,11 @@
 ---
 id: TASK-0143
 title: code-review-plan-wave26
-status: To Do
+status: Done
 assignee:
   - code-review-wave
 created_date: '2026-08-18 09:59'
-updated_date: '2026-08-18 09:59'
+updated_date: '2026-08-18 14:31'
 labels:
   - code-review-wave
 dependencies:
@@ -28,4 +28,6 @@ Bounds on untrusted input: pre-auth limits and configurability
 
 <!-- SECTION:NOTES:BEGIN -->
 Overlaps: TASK-0140 wave23 (crates/proxy/src/session.rs); TASK-0141 wave24 (crates/proxy/src/rows.rs)
+
+Branch: code-review/TASK-0143
 <!-- SECTION:NOTES:END -->

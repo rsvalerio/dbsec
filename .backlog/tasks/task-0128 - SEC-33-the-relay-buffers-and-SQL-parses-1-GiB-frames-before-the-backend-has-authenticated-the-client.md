@@ -3,11 +3,11 @@ id: TASK-0128
 title: >-
   SEC-33: the relay buffers and SQL-parses 1 GiB frames before the backend has
   authenticated the client
-status: To Do
+status: Done
 assignee:
   - TASK-0143
 created_date: '2026-08-17 20:23'
-updated_date: '2026-08-18 10:00'
+updated_date: '2026-08-18 14:28'
 labels:
   - code-review-rust
   - security
@@ -54,7 +54,31 @@ necessarily solve".
 
 ## Acceptance Criteria
 <!-- AC:BEGIN -->
-- [ ] #1 Frames arriving from the client before AuthenticationOk has been relayed are bounded well below MAX_MESSAGE_LEN
-- [ ] #2 A legitimate authenticated session still relays frames up to the 1 GiB Postgres parity limit
-- [ ] #3 A test drives an oversized pre-authentication frame and asserts it is refused
+- [x] #1 Frames arriving from the client before AuthenticationOk has been relayed are bounded well below MAX_MESSAGE_LEN
+- [x] #2 A legitimate authenticated session still relays frames up to the 1 GiB Postgres parity limit
+- [x] #3 A test drives an oversized pre-authentication frame and asserts it is refused
 <!-- AC:END -->
+
+## Implementation Notes
+
+<!-- SECTION:NOTES:BEGIN -->
+Fixed on code-review/TASK-0143.
+
+`pgwire::MAX_PRE_AUTH_MESSAGE_LEN` (= `MAX_STARTUP_MESSAGE_LEN`, 16 KiB) bounds
+the client->upstream direction until the backend answers AuthenticationOk.
+`session::Direction` carries a `BodyLimit` per direction; `BodyLimit::max_body`
+is re-asked per frame and checked before `body.resize`, so the allocation the
+finding is about never happens. `note_authentication` sets the flag from the
+upstream->client transform when it sees `'R'` with request code 0, *before* the
+frame is forwarded — which is what orders the flag against the client's next
+frame without any synchronisation of its own. upstream->client stays
+`BodyLimit::Full`: TASK-0009's 1 GiB Postgres parity is unchanged for the
+backend and for the authenticated client (AC #2, covered by
+`authentication_restores_the_full_frame_limit`).
+
+Not done, deliberately: the "possibly also skip the SQL rewriter until then"
+half of the fix shape. With the body capped at 16 KiB the parse cost is bounded
+by the same factor as the allocation (65536x), and gating the rewriter would
+mean relaying an unrewritten statement in the one window where the backend is
+going to refuse it anyway — added state for no remaining exposure.
+<!-- SECTION:NOTES:END -->
