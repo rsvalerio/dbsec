@@ -34,13 +34,19 @@ fn vault_token() -> String {
 /// A `[vault]` section pointing at the live server. Each run gets its own KV
 /// path so a rerun starts from an empty key store — the point is watching the
 /// keys being minted and then reused.
+///
+/// `allow_insecure_addr` is set because the fixture's OpenBao is a `-dev`
+/// server on plaintext `http`, which the config otherwise refuses: the Vault
+/// channel carries the token and every DEK in plaintext, so accepting it is a
+/// choice a config has to state out loud. Naming it here is exactly that
+/// statement, scoped to the fixture.
 fn vault_section() -> String {
     let addr = vault_addr();
     let token = vault_token();
     let path = format!("dbsec-e2e/{}", std::process::id());
     format!(
         "[vault]\naddr = \"{addr}\"\ntoken = \"{token}\"\npath = \"{path}\"\n\
-         transit_key = \"dbsec\"\n"
+         transit_key = \"dbsec\"\nallow_insecure_addr = true\n"
     )
 }
 

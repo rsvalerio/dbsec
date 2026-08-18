@@ -503,8 +503,13 @@ fn default_true() -> bool {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct VaultConfig {
-    /// e.g. `https://bao.internal:8200`.
+    /// e.g. `https://bao.internal:8200`. Validated as a URL with an `https`
+    /// scheme by [`VaultConfig::validate_addr`].
     pub addr: String,
+    /// Accepts a plaintext `http://` [`Self::addr`]. Development only — see
+    /// [`VaultConfig::validate_addr`] for what travels over that channel.
+    #[serde(default)]
+    pub allow_insecure_addr: bool,
     /// Static token; prefer `token_file` outside of dev.
     pub token: Option<Secret>,
     /// File containing the token (e.g. written by an agent sidecar).
@@ -530,6 +535,55 @@ pub struct VaultConfig {
 }
 
 impl VaultConfig {
+    /// Parses [`Self::addr`] and refuses anything that is not a TLS Vault
+    /// endpoint.
+    ///
+    /// Two properties are established here, both at startup rather than on the
+    /// connect path:
+    ///
+    /// - **It is a URL.** `vaultrs`' `VaultClientSettingsBuilder::address` is
+    ///   documented "# Panics" and parses with `Url::parse(..).unwrap()`, so a
+    ///   typo in `addr` would otherwise abort the process from inside
+    ///   `VaultKeySource::connect` instead of joining every neighbouring
+    ///   misconfiguration as a clean startup error (ERR-11).
+    /// - **Its scheme is `https`.** This is the channel that carries the Vault
+    ///   token, every DEK in plaintext and every deterministic index key. The
+    ///   proxy hard-refuses a plaintext peer on both pgwire hops once TLS is
+    ///   configured, so tolerating a fully plaintext KMS hop — the one whose
+    ///   compromise yields the entire key hierarchy — would be the weakest
+    ///   link deciding the whole (SEC-31). A `http://` dev address stays
+    ///   reachable, but only by writing `allow_insecure_addr = true`, which is
+    ///   a deliberate act rather than a config copied out of an example.
+    ///
+    /// `addr` is echoed in the refusals: unlike `control_dsn` it is an
+    /// endpoint, and the credential beside it lives in `token`/`token_file`.
+    fn validate_addr(&self) -> Result<(), Error> {
+        let addr = url::Url::parse(&self.addr).map_err(|e| {
+            Error::InvalidConfig(format!("[vault] addr {:?} is not a URL: {e}", self.addr))
+        })?;
+        match addr.scheme() {
+            "https" => Ok(()),
+            "http" if self.allow_insecure_addr => {
+                tracing::warn!(
+                    addr = self.addr,
+                    "[vault] allow_insecure_addr is set: the Vault token, every DEK plaintext \
+                     and every deterministic index key cross the network in the clear"
+                );
+                Ok(())
+            }
+            "http" => Err(Error::InvalidConfig(format!(
+                "[vault] addr {:?} is plaintext http, which would put the Vault token, every \
+                 DEK plaintext and every deterministic index key on the wire in the clear. Use \
+                 https, or set allow_insecure_addr = true to accept that in development",
+                self.addr
+            ))),
+            other => Err(Error::InvalidConfig(format!(
+                "[vault] addr {:?} has scheme {other:?}; Vault is reached over https",
+                self.addr
+            ))),
+        }
+    }
+
     /// Resolves the token from whichever of the two sources is configured.
     ///
     /// Called once, by [`Config::validate`], and the result is carried in the
@@ -773,6 +827,7 @@ impl Config {
                         "[vault] timeout_secs must be greater than 0".into(),
                     ));
                 }
+                vault.validate_addr()?;
                 Some(VaultSetup { config: vault.clone(), token: vault.resolve_token()? })
             }
         };
@@ -799,6 +854,9 @@ impl Config {
             let control_dsn = self.control_dsn.clone().ok_or_else(|| {
                 Error::InvalidConfig("[[column]] entries require control_dsn".into())
             })?;
+            if self.tls.upstream.is_some() {
+                check_control_dsn_is_not_downgradeable(&control_dsn)?;
+            }
             Some(ProtectedConfig { keys, control_dsn })
         };
         let mut seen = std::collections::HashSet::new();
@@ -826,6 +884,53 @@ impl Config {
         }
         Ok(protected)
     }
+}
+
+/// Refuses a `control_dsn` that would accept a plaintext session while
+/// `[tls.upstream]` is configured.
+///
+/// The data hop sends SSLRequest itself and hard-fails on anything but `S`
+/// ([`crate::session`]), so it cannot be downgraded. The control hop hands the
+/// DSN to `tokio_postgres`, whose default `sslmode` is `prefer`: a server —
+/// or an active MITM stripping the TLS offer — that answers `N` gets a
+/// plaintext session instead, with no error. That session carries the control
+/// user's password and performs the catalog resolution that decides which
+/// columns are protected, so it is the *more* sensitive of the two hops, and
+/// leaving it downgradeable while the data hop is not enforces neither half of
+/// the invariant (SEC-31).
+///
+/// Refused rather than rewritten: the DSN arrives in either of the two shapes
+/// `tokio_postgres` accepts, and editing a connection string carrying a
+/// password is a worse trade than telling the operator exactly what to add.
+///
+/// Only the two modes that permit a plaintext fallback are rejected, so a
+/// future `tokio_postgres` mode at least as strict as `require` is accepted
+/// rather than refused by a stale allow-list (the enum is `#[non_exhaustive]`).
+fn check_control_dsn_is_not_downgradeable(dsn: &Dsn) -> Result<(), Error> {
+    use tokio_postgres::config::SslMode;
+
+    // The parse error is not echoed: it quotes the offending part of the
+    // connection string, which is where the password lives (SEC-21).
+    let parsed = dsn.as_str().parse::<tokio_postgres::Config>().map_err(|_| {
+        Error::InvalidConfig(
+            "control_dsn is not a PostgreSQL connection string in either the URL or the \
+             keyword/value form"
+                .into(),
+        )
+    })?;
+    // Named with the `sslmode=` spelling the operator would have written, so
+    // the refusal quotes their own config back at them.
+    let downgradeable = match parsed.get_ssl_mode() {
+        SslMode::Disable => "disable",
+        SslMode::Prefer => "prefer",
+        _ => return Ok(()),
+    };
+    Err(Error::InvalidConfig(format!(
+        "[tls.upstream] is configured but control_dsn has sslmode={downgradeable} — that lets \
+         the control connection fall back to plaintext when the server, or a MITM stripping the \
+         TLS offer, answers N to its SSLRequest, and that connection carries the control user's \
+         password and resolves which columns are protected. Add sslmode=require to control_dsn"
+    )))
 }
 
 #[cfg(test)]
@@ -922,7 +1027,7 @@ mod tests {
     #[test]
     fn vault_section_parses_and_is_exclusive_with_keys_file() {
         let cfg: Config = toml::from_str(
-            "control_dsn = \"d\"\n\n[vault]\naddr = \"http://127.0.0.1:8200\"\ntoken = \"root\"\n\n[[column]]\ntable = \"users\"\ncolumn = \"email\"\n",
+            "control_dsn = \"d\"\n\n[vault]\naddr = \"https://bao.internal:8200\"\ntoken = \"root\"\n\n[[column]]\ntable = \"users\"\ncolumn = \"email\"\n",
         )
         .unwrap();
         cfg.validate().unwrap();
@@ -934,7 +1039,7 @@ mod tests {
         assert_eq!(vault.timeout_secs, 5, "every Vault call is bounded by default");
 
         let zero_timeout: Config = toml::from_str(
-            "control_dsn = \"d\"\n\n[vault]\naddr = \"a\"\ntoken = \"t\"\ntimeout_secs = 0\n\n[[column]]\ntable = \"users\"\ncolumn = \"email\"\n",
+            "control_dsn = \"d\"\n\n[vault]\naddr = \"https://bao.internal:8200\"\ntoken = \"t\"\ntimeout_secs = 0\n\n[[column]]\ntable = \"users\"\ncolumn = \"email\"\n",
         )
         .unwrap();
         assert!(
@@ -943,13 +1048,128 @@ mod tests {
         );
 
         let both: Config = toml::from_str(
-            "keys_file = \"k\"\ncontrol_dsn = \"d\"\n\n[vault]\naddr = \"a\"\ntoken = \"t\"\n\n[[column]]\ntable = \"users\"\ncolumn = \"email\"\n",
+            "keys_file = \"k\"\ncontrol_dsn = \"d\"\n\n[vault]\naddr = \"https://bao.internal:8200\"\ntoken = \"t\"\n\n[[column]]\ntable = \"users\"\ncolumn = \"email\"\n",
         )
         .unwrap();
         assert!(matches!(both.validate(), Err(Error::InvalidConfig(_))));
 
-        let no_token: Config = toml::from_str("[vault]\naddr = \"a\"\n").unwrap();
+        let no_token: Config =
+            toml::from_str("[vault]\naddr = \"https://bao.internal:8200\"\n").unwrap();
         assert!(matches!(no_token.validate(), Err(Error::InvalidConfig(_))));
+    }
+
+    /// A `[vault]` section with `addr` set to `value`, and no column — the
+    /// section is validated whether or not anything uses it.
+    fn vault_addr_config(value: &str) -> Config {
+        toml::from_str(&format!("[vault]\naddr = {value:?}\ntoken = \"t\"\n"))
+            .expect("test config parses")
+    }
+
+    /// The KMS hop carries the Vault token, every DEK plaintext and every
+    /// deterministic index key. A config copied out of a dev example must not
+    /// put that on the wire in the clear just because nobody edited one line.
+    #[test]
+    fn a_plaintext_vault_addr_is_refused_unless_it_is_opted_into() {
+        let plaintext = vault_addr_config("http://127.0.0.1:8200");
+        let Err(err) = plaintext.validate() else {
+            panic!("a plaintext Vault address must not pass validation");
+        };
+        assert!(matches!(err, Error::InvalidConfig(_)), "got {err}");
+        assert!(
+            err.to_string().contains("allow_insecure_addr"),
+            "the refusal names the opt-in that would accept it: {err}"
+        );
+
+        let opted_in: Config = toml::from_str(
+            "[vault]\naddr = \"http://127.0.0.1:8200\"\ntoken = \"t\"\nallow_insecure_addr = true\n",
+        )
+        .expect("test config parses");
+        opted_in.validate().expect("an explicit dev opt-in is honoured");
+
+        vault_addr_config("https://bao.internal:8200").validate().expect("https is the norm");
+    }
+
+    /// `vaultrs`' address setter is documented "# Panics" and unwraps a
+    /// `Url::parse`, so a typo that reaches it aborts the process from inside
+    /// the async connect path instead of failing at startup like every
+    /// neighbouring misconfiguration.
+    #[test]
+    fn a_malformed_vault_addr_is_a_startup_error() {
+        for addr in ["a", "https://[", "", "bao.internal:8200"] {
+            let Err(err) = vault_addr_config(addr).validate() else {
+                panic!("{addr:?} is not a Vault address and must not validate");
+            };
+            assert!(matches!(err, Error::InvalidConfig(_)), "{addr:?} gave {err}");
+        }
+
+        let Err(err) = vault_addr_config("file:///etc/passwd").validate() else {
+            panic!("only http(s) reaches a Vault server");
+        };
+        assert!(err.to_string().contains("https"), "the refusal names what is expected: {err}");
+    }
+
+    /// The data hop sends its own SSLRequest and hard-fails on anything but
+    /// `S`; the control hop lets the DSN decide, and `tokio_postgres` defaults
+    /// to `sslmode=prefer`. Leaving the more sensitive of the two hops
+    /// downgradeable while the other is not enforces neither half.
+    #[test]
+    fn a_downgradeable_control_dsn_is_refused_once_upstream_tls_is_configured() {
+        let config = |dsn: &str, tls: &str| -> Config {
+            toml::from_str(&format!(
+                "control_dsn = {dsn:?}\nkeys_file = \"k\"\n{tls}\n\
+                 [[column]]\ntable = \"users\"\ncolumn = \"email\"\n"
+            ))
+            .expect("test config parses")
+        };
+        let upstream_tls = "[tls.upstream]\nca = \"ca.pem\"\n\n";
+
+        for dsn in [
+            // `prefer`, by omission and by name.
+            "postgres://dbsec:hunter2@db.internal:5433/app",
+            "postgres://dbsec:hunter2@db.internal:5433/app?sslmode=prefer",
+            "host=db.internal password=hunter2 sslmode=disable",
+        ] {
+            let Err(err) = config(dsn, upstream_tls).validate() else {
+                panic!("{dsn} accepts a plaintext control session and must be refused");
+            };
+            assert!(matches!(err, Error::InvalidConfig(_)), "got {err}");
+            assert!(
+                err.to_string().contains("sslmode=require"),
+                "the refusal names the fix: {err}"
+            );
+            assert!(!err.to_string().contains("hunter2"), "the password must not surface: {err}");
+        }
+
+        config("postgres://dbsec@db.internal:5433/app?sslmode=require", upstream_tls)
+            .validate()
+            .expect("sslmode=require cannot fall back to plaintext");
+        config("host=db.internal password=hunter2 sslmode=require", upstream_tls)
+            .validate()
+            .expect("the keyword/value form is checked the same way as the URL form");
+
+        // Without `[tls.upstream]` the operator has asked for no TLS on the
+        // data hop either; the control hop is not held to a bar the rest of
+        // the deployment does not meet.
+        config("postgres://dbsec@db.internal:5433/app", "")
+            .validate()
+            .expect("plaintext upstream leaves the control hop alone");
+    }
+
+    /// A `control_dsn` that `tokio_postgres` cannot parse never connects
+    /// either, so it is a config error — and the diagnosis must not quote the
+    /// part of the string the password lives in.
+    #[test]
+    fn an_unparseable_control_dsn_is_refused_without_being_echoed() {
+        let cfg: Config = toml::from_str(
+            "control_dsn = \"host=db.internal password='unterminated\"\nkeys_file = \"k\"\n\n\
+             [tls.upstream]\nca = \"ca.pem\"\n\n\
+             [[column]]\ntable = \"users\"\ncolumn = \"email\"\n",
+        )
+        .expect("test config parses");
+
+        let Err(err) = cfg.validate() else { panic!("an unparseable control_dsn must be refused") };
+        assert!(matches!(err, Error::InvalidConfig(_)), "got {err}");
+        assert!(!err.to_string().contains("unterminated"), "the DSN must not be echoed: {err}");
     }
 
     /// The whole reason `Config` may be `Debug`-formatted at all.
@@ -1051,8 +1271,10 @@ mod tests {
         // The same rule for the Vault token file, which is the credential that
         // unwraps everything the keyfile would have held.
         let token = write_mode(dir.path(), "token", "s3cr3t\n", 0o640);
-        let cfg: Config =
-            toml::from_str(&format!("[vault]\naddr = \"a\"\ntoken_file = {token:?}\n")).unwrap();
+        let cfg: Config = toml::from_str(&format!(
+            "[vault]\naddr = \"https://bao.internal:8200\"\ntoken_file = {token:?}\n"
+        ))
+        .unwrap();
         assert!(matches!(cfg.validate(), Err(Error::InvalidConfig(_))));
     }
 
@@ -1095,7 +1317,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let token = write_mode(dir.path(), "token", "  s3cr3t\n", 0o600);
         let cfg: Config = toml::from_str(&format!(
-            "control_dsn = \"postgres://x\"\n\n[vault]\naddr = \"a\"\ntoken_file = {token:?}\n\n\
+            "control_dsn = \"postgres://x\"\n\n[vault]\naddr = \"https://bao.internal:8200\"\ntoken_file = {token:?}\n\n\
              [[column]]\ntable = \"users\"\ncolumn = \"email\"\n"
         ))
         .unwrap();
@@ -1212,7 +1434,7 @@ mod tests {
         let token_file = write_mode(dir.path(), "token", "s3cr3t\n", 0o600);
         let text = format!(
             "listen = \"127.0.0.1:6432\"\ncontrol_dsn = \"postgres://dbsec@db.internal/app\"\n\n\
-             [vault]\naddr = \"a\"\ntoken_file = {token_file:?}\n"
+             [vault]\naddr = \"https://bao.internal:8200\"\ntoken_file = {token_file:?}\n"
         );
 
         let world_readable = write_mode(dir.path(), "public.toml", &text, 0o644);

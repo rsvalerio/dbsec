@@ -304,6 +304,65 @@ mod tests {
         accepting.abort();
     }
 
+    /// The same trust configuration the control hop gets from
+    /// `[tls.upstream]`, minus the roots: the endpoint under test never
+    /// presents a certificate, so an empty store cannot be what fails the
+    /// connection.
+    fn upstream_tls() -> TlsContext {
+        crate::tls::install_crypto_provider().expect("the crypto provider installs");
+        let client = rustls::ClientConfig::builder()
+            .with_root_certificates(rustls::RootCertStore::empty())
+            .with_no_client_auth();
+        TlsContext { acceptor: None, connector: None, upstream_client: Some(Arc::new(client)) }
+    }
+
+    /// An endpoint answering `N` to the SSLRequest is either a server with no
+    /// TLS or a MITM stripping the offer. `tokio_postgres` would take that as
+    /// permission to continue in plaintext under its default `sslmode=prefer`
+    /// — which is why `Config::validate` refuses a `control_dsn` weaker than
+    /// `require` once `[tls.upstream]` is set. This is the other half of that
+    /// check: with `require`, the strip attempt ends the connection instead of
+    /// downgrading it.
+    #[tokio::test]
+    async fn a_control_endpoint_that_strips_tls_gets_no_plaintext_session() {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let stripping = tokio::spawn(async move {
+            // Sockets are held rather than dropped, so a client that decides
+            // to carry on in plaintext gets a live connection to carry on
+            // over — the downgrade has to fail on its own merits.
+            let mut held = Vec::new();
+            while let Ok((mut socket, _)) = listener.accept().await {
+                // SSLRequest is a fixed 8-byte message; `N` is "no TLS here".
+                let mut request = [0_u8; 8];
+                if socket.read_exact(&mut request).await.is_ok() {
+                    let _ = socket.write_all(b"N").await;
+                }
+                held.push(socket);
+            }
+        });
+
+        let dsn = Dsn::new(format!(
+            "postgres://dbsec:hunter2@127.0.0.1:{}/app?sslmode=require",
+            addr.port()
+        ));
+        let deadline = Duration::from_secs(5);
+        let started = std::time::Instant::now();
+        let Err(err) = connect(&dsn, &upstream_tls(), deadline).await else {
+            panic!("a stripped TLS offer must not produce a control connection");
+        };
+
+        assert!(
+            matches!(err, Error::Control(_)),
+            "the strip must fail the connect, not time out: {err}"
+        );
+        assert!(!err.to_string().contains("hunter2"), "the DSN password must not reach the error");
+        assert!(started.elapsed() < deadline, "the refusal is immediate, not a timeout");
+        stripping.abort();
+    }
+
     /// One `[[column]]` per read-path shape the filter has to tell apart.
     fn protected() -> Vec<ProtectedColumn> {
         let config: Config = toml::from_str(
