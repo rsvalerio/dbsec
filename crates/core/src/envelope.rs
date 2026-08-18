@@ -19,23 +19,27 @@
 //! tamper signal. Binding the column into the AAD makes the ciphertext
 //! authenticate only where it was written.
 //!
-//! The binding is per *column*, not per *cell*: relocating a value between two
-//! rows of the same column still authenticates. Cross-column and cross-table
-//! relocation are detected; cross-row within one column is not.
+//! Cross-column and cross-table relocation are detected by that alone. Moving
+//! a value between two rows of the *same* column needs the row's identity as
+//! well, which a table opts into by declaring a `row_key`: its values then seal
+//! as [`MAGIC_V3`], whose AAD carries the row key too.
 //!
-//! That gap is a deliberate open decision, not an oversight, and it cannot be
-//! closed here. Detecting relocation requires the opener to know where the
-//! bytes belong *independently of the bytes themselves*, so any identifier
-//! carried inside the envelope is copied along with it and proves nothing —
-//! the identity has to be the row's primary key, supplied from outside. Making
-//! that key reach both data paths costs a `DBS3` format bump plus deployment
-//! rules the proxy cannot impose on its own: client-generated keys on
-//! protected tables (a `serial` key does not exist yet when the write path
-//! rewrites the statement), single-row `UPDATE`s (one bound parameter cannot
-//! become a different ciphertext per target row), and every read projecting
-//! its table's key in a type the proxy can canonicalise. `plans/PLAN.md`,
-//! "Why the row half is not bound", carries the full analysis and the one
-//! viable design.
+//! The identity has to be a key the application already treats as the row's
+//! name, supplied from outside. Detecting relocation requires the opener to
+//! know where the bytes belong *independently of the bytes themselves*, so any
+//! identifier carried inside the envelope would be copied along with it and
+//! prove nothing. That is why the row key qualifies and a proxy-minted token
+//! does not — an attacker who rewrites the primary key has renamed the row, not
+//! relocated a value.
+//!
+//! It is opt-in because it constrains the deployment, not just the format:
+//! client-generated keys on protected tables (a `serial` key does not exist yet
+//! when the write path rewrites the statement), single-row `UPDATE`s (one bound
+//! parameter cannot become a different ciphertext per target row), and every
+//! read projecting its table's key in a type the proxy can canonicalise. Only
+//! authenticated encryption can bind a row at all: FPE and tokenization store
+//! identical bytes for a plaintext in every row by design. `plans/PLAN.md`,
+//! "Binding a value to its row", carries the whole picture.
 //!
 //! The context is the configured `schema.table.column` string, so **renaming a
 //! protected column or table makes every value already stored under the old

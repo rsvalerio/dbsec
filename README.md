@@ -60,6 +60,41 @@ literals differently from the proxy's parser, so the change is an
 through `options=-c standard_conforming_strings=off` — is watched the same way
 and reported on the session's first statement.
 
+**`row_key`** — by default a stored value is bound to its *column*, so pasting
+one column's ciphertext into another fails to decrypt. Binding it to its *row*
+as well is opt-in per table:
+
+```toml
+[[table]]
+table   = "users"
+row_key = "id"      # unique per row: a primary key, or a unique column
+```
+
+With that, a value copied from one row's `users.ssn` into another row's
+`users.ssn` no longer decrypts. It is opt-in because it constrains the SQL the
+table can take, and each constraint is a refusal rather than a silent
+degradation:
+
+- **Client-generated keys only.** `INSERT` must carry `id` in its column list.
+  A `serial` key does not exist yet when the proxy rewrites the statement, so
+  there is nothing to seal the value against.
+- **Single-row updates.** `UPDATE users SET ssn = $1 WHERE id = $2` is fine;
+  `WHERE dept = 'x'` is refused. One bound parameter cannot become a different
+  ciphertext for every matching row.
+- **Reads must project the key.** `SELECT ssn FROM users WHERE id = $1` does not
+  return `id`, so it cannot be verified; select `id` too.
+
+The key column must be a type the proxy can canonicalise — integer, text or
+uuid — and must not itself be protected. Both are refused at startup, naming the
+column. Only `transform = "encrypt"` binds a row: `fpe` and `token` store the
+same bytes for a plaintext in every row by design, which is what makes them
+searchable, so a `row_key` on a table with no encrypt column is refused rather
+than left looking like coverage.
+
+Adopting it needs no migration. Values written before the change keep opening —
+the stored value decides which binding verifies it — so re-encrypt only when you
+want the row binding to be retroactive.
+
 **Identifier names** — a `[[column]]` name is the name the catalog holds. SQL
 identifiers are folded the way PostgreSQL folds them before they are compared
 against it: unquoted names are downcased ASCII-only (a multibyte character is

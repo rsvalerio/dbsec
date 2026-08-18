@@ -1,11 +1,11 @@
 ---
 id: TASK-0141
 title: code-review-plan-wave24
-status: In Progress
+status: Done
 assignee:
   - code-review-wave
 created_date: '2026-08-18 09:59'
-updated_date: '2026-08-18 10:28'
+updated_date: '2026-08-18 19:52'
 labels:
   - code-review-wave
 dependencies:
@@ -66,4 +66,6 @@ had not moved, so the rebase was a no-op and no conflicts arose.
 
 The worktree ../.wave-TASK-0141 and branch code-review/TASK-0141 are left in place per the
 parked-wave rule; both are clean and fully merged into main.
+
+Closed once TASK-0127 was implemented on feat/task-0127-row-binding. The wave correctly parked rather than forcing a format change it could not complete; the design it wrote up (declared row key + DBS3) is what shipped.
 <!-- SECTION:NOTES:END -->

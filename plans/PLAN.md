@@ -33,11 +33,10 @@ The GCM associated data is `key_id || schema.table.column`, not the key id alone
 encrypted column in a process seals under the same active DEK and so stamps the same key
 id; binding only that would authenticate a blob anywhere the key reaches, letting anyone
 who can write stored bytes paste one column's ciphertext into another and have it decrypt
-cleanly. Binding the column means a relocated value fails authentication instead. The
-binding is per column, not per cell — moving a value between two rows of the *same* column
-is still undetected. Closing that needs the row's primary key on both data paths, which
-costs a format bump and deployment rules the proxy cannot impose on its own; "Why the row
-half is not bound" works through it.
+cleanly. Binding the column means a relocated value fails authentication instead. A table that
+declares a `row_key` goes further, sealing as `DBS3` with the row's key in the associated
+data so a value moved between two rows of the same column also fails; see "Binding a value
+to its row" for what that costs a deployment.
 
 `"DBS1"` is the pre-context version: same header, key id alone as associated data. See
 "Upgrading DBS1 rows to the bound envelope" below.
@@ -189,11 +188,13 @@ TLS: `MaybeTls` stream enum both hops. Downstream handles `SSLRequest` from clie
   leaves every multibyte character alone — and every name is clipped to 63 bytes
   (`NAMEDATALEN - 1`). One function does it for both the write path's SQL identifiers and
   the configured `[[column]]` names, so the two sides of a name comparison cannot drift.
-- **Ciphertext relocation is detected across columns, not across rows.** The envelope AAD
-  binds `schema.table.column`, so pasting a stored value into a different column or table
-  fails authentication; pasting it into the *same* column of another row does not. Rows
-  written before the binding (`DBS1`) have neither guarantee until they are re-encrypted.
-  See "Why the row half is not bound" for what closing it would actually cost.
+- **Ciphertext relocation is detected across columns always, across rows only where a
+  `row_key` is declared.** The envelope AAD binds `schema.table.column`, so pasting a
+  stored value into a different column or table fails authentication. Pasting it into the
+  *same* column of another row fails only for a table with a declared row key, and only
+  for `transform = "encrypt"` columns — deterministic transforms store identical bytes in
+  every row by design. Rows written before either binding (`DBS1`, `DBS2`) keep the
+  guarantee they were written under until re-encrypted. See "Binding a value to its row".
 - **Authentication is relayed, not terminated, so `SCRAM-SHA-256-PLUS` cannot work and
   GSSAPI encryption is always refused.** The proxy never speaks the auth exchange itself:
   it forwards the SASL frames verbatim between two independent TLS sessions. Channel
@@ -370,83 +371,61 @@ column is looked up under a new name — copy the old key's material into the ne
 secret first, or the column is re-indexed under a freshly minted key and every stored
 token stops matching.
 
-### Why the row half is not bound
+### Binding a value to its row
 
-The envelope binds `schema.table.column`, so cross-column and cross-table relocation
-fail authentication. Cross-*row* relocation within one column does not, and this section
-records why — it is a design decision above the envelope, not a missing line of code, and
-the shape of the fix is expensive enough that it should be chosen deliberately.
+The envelope binds `schema.table.column`, which stops cross-column and cross-table
+relocation. Cross-*row* relocation within one column needs more, and it is available as an
+opt-in: a table that declares a `row_key` seals its encrypted values as `DBS3`, whose
+associated data is `key_id || len ‖ schema.table.column || len ‖ canonical(row_key)`.
 
-Start from what relocation detection needs. The verifier has to know, **independently of
-the copied bytes**, where those bytes are supposed to be. Any identifier that travels with
-the ciphertext — a salt in the header, a token in a sibling column — is copied along with
-it, so it proves nothing. The identity must therefore be something the *application*
-already treats as the row's name: the primary key. That is not a limitation of this
-codebase; it is why a key works at all. An attacker who rewrites the primary key has not
-relocated a value, they have renamed the row.
+The length prefixes are not tidiness. With three variable fields a plain concatenation is
+forgeable — column `users.ssn` with row `42` and column `users.ssn4` with row `2` are the
+same bytes — and the row key is usually the attacker's own row id, so they can choose one
+that straddles the seam.
 
-So the identity is the primary key, and it must reach both paths. Neither path has it, for
-different and more specific reasons than "the proxy does not track rows":
+Start from what relocation detection needs, because it rules out the cheaper designs. The
+verifier has to know, **independently of the copied bytes**, where those bytes belong. Any
+identifier that travels with the ciphertext — a salt in the header, a token in a sibling
+column — is copied along with it and proves nothing. So the identity has to be one the
+application already treats as the row's name: its primary key. (An attacker who rewrites
+the primary key has not relocated a value; they have renamed the row. That is exactly why
+the key qualifies and a proxy-minted identifier does not.)
 
-**Write path.** The seal happens in two places, and both are missing a different half.
-For an inline literal, `rewrite_insert_values` holds the whole `Insert` node — the full
-column list and every `VALUES` row — so a sibling `id` expression is in scope. For a bound
-parameter, `QueryRewriter::bind` holds the entire parameter array, so a sibling `$3` is in
-scope as bytes. What does not survive Parse→Bind is the *mapping*: the only state carried
-across is `Vec<(usize, ParamAction)>`, index → what to do, with no column or table on it.
-Threading a "the row key is at index N" entry through is mechanical. The blockers are
-semantic:
+Two problems had to be solved rather than designed around:
 
-- **Server-generated keys.** `INSERT INTO users (ssn) VALUES ($1)` with `id serial` has no
-  row key anywhere in the statement — the value the proxy would need does not exist until
-  after the statement it is rewriting has run. This is the ordinary case, not an edge one.
-- **Multi-row `UPDATE`.** `UPDATE users SET ssn = $1 WHERE dept = 'x'` must produce a
-  *different* ciphertext per target row, and a Bind parameter is one byte string. No
-  rewrite of that statement can satisfy row binding; it can only be refused.
-- **`ON CONFLICT DO UPDATE`.** The conflicting row's key need not be the key the `INSERT`
-  proposed, and the proxy cannot know which branch ran.
+- **The value is untyped and format-ambiguous.** `id = 42` arrives as `b"42"` from a
+  text-format client and as four big-endian bytes from a binary one, and both appear in
+  this repo's e2e suite. `RowDescription` now retains `atttypid` and the format code, and
+  `proxy::rowkey` canonicalises per type to the value's ordinary text form. The supported
+  set is small on purpose — integers, text, uuid — because each type needs a decoder that
+  matches PostgreSQL's own output exactly; anything else is refused at startup, naming the
+  column.
+- **The key is usually not projected.** `SELECT ssn FROM users WHERE id = $1` does not
+  return `id`. Injecting it into the target list and stripping it before relay would mean
+  parsing and rewriting `SELECT`s, which this path exists to avoid — it matches on catalog
+  OIDs precisely so `SELECT *`, CTEs, unions and cached prepared statements need no SQL
+  understanding. So the query must project the key, and one that does not gets
+  `RowKeyMissing` rather than the stored bytes.
 
-**Read path.** This half is closer than the earlier note claimed. `Described::fields`
-already holds `(table_oid, attnum)` for *every* field of a described statement, in order,
-and `decrypt_row` already has every field's bytes in hand — so if the client projected the
-row key, the proxy can find it. Two things still block using it:
+**What a deployment accepts by declaring a row key.** Each of these is a refusal, not a
+degradation:
 
-- **The value is untyped and format-ambiguous.** `parse_row_description` discards the type
-  OID and the format code (twelve bytes it deliberately skips), and the result format is a
-  per-query client choice. `id = 42` arrives as `b"42"` from a text-format client and as
-  four big-endian bytes from a binary-format one. Binding raw wire bytes means a row
-  written through psycopg cannot be read through sqlx. Binding the *logical* value means
-  retaining `atttypid` and the format codes and canonicalising per type — a
-  PostgreSQL-type-decoding surface the proxy does not have anywhere today, and the one
-  thing the read path has consistently avoided (`decode_wire` sniffs a `\x` prefix rather
-  than consulting a type).
-- **The key is usually not projected.** `SELECT ssn FROM users WHERE id = $1` is the normal
-  shape and does not return `id`. Under row binding that query cannot be answered at all —
-  the proxy would have to fail it. Injecting the key into the target list and stripping it
-  before relay would mean parsing and rewriting `SELECT`s, which this path exists to avoid:
-  it matches on catalog OIDs precisely so that `SELECT *`, CTEs, unions and cached prepared
-  statements without a fresh `RowDescription` need no SQL understanding.
+- Client-generated keys only on protected tables. A `serial` key does not exist when the
+  proxy rewrites the `INSERT`, so the value cannot be sealed against it.
+- Single-row `UPDATE ... WHERE row_key = ?` for protected columns. A Bind carries one byte
+  string per placeholder, so a multi-row update would need a different ciphertext per row
+  and there is nowhere to put them.
+- Every read of a protected column projects that table's row key.
 
-That leaves one viable design, and its cost is in deployment rules rather than code:
+**What it does not cover.** Only `transform = "encrypt"` binds a row. FPE and tokenization
+map a plaintext to identical stored bytes in every row — the determinism that makes them
+searchable and joinable — so there is no associated data to bind and adding one would
+destroy the property they are chosen for. Config validation refuses a `row_key` on a table
+whose columns are all deterministic, rather than letting it look like coverage.
 
-> **Declared row key.** A per-table `row_key` in config, resolved to its `attnum` by the
-> same catalog query that resolves protected columns, bound into a new `DBS3` AAD as
-> `key_id || schema.table.column || canonical(row_key)`. `DBS2` stays readable, so the
-> migration is the same re-encryption sweep as the `DBS1` upgrade. In exchange the
-> deployment must accept: client-generated keys only (no `serial`/`identity`/`DEFAULT`) on
-> protected tables; single-row `UPDATE ... WHERE row_key = ?` only; and every query reading
-> a protected column must project that table's row key. Plus the proxy takes on type-aware
-> decoding of the key column.
-
-The alternative that keeps application queries untouched — a proxy-maintained side table
-of per-cell MACs keyed by `(table, row key, column)` — needs the same row key on the same
-two paths, so it inherits every blocker above and adds transactional consistency with the
-user's own writes on top. It is strictly worse and is not on the table.
-
-Until that decision is made, the exposure stands and is stated plainly in the caveats: an
-attacker who can write stored bytes can move a high-privilege row's `users.ssn` into their
-own row and read it back. Cross-column and cross-table relocation are detected;
-cross-row within one column is not.
+**Migration.** Opt-in per table, and the *stored value* decides which AAD verifies it, so
+`DBS2` rows keep opening after their table gains a key. Re-encrypt to make the binding
+retroactive; until then a row written before the change is bound to its column only.
 
 ### Retiring the shared-map layout
 
