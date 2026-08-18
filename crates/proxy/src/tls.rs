@@ -17,7 +17,7 @@ use rustls::{ClientConfig, RootCertStore, ServerConfig};
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio_rustls::{TlsAcceptor, TlsConnector};
 
-use crate::config::Config;
+use crate::config::ValidatedConfig;
 use crate::Error;
 
 /// Per-process TLS state, built once at startup from the config.
@@ -101,7 +101,16 @@ impl std::fmt::Display for ProviderPolicy {
 }
 
 impl TlsContext {
-    pub fn from_config(config: &Config) -> Result<Self, Error> {
+    /// Builds the per-process TLS state.
+    ///
+    /// Takes a [`ValidatedConfig`] rather than a bare [`crate::config::Config`]
+    /// on purpose: the SEC-29 permission check on `[tls.downstream] key` lives
+    /// in `Config::validate`, and [`load_key`] deliberately does not repeat it.
+    /// Requiring the validated form makes "this key's mode was proved safe"
+    /// a precondition the compiler enforces rather than one every call site has
+    /// to remember (ERR-11).
+    pub fn from_config(validated: &ValidatedConfig) -> Result<Self, Error> {
+        let config = &validated.config;
         install_crypto_provider()?;
         let acceptor = match &config.tls.downstream {
             Some(down) => {
@@ -169,10 +178,10 @@ fn load_certs(path: &Path) -> Result<Vec<CertificateDer<'static>>, Error> {
 /// Reads the downstream private key.
 ///
 /// The key's *permissions* are not checked here: `Config::validate` refuses a
-/// `[tls.downstream] key` readable beyond its owner (SEC-29), so by the time a
-/// `TlsContext` is built from a loaded config the mode has already been proved
-/// safe, and doing it here as well would stat the file twice and put the same
-/// policy in two places.
+/// `[tls.downstream] key` readable beyond its owner (SEC-29), and
+/// [`TlsContext::from_config`] only accepts a [`ValidatedConfig`] — so by the
+/// time this runs the mode has already been proved safe, and doing it here as
+/// well would stat the file twice and put the same policy in two places.
 fn load_key(path: &Path) -> Result<PrivateKeyDer<'static>, Error> {
     PrivateKeyDer::from_pem_file(path)
         .map_err(|e| Error::TlsConfig(format!("reading {}: {e}", path.display())))
@@ -242,7 +251,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin> AsyncWrite for MaybeTls<S> {
 mod tests {
     use std::path::PathBuf;
 
-    use crate::config::{DownstreamTls, TlsSection, UpstreamTls};
+    use crate::config::{Config, DownstreamTls, TlsSection, UpstreamTls};
 
     use super::*;
 
@@ -264,6 +273,23 @@ mod tests {
         let path = dir.path().join(name);
         std::fs::write(&path, contents).unwrap();
         path
+    }
+
+    /// A private key written the way an operator has to write it: validation
+    /// refuses a `[tls.downstream] key` readable beyond its owner (SEC-29), and
+    /// every `TlsContext` — here included — is built from a validated config.
+    fn write_key(dir: &tempfile::TempDir, name: &str, contents: &str) -> PathBuf {
+        let path = write(dir, name, contents);
+        #[cfg(unix)]
+        std::fs::set_permissions(&path, std::os::unix::fs::PermissionsExt::from_mode(0o600))
+            .unwrap();
+        path
+    }
+
+    /// Every test here goes through validation, so no call site can build a
+    /// `TlsContext` from a config whose invariants were never checked.
+    fn validated(config: Config) -> ValidatedConfig {
+        config.validated().expect("the test config is valid")
     }
 
     fn message(err: &Error) -> String {
@@ -347,9 +373,9 @@ mod tests {
         let (cert_pem, _) = cert_pair();
         let (_, other_key_pem) = cert_pair();
         let cert = write(&dir, "cert.pem", &cert_pem);
-        let key = write(&dir, "other.key", &other_key_pem);
+        let key = write_key(&dir, "other.key", &other_key_pem);
 
-        let err = config_error(TlsContext::from_config(&downstream_config(cert, key)));
+        let err = config_error(TlsContext::from_config(&validated(downstream_config(cert, key))));
         assert!(err.contains("downstream cert/key"), "{err}");
     }
 
@@ -358,9 +384,10 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let (_, key_pem) = cert_pair();
         let cert = dir.path().join("absent.pem");
-        let key = write(&dir, "key.pem", &key_pem);
+        let key = write_key(&dir, "key.pem", &key_pem);
 
-        let err = config_error(TlsContext::from_config(&downstream_config(cert.clone(), key)));
+        let err =
+            config_error(TlsContext::from_config(&validated(downstream_config(cert.clone(), key))));
         assert!(err.contains(&cert.display().to_string()), "{err}");
     }
 
@@ -369,11 +396,11 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let ca = write(&dir, "ca.pem", "# no PEM blocks here\n");
 
-        let err = config_error(TlsContext::from_config(&upstream_config(
+        let err = config_error(TlsContext::from_config(&validated(upstream_config(
             ca.clone(),
             None,
             "db.example.com:5432",
-        )));
+        ))));
         assert!(err.contains(&ca.display().to_string()), "{err}");
         assert!(err.contains("no certificates"), "{err}");
     }
@@ -385,7 +412,7 @@ mod tests {
         let ca = write(&dir, "ca.pem", &ca_pem);
 
         let config = upstream_config(ca, Some("not a hostname".to_owned()), "db.example.com:5432");
-        let err = config_error(TlsContext::from_config(&config));
+        let err = config_error(TlsContext::from_config(&validated(config)));
         assert!(err.contains("invalid upstream hostname"), "{err}");
         assert!(err.contains("not a hostname"), "{err}");
     }
@@ -398,21 +425,46 @@ mod tests {
         let (ca_pem, _) = cert_pair();
         let ca = write(&dir, "ca.pem", &ca_pem);
 
-        let context =
-            TlsContext::from_config(&upstream_config(ca.clone(), None, "db.example.com:5432"))
-                .unwrap();
+        let context = TlsContext::from_config(&validated(upstream_config(
+            ca.clone(),
+            None,
+            "db.example.com:5432",
+        )))
+        .unwrap();
         let (_, name) = context.connector.expect("upstream TLS is configured");
         assert_eq!(name.to_str(), "db.example.com");
 
         // An explicit hostname still wins over the derived one.
-        let context = TlsContext::from_config(&upstream_config(
+        let context = TlsContext::from_config(&validated(upstream_config(
             ca,
             Some("other.example.com".to_owned()),
             "db.example.com:5432",
-        ))
+        )))
         .unwrap();
         let (_, name) = context.connector.expect("upstream TLS is configured");
         assert_eq!(name.to_str(), "other.example.com");
+    }
+
+    /// The reason `from_config` takes a `ValidatedConfig`: a downstream key
+    /// readable beyond its owner is refused before a `TlsContext` can exist,
+    /// and no call site is able to opt out of that (SEC-29, ERR-11).
+    #[cfg(unix)]
+    #[test]
+    fn a_world_readable_downstream_key_never_reaches_a_tls_context() {
+        let dir = tempfile::tempdir().unwrap();
+        let (cert_pem, key_pem) = cert_pair();
+        let cert = write(&dir, "cert.pem", &cert_pem);
+        let key = write(&dir, "loose.key", &key_pem);
+        std::fs::set_permissions(&key, std::os::unix::fs::PermissionsExt::from_mode(0o644))
+            .unwrap();
+
+        let err = downstream_config(cert, key.clone())
+            .validated()
+            .expect_err("a world-readable private key must not validate");
+        assert!(
+            matches!(&err, Error::InvalidConfig(message) if message.contains(&key.display().to_string())),
+            "{err}"
+        );
     }
 
     /// The point of SEC-8: the provider in force is compared, not assumed, and

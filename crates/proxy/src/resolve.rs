@@ -138,7 +138,7 @@ pub async fn resolve_columns(
         )
         .await
         .map_err(|_| Error::ControlTimeout { host: control_host(dsn.as_str()), timeout: deadline })?
-        .map_err(|e| Error::Control(e.to_string()))?
+        .map_err(|source| Error::Control { host: control_host(dsn.as_str()), source })?
         .ok_or_else(|| Error::ColumnNotFound {
             table: format!("{}.{}", column.schema, column.table),
             column: column.column.clone(),
@@ -214,7 +214,7 @@ where
     let (client, connection) = timeout(deadline, tokio_postgres::connect(dsn.as_str(), connector))
         .await
         .map_err(|_| Error::ControlTimeout { host: control_host(dsn.as_str()), timeout: deadline })?
-        .map_err(|e| Error::Control(e.to_string()))?;
+        .map_err(|source| Error::Control { host: control_host(dsn.as_str()), source })?;
     tokio::spawn(async move {
         if let Err(e) = connection.await {
             tracing::warn!(error = %e, "control connection ended with error");
@@ -286,7 +286,7 @@ mod tests {
             }
         });
 
-        let tls = TlsContext::from_config(&Config::default()).unwrap();
+        let tls = TlsContext::from_config(&Config::default().validated().unwrap()).unwrap();
         let dsn = Dsn::new(format!("postgres://dbsec:hunter2@127.0.0.1:{}/app", addr.port()));
         let deadline = Duration::from_millis(200);
         let started = std::time::Instant::now();
@@ -355,12 +355,48 @@ mod tests {
         };
 
         assert!(
-            matches!(err, Error::Control(_)),
+            matches!(err, Error::Control { .. }),
             "the strip must fail the connect, not time out: {err}"
         );
         assert!(!err.to_string().contains("hunter2"), "the DSN password must not reach the error");
         assert!(started.elapsed() < deadline, "the refusal is immediate, not a timeout");
         stripping.abort();
+    }
+
+    /// ERR-9: the `tokio_postgres` error is kept as a `#[source]` rather than
+    /// flattened with `to_string()`. Its top line is the same for every
+    /// connect failure — "error connecting to server" — so the part that tells
+    /// "connection refused" apart from "certificate verify failed" apart from
+    /// "password authentication failed" is only reachable one link further
+    /// down the chain.
+    ///
+    /// A Unix socket that does not exist rather than a closed TCP port: the
+    /// failure is then a deterministic `ENOENT` instead of a race with
+    /// whatever else may bind an ephemeral port.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_failed_control_connection_keeps_its_typed_cause() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("nothing-listens-here");
+
+        let tls = TlsContext::from_config(&Config::default().validated().unwrap()).unwrap();
+        let dsn =
+            Dsn::new(format!("host={} user=dbsec password=hunter2 dbname=app", socket.display()));
+        let Err(err) = resolve_columns(&dsn, &tls, &[], Duration::from_secs(5)).await else {
+            panic!("a control socket that does not exist must not resolve");
+        };
+
+        let Error::Control { host, .. } = &err else {
+            panic!("expected a control-connection error, got: {err}");
+        };
+        assert_eq!(host, &socket.display().to_string());
+        assert!(!err.to_string().contains("hunter2"), "the DSN password must not reach the error");
+
+        // The chain, not the top line, is where the cause lives.
+        let cause =
+            std::error::Error::source(&err).expect("the tokio_postgres cause stays reachable");
+        let io = cause.source().expect("and its own io::Error under that");
+        assert!(io.to_string().contains("No such file or directory"), "{io}");
     }
 
     /// One `[[column]]` per read-path shape the filter has to tell apart.

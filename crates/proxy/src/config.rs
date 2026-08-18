@@ -616,7 +616,7 @@ impl VaultConfig {
                 // `Secret`, which is wiped in turn.
                 let raw = Zeroizing::new(
                     std::fs::read_to_string(path)
-                        .map_err(|e| Error::Vault(format!("reading {}: {e}", path.display())))?,
+                        .map_err(|source| Error::VaultToken { path: path.clone(), source })?,
                 );
                 Ok(Secret::new(raw.trim().to_owned()))
             }
@@ -1590,6 +1590,32 @@ mod tests {
 
         let world_readable = write_mode(dir.path(), "public.toml", &text, 0o644);
         Config::load(&world_readable).unwrap();
+    }
+
+    /// ERR-9/ERR-13: a `token_file` that cannot be read names the path and
+    /// keeps the `io::Error` as a source, so "no such file" is told apart from
+    /// "permission denied" without the operator guessing.
+    #[test]
+    fn an_unreadable_token_file_names_the_path_and_keeps_its_cause() {
+        let dir = tempfile::tempdir().unwrap();
+        let absent = dir.path().join("absent-token");
+        let cfg: Config = toml::from_str(&format!(
+            "control_dsn = \"postgres://x\"\n\n[vault]\n\
+             addr = \"https://bao.internal:8200\"\ntoken_file = {absent:?}\n"
+        ))
+        .unwrap();
+
+        let err = cfg.validated().expect_err("a token file that is not there cannot resolve");
+        let Error::VaultToken { path, source } = &err else {
+            panic!("expected a token-file read error, got: {err}");
+        };
+        assert_eq!(path, &absent);
+        assert_eq!(source.kind(), std::io::ErrorKind::NotFound);
+        assert!(err.to_string().contains(&absent.display().to_string()), "{err}");
+        assert!(
+            std::error::Error::source(&err).is_some(),
+            "the io::Error stays reachable through the chain"
+        );
     }
 
     #[test]

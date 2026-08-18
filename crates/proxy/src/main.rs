@@ -106,7 +106,7 @@ const USAGE: &str = "usage: dbsec [--plain-relay] [--allow-core-dumps] [config.t
 #[cfg(test)]
 pub fn log_capture() -> std::sync::MutexGuard<'static, ()> {
     static LOG_CAPTURE: std::sync::Mutex<()> = std::sync::Mutex::new(());
-    LOG_CAPTURE.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+    dbsec_core::sync::Unpoisoned::unpoisoned(LOG_CAPTURE.lock())
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -165,10 +165,31 @@ pub enum Error {
         #[source]
         source: std::io::Error,
     },
-    #[error("vault: {0}")]
-    Vault(String),
-    #[error("control connection: {0}")]
-    Control(String),
+    /// The `[vault] token_file` read. Shaped like [`Error::ConfigRead`] rather
+    /// than flattened into a string: the file is config-adjacent, so the same
+    /// "name the path, keep the `io::Error`" rule applies (ERR-9, ERR-13). The
+    /// token itself is never in the error — only the path it was to be read
+    /// from.
+    #[error("reading the [vault] token_file {path}: {source}")]
+    VaultToken {
+        path: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
+    /// The control connection is the most failure-prone startup step, and the
+    /// part an operator needs — "connection refused" vs "certificate verify
+    /// failed" vs "password authentication failed" — lives *under* the
+    /// `tokio_postgres` error, not in its top line. So the cause is kept as a
+    /// `#[source]` instead of being flattened with `to_string()` (ERR-9), and
+    /// the endpoint is named the same way [`Error::ControlTimeout`] names it —
+    /// parsed out of the DSN, never echoed, because `control_dsn` carries the
+    /// control user's password.
+    #[error("control connection to {host}: {source}")]
+    Control {
+        host: String,
+        #[source]
+        source: tokio_postgres::Error,
+    },
     #[error("control connection to {host}: no response within {timeout:?}")]
     ControlTimeout { host: String, timeout: Duration },
     #[error("configured column {table}.{column} does not exist")]
@@ -342,8 +363,10 @@ fn load_config(args: &Args, default: &Path) -> Result<ValidatedConfig, Error> {
 }
 
 async fn serve(validated: ValidatedConfig) -> Result<(), Error> {
+    // Built before the destructure: `TlsContext` only accepts the validated
+    // form, which is what proves the downstream key's mode was checked.
+    let tls = Arc::new(TlsContext::from_config(&validated)?);
     let ValidatedConfig { config, protected } = validated;
-    let tls = Arc::new(TlsContext::from_config(&config)?);
 
     // `protected` is `Some` exactly when `[[column]]` entries were configured,
     // and validation already resolved the key source and the control DSN — so
@@ -753,7 +776,7 @@ mod tests {
     }
 
     fn test_ctx() -> Arc<SessionContext> {
-        let config = Config::default();
+        let config = Config::default().validated().unwrap();
         Arc::new(SessionContext {
             // Never dialled: these tests stop at the SSLRequest answer.
             upstream_addr: "127.0.0.1:1".to_owned(),

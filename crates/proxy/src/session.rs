@@ -605,7 +605,9 @@ mod tests {
     fn plain_ctx(upstream_addr: &str) -> SessionContext {
         SessionContext {
             upstream_addr: upstream_addr.to_owned(),
-            tls: Arc::new(TlsContext::from_config(&Config::default()).unwrap()),
+            tls: Arc::new(
+                TlsContext::from_config(&Config::default().validated().unwrap()).unwrap(),
+            ),
             rows: None,
             writes: None,
             startup_timeout: TEST_STARTUP_TIMEOUT,
@@ -625,6 +627,12 @@ mod tests {
         let key_path = dir.join("key.pem");
         std::fs::write(&cert_path, cert.cert.pem()).unwrap();
         std::fs::write(&key_path, cert.key_pair.serialize_pem()).unwrap();
+        // Written the way an operator has to write it: validation refuses a
+        // `[tls.downstream] key` readable beyond its owner (SEC-29), and every
+        // `TlsContext` is built from a validated config.
+        #[cfg(unix)]
+        std::fs::set_permissions(&key_path, std::os::unix::fs::PermissionsExt::from_mode(0o600))
+            .unwrap();
         (cert_path, key_path)
     }
 
@@ -1043,6 +1051,7 @@ mod tests {
             cert_path, key_path
         ))
         .unwrap();
+        let config = config.validated().unwrap();
         let (_shutdown_tx, shutdown) = no_shutdown();
         let first_ctx = SessionContext {
             upstream_addr: "127.0.0.1:1".to_owned(),
@@ -1151,9 +1160,10 @@ mod tests {
             "upstream = \"{upstream_addr}\"\n\n[tls.upstream]\nca = {cert_path:?}\nhostname = \"localhost\"\n",
         ))
         .unwrap();
+        let config = config.validated().unwrap();
         let (_shutdown_tx, shutdown) = no_shutdown();
         let ctx = SessionContext {
-            upstream_addr: config.upstream.clone(),
+            upstream_addr: config.config.upstream.clone(),
             tls: Arc::new(TlsContext::from_config(&config).unwrap()),
             rows: None,
             writes: None,
@@ -1191,8 +1201,9 @@ mod tests {
             "upstream = \"{refusing_addr}\"\n\n[tls.upstream]\nca = {cert_path:?}\nhostname = \"localhost\"\n",
         ))
         .unwrap();
+        let config = config.validated().unwrap();
         let ctx = SessionContext {
-            upstream_addr: config.upstream.clone(),
+            upstream_addr: config.config.upstream.clone(),
             tls: Arc::new(TlsContext::from_config(&config).unwrap()),
             rows: None,
             writes: None,
