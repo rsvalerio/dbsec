@@ -2,6 +2,27 @@
 All notable changes to this project will be documented in this file. See [conventional commits](https://www.conventionalcommits.org/) for commit guidelines.
 
 - - -
+## v0.3.0 - 2026-08-18
+#### Features
+- (**config**) let a deployment set the read path's per-value ceiling - (3c1ec5b) - Rodrigo Valerio
+#### Bug Fixes
+- (**encrypt**) see every relation a parenthesized join holds and cover COPY reads - (55682d2) - Rodrigo Valerio
+- (**proxy**) read both session settings out of the startup packet - (1ca5ccc) - Rodrigo Valerio, *Claude Opus 5 (1M context)*
+- (**proxy**) answer --help, warn on a zero-protection startup, log causes - (fb29fc9) - Rodrigo Valerio
+- (**session**) bound a client's frames until the backend authenticates it - (e50e696) - Rodrigo Valerio
+#### Documentation
+- (**crypto**) argue the unbound row half and the unwiped GHASH subkey in place - (5d29159) - Rodrigo Valerio, *Claude Opus 5 (1M context)*
+- (**readme**) document --help and the zero-protection startup warning - (6e7a8df) - Rodrigo Valerio
+- note that standard_conforming_strings is watched at connect time - (2cc5a16) - Rodrigo Valerio, *Claude Opus 5 (1M context)*
+- note that a COPY query's predicates are rewritten - (51ae6ca) - Rodrigo Valerio
+#### Miscellaneous Chores
+- (**backlog**) close waves 22, 24 and 25 and file the help-pipe defect - (fbeb52a) - Rodrigo Valerio, *Claude Opus 5 (1M context)*
+- (**backlog**) close the wave 26 input-bounds findings - (93b97d5) - Rodrigo Valerio
+- (**backlog**) close the wave 23 session-settings findings - (273cbf9) - Rodrigo Valerio, *Claude Opus 5 (1M context)*
+- (**backlog**) triage the wave 13-21 findings into waves 22-26 - (7a48721) - Rodrigo Valerio, *Claude Opus 5 (1M context)*
+
+- - -
+
 ## v0.2.0 - 2026-08-18
 #### Features
 - (**crypto**) bind a ciphertext to its column and tighten key handling - (8beb7c8) - Rodrigo Valerio
