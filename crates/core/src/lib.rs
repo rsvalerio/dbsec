@@ -6,6 +6,7 @@ pub mod envelope;
 pub mod keys;
 pub mod mask;
 pub mod pgwire;
+pub mod sync;
 pub mod transform;
 
 use std::path::PathBuf;

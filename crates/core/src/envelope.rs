@@ -70,6 +70,7 @@ use aes_gcm::{Aes256Gcm, Nonce};
 use rand::RngCore;
 
 use crate::keys::KeySource;
+use crate::sync::Unpoisoned as _;
 use crate::Error;
 
 /// The current envelope version: associated data is the key id *and* the cell
@@ -301,12 +302,16 @@ impl Ciphers {
         self.for_id(&id)?.decrypt(context, enveloped)
     }
 
+    /// Both caches recover from a poisoned lock rather than panicking on it
+    /// ([`crate::sync`]): this one is process-wide, so a panic here would fail
+    /// every session from then on, and each critical section is a single slot
+    /// or map operation whose value is intact either way.
     fn active(&self) -> Result<(KeyId, Arc<Cipher>), Error> {
-        if let Some((id, cipher)) = self.active.read().expect("ciphers lock").as_ref() {
+        if let Some((id, cipher)) = self.active.read().unpoisoned().as_ref() {
             return Ok((*id, cipher.clone()));
         }
         let (id, key) = self.keys.active_key()?;
-        let mut slot = self.active.write().expect("ciphers lock");
+        let mut slot = self.active.write().unpoisoned();
         let (id, cipher) =
             slot.get_or_insert_with(|| (id, Arc::new(Cipher::with_budget(&key, self.budget))));
         Ok((*id, cipher.clone()))
@@ -317,7 +322,7 @@ impl Ciphers {
         if id == *spent {
             return Err(Error::KeyExhausted(hex::encode(spent)));
         }
-        let mut slot = self.active.write().expect("ciphers lock");
+        let mut slot = self.active.write().unpoisoned();
         // Another thread may have rolled already; its key is just as fresh.
         if let Some((current, cipher)) = slot.as_ref() {
             if current != spent {
@@ -330,12 +335,12 @@ impl Ciphers {
     }
 
     fn for_id(&self, id: &KeyId) -> Result<Arc<Cipher>, Error> {
-        if let Some(cipher) = self.by_id.read().expect("ciphers lock").get(id) {
+        if let Some(cipher) = self.by_id.read().unpoisoned().get(id) {
             return Ok(cipher.clone());
         }
         let key = self.keys.key(id)?;
         let cipher = Arc::new(Cipher::with_budget(&key, self.budget));
-        Ok(self.by_id.write().expect("ciphers lock").entry(*id).or_insert(cipher).clone())
+        Ok(self.by_id.write().unpoisoned().entry(*id).or_insert(cipher).clone())
     }
 }
 
@@ -599,6 +604,34 @@ mod tests {
         let sealed = ciphers.seal(&ssn(), b"secret").unwrap();
         assert_eq!(ciphers.open(&ssn(), &sealed).unwrap(), b"secret");
         assert_eq!(ciphers.open(&ssn(), &sealed).unwrap(), b"secret");
-        assert_eq!(ciphers.by_id.read().unwrap().len(), 1);
+        assert_eq!(ciphers.by_id.read().unpoisoned().len(), 1);
+    }
+
+    /// `Ciphers` is process-wide, so panicking on a poisoned lock would fail
+    /// every session from then on rather than the one that tripped it. Both
+    /// caches recover instead ([`crate::sync`]), and what they hand back is
+    /// what the panicking thread left — a single slot or map operation that
+    /// cannot be half-applied.
+    #[test]
+    fn a_poisoned_cache_keeps_serving() {
+        let ciphers = Arc::new(Ciphers::new(Arc::new(OneKey)));
+        let sealed = ciphers.seal(&ssn(), b"secret").unwrap();
+        // Populates `by_id` too, so both locks are holding real state.
+        assert_eq!(ciphers.open(&ssn(), &sealed).unwrap(), b"secret");
+
+        let poisoner = Arc::clone(&ciphers);
+        let panicked = std::thread::spawn(move || {
+            let _active = poisoner.active.write().unpoisoned();
+            let _by_id = poisoner.by_id.write().unpoisoned();
+            panic!("a session task panicked while holding the cache locks");
+        })
+        .join();
+        assert!(panicked.is_err(), "the helper thread has to have panicked");
+        assert!(ciphers.active.is_poisoned() && ciphers.by_id.is_poisoned());
+
+        // Every path a live session takes still works.
+        assert_eq!(ciphers.open(&ssn(), &sealed).unwrap(), b"secret");
+        let again = ciphers.seal(&ssn(), b"another").unwrap();
+        assert_eq!(ciphers.open(&ssn(), &again).unwrap(), b"another");
     }
 }

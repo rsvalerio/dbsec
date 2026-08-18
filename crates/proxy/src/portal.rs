@@ -50,8 +50,9 @@
 //! capped — names, statements, portals and outstanding responses (SEC-33).
 
 use std::collections::{HashMap, VecDeque};
-use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+use std::sync::{Arc, Mutex, MutexGuard};
 
+use dbsec_core::sync::Unpoisoned as _;
 use dbsec_core::transform::FieldTransform;
 
 use crate::rows::Described;
@@ -274,7 +275,7 @@ impl SessionPortals {
     /// is structurally intact; refusing to read it would turn one task's bug
     /// into a second panic in a session that is being torn down anyway.
     fn tracked(&self) -> MutexGuard<'_, Tracked> {
-        self.0.lock().unwrap_or_else(PoisonError::into_inner)
+        self.0.lock().unpoisoned()
     }
 
     /// Remembers a freshly parsed statement, replacing any statement of the

@@ -65,10 +65,11 @@
 
 use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
-use std::sync::{Arc, PoisonError};
+use std::sync::Arc;
 
 use dbsec_core::mask::MaskSpec;
 use dbsec_core::pgwire;
+use dbsec_core::sync::Unpoisoned as _;
 use dbsec_core::transform::{FieldTransform, WireForm};
 
 use tokio::sync::Notify;
@@ -255,7 +256,7 @@ impl RowContext {
     /// while holding it, which it can only have done between a clone and a
     /// swap — the value is intact either way.
     pub fn resolved(&self) -> Arc<Resolved> {
-        self.resolved.read().unwrap_or_else(PoisonError::into_inner).clone()
+        self.resolved.read().unpoisoned().clone()
     }
 
     /// Publishes a fresh resolution to every live session, under the next
@@ -263,7 +264,7 @@ impl RowContext {
     /// are out of date.
     pub fn publish(&self, mut resolved: Resolved) {
         use std::sync::atomic::Ordering;
-        let mut slot = self.resolved.write().unwrap_or_else(PoisonError::into_inner);
+        let mut slot = self.resolved.write().unpoisoned();
         let generation = slot.generation.saturating_add(1);
         resolved.generation = generation;
         *slot = Arc::new(resolved);

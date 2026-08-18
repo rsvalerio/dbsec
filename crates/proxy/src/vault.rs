@@ -82,6 +82,7 @@ use std::time::{Duration, Instant};
 use base64::Engine as _;
 use dbsec_core::envelope::{KeyId, KEY_ID_LEN};
 use dbsec_core::keys::{Key, KeySource};
+use dbsec_core::sync::Unpoisoned as _;
 use dbsec_core::Error as CoreError;
 use rand::RngCore;
 use serde::{Deserialize, Serialize};
@@ -653,13 +654,13 @@ impl<S: KeyStore> VaultKeySource<S> {
     fn recently_missing(&self, id: &KeyId) -> bool {
         self.missing_deks
             .read()
-            .expect("lock")
+            .unpoisoned()
             .get(id)
             .is_some_and(|seen| seen.elapsed() < MISSING_DEK_CACHE_TTL)
     }
 
     fn remember_missing(&self, id: &KeyId) {
-        let mut missing = self.missing_deks.write().expect("lock");
+        let mut missing = self.missing_deks.write().unpoisoned();
         missing.retain(|_, seen| seen.elapsed() < MISSING_DEK_CACHE_TTL);
         if missing.len() >= MISSING_DEK_CACHE_MAX {
             missing.clear();
@@ -735,13 +736,17 @@ pub(crate) async fn token_watch<S: KeyStore>(
     }
 }
 
+/// Every cache here recovers from a poisoned lock rather than panicking on it
+/// ([`dbsec_core::sync`]): these caches are process-wide, so a panic would fail
+/// every session from then on rather than the one that tripped it, and each
+/// critical section is a single map operation whose value is intact either way.
 impl<S: KeyStore> KeySource for VaultKeySource<S> {
     fn active_key(&self) -> Result<(KeyId, Key), CoreError> {
         Ok((self.active.0, self.active.1.clone()))
     }
 
     fn key(&self, id: &KeyId) -> Result<Key, CoreError> {
-        if let Some(key) = self.deks.read().expect("lock").get(id) {
+        if let Some(key) = self.deks.read().unpoisoned().get(id) {
             return Ok(key.clone());
         }
         if self.recently_missing(id) {
@@ -751,16 +756,16 @@ impl<S: KeyStore> KeySource for VaultKeySource<S> {
             self.remember_missing(id);
             return Err(CoreError::UnknownKey(hex::encode(id)));
         };
-        self.deks.write().expect("lock").insert(*id, key.clone());
+        self.deks.write().unpoisoned().insert(*id, key.clone());
         Ok(key)
     }
 
     fn index_key(&self, name: &str) -> Result<Key, CoreError> {
-        if let Some(key) = self.index_keys.read().expect("lock").get(name) {
+        if let Some(key) = self.index_keys.read().unpoisoned().get(name) {
             return Ok(key.clone());
         }
         let key = self.block_on("resolving index key", self.resolve_index_key(name))?;
-        self.index_keys.write().expect("lock").insert(name.to_owned(), key.clone());
+        self.index_keys.write().unpoisoned().insert(name.to_owned(), key.clone());
         Ok(key)
     }
 }
