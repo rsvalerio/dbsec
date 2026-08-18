@@ -169,6 +169,7 @@ pub async fn resolve_columns(
         }
     }
     let mut resolved_row_keys = std::collections::HashMap::new();
+    let mut row_keys_by_table = std::collections::HashMap::new();
     for decl in row_keys {
         let row = timeout(
             deadline,
@@ -204,8 +205,10 @@ pub async fn resolve_columns(
             type_oid,
             "row key resolved; this table's encrypted values are bound to their row"
         );
-        resolved_row_keys
-            .insert(table_oid, ResolvedRowKey { attnum, type_oid, name: decl.column.clone() });
+        let spec = ResolvedRowKey { attnum, type_oid, name: decl.column.clone() };
+        row_keys_by_table
+            .insert((decl.schema.to_lowercase(), decl.table.to_lowercase()), spec.clone());
+        resolved_row_keys.insert(table_oid, spec);
     }
 
     // `generation` is stamped by `RowContext::publish`, which is the only
@@ -215,6 +218,7 @@ pub async fn resolve_columns(
         names,
         positions,
         row_keys: resolved_row_keys,
+        row_key_by_table: row_keys_by_table,
         ..Resolved::default()
     })
 }

@@ -52,6 +52,7 @@
 use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex, MutexGuard};
 
+use dbsec_core::envelope::RowKey;
 use dbsec_core::sync::Unpoisoned as _;
 use dbsec_core::transform::FieldTransform;
 
@@ -92,7 +93,7 @@ pub type Positions = Arc<Described>;
 #[derive(Clone)]
 pub enum ParamAction {
     /// The parameter feeds a protected column: seal it.
-    Seal(Arc<dyn FieldTransform>),
+    Seal { transform: Arc<dyn FieldTransform>, row: RowKeySource },
     /// The parameter is compared for equality against a searchable column:
     /// replace it with the blind index (the SQL was rewritten to match the
     /// index prefix).
@@ -106,14 +107,34 @@ pub enum ParamAction {
     SearchIndexArray { transform: Arc<dyn FieldTransform>, column: Arc<str> },
 }
 
+/// Where the row key for a sealed parameter comes from.
+///
+/// A row-bound value cannot be sealed until its row is known, and for a bound
+/// parameter the row is often another bound parameter — `UPDATE users SET
+/// ssn = $1 WHERE id = $2` knows nothing about `$2` until Bind. So the *source*
+/// of the key crosses Parse→Bind, and the key itself is resolved at Bind.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum RowKeySource {
+    /// The column's table declares no row key: cell-only binding, as before.
+    None,
+    /// The row key was a literal in the statement, canonicalised at rewrite
+    /// time because the statement text is all it depends on.
+    Literal(RowKey),
+    /// The row key is another placeholder, canonicalised at Bind from that
+    /// parameter's bytes. The type is carried because those bytes cannot be
+    /// interpreted without it (see `crate::rowkey`).
+    Param { index: usize, type_oid: u32 },
+}
+
 impl ParamAction {
     /// Whether two actions on one parameter ask for the same wire value, and
     /// so can be satisfied by transforming it once.
     fn agrees_with(&self, other: &Self) -> bool {
         match (self, other) {
-            (Self::Seal(a), Self::Seal(b)) | (Self::SearchIndex(a), Self::SearchIndex(b)) => {
-                Arc::ptr_eq(a, b)
+            (Self::Seal { transform: a, row: left }, Self::Seal { transform: b, row: right }) => {
+                Arc::ptr_eq(a, b) && left == right
             }
+            (Self::SearchIndex(a), Self::SearchIndex(b)) => Arc::ptr_eq(a, b),
             (
                 Self::SearchIndexArray { transform: a, column: left },
                 Self::SearchIndexArray { transform: b, column: right },
@@ -875,9 +896,13 @@ mod tests {
     fn one_placeholder_cannot_carry_two_conflicting_actions() {
         let searchable = transform(true);
         let mut params = ParamTransforms::default();
-        params.record(0, ParamAction::Seal(searchable.clone())).unwrap();
+        params
+            .record(0, ParamAction::Seal { transform: searchable.clone(), row: RowKeySource::None })
+            .unwrap();
         // The same action for the same placeholder is one transform, not two.
-        params.record(0, ParamAction::Seal(searchable.clone())).unwrap();
+        params
+            .record(0, ParamAction::Seal { transform: searchable.clone(), row: RowKeySource::None })
+            .unwrap();
         assert_eq!(params.iter().count(), 1);
 
         // Seal and blind-index need different bytes on the wire.
@@ -887,7 +912,10 @@ mod tests {
         ));
         // A different transform for the same placeholder is a conflict too.
         assert!(matches!(
-            params.record(0, ParamAction::Seal(transform(false))),
+            params.record(
+                0,
+                ParamAction::Seal { transform: transform(false), row: RowKeySource::None }
+            ),
             Err(Error::ConflictingParameter { placeholder: 1 })
         ));
         assert_eq!(params.iter().count(), 1);
