@@ -255,6 +255,35 @@ fn help_prints_usage_to_stdout_and_exits_zero() {
     }
 }
 
+/// The piped shape the help text's own comment advertises. A consumer that
+/// closes the pipe early is ordinary — `| head`, a `less` the reader quits —
+/// and it must not turn help into a panic on stderr and a non-zero exit.
+///
+/// Driven through a shell so the pipe is a real one with a real early-closing
+/// reader. `head -1` is the reader; the shell reports *its* status, so the
+/// assertion that matters here is the absence of a panic on dbsec's stderr —
+/// `main::tests::a_closed_pipe_makes_help_succeed_rather_than_fail` pins the
+/// exit code deterministically, which a pipe this small cannot.
+#[test]
+fn help_survives_a_reader_that_closes_the_pipe() {
+    let dir = tempfile::tempdir().unwrap();
+    let output = Command::new("sh")
+        .current_dir(dir.path())
+        .arg("-c")
+        .arg(format!("{} --help | head -1", env!("CARGO_BIN_EXE_dbsec")))
+        .output()
+        .expect("sh must be runnable");
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(output.status.code(), Some(0), "stderr: {stderr}");
+    assert!(stdout.contains("usage: dbsec"), "the reader still got its line: {stdout}");
+    assert!(
+        !stderr.contains("panicked") && !stderr.contains("failed printing"),
+        "a closed pipe must not panic: {stderr}"
+    );
+}
+
 /// A mistyped option is refused with the usage line rather than treated as a
 /// config path — on this command line the difference between `--plain-relay`
 /// and a typo is the difference between an intended plaintext relay and an
