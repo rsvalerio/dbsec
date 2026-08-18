@@ -149,6 +149,13 @@ pub struct WriteCatalog {
     /// can be recognised as *possibly* protected even when `search_path` no
     /// longer says which schema it resolves to.
     bare_names: HashSet<String>,
+    /// The tables the *read* path has something to do to, which is a superset
+    /// of `tables`: a mask-only column has no transform, so it is not in the
+    /// write catalog at all, but the mask applied on the way out is the only
+    /// thing protecting it. See [`Self::protects_reads`].
+    read_tables: HashSet<(String, String)>,
+    /// The `bare_names` of `read_tables`.
+    read_bare_names: HashSet<String>,
     on_unprotected: OnUnprotected,
 }
 
@@ -156,8 +163,15 @@ impl WriteCatalog {
     pub fn new(columns: &[ProtectedColumn], on_unprotected: OnUnprotected) -> Self {
         let mut tables: HashMap<_, Columns> = HashMap::new();
         let mut bare_names = HashSet::new();
-        // Mask-only columns have no transform; their writes pass through.
+        let mut read_tables = HashSet::new();
+        let mut read_bare_names = HashSet::new();
         for column in columns {
+            // Every configured column protects the read path somehow: config
+            // validation refuses `transform = "none"` without a mask, so a
+            // column with no transform always carries one.
+            read_bare_names.insert(column.table.clone());
+            read_tables.insert((column.schema.clone(), column.table.clone()));
+            // Mask-only columns have no transform; their writes pass through.
             let Some(transform) = &column.transform else { continue };
             bare_names.insert(column.table.clone());
             tables
@@ -165,7 +179,7 @@ impl WriteCatalog {
                 .or_default()
                 .insert(column.column.clone(), transform.clone());
         }
-        Self { tables, bare_names, on_unprotected }
+        Self { tables, bare_names, read_tables, read_bare_names, on_unprotected }
     }
 
     /// Looks a table up the way Postgres would resolve the SQL name: the last
@@ -173,16 +187,41 @@ impl WriteCatalog {
     /// fall back to `public` — which holds only while the session's
     /// `search_path` does, hence [`QueryRewriter::table`].
     fn table(&self, name: &ObjectName) -> Option<&Columns> {
-        let mut parts = name.0.iter().rev();
-        let table = normalize(parts.next()?);
-        let schema = parts.next().map_or_else(|| "public".to_owned(), normalize);
-        self.tables.get(&(schema, table))
+        self.tables.get(&resolved_name(name)?)
     }
 
     /// Whether an unqualified name matches a protected table in *some* schema.
     fn may_be_protected(&self, name: &ObjectName) -> bool {
         name.0.last().is_some_and(|ident| self.bare_names.contains(&normalize(ident)))
     }
+
+    /// Whether reading this table hands the client something the read path is
+    /// supposed to act on — a transform to open, a mask to apply, or both.
+    ///
+    /// Deliberately *not* [`Self::table`]. That lookup answers "does a write
+    /// here need sealing", and a plaintext write to a mask-only column is
+    /// correct, so the mask-only case is absent from it by design. Reading one
+    /// is the opposite: the value is stored in the clear and the mask is the
+    /// only thing that ever hides it, so a path that streams the stored bytes
+    /// past the read path — `COPY … TO`, in either of its two forms — hands
+    /// the client exactly what the mask exists to withhold.
+    fn protects_reads(&self, name: &ObjectName) -> bool {
+        resolved_name(name).is_some_and(|key| self.read_tables.contains(&key))
+    }
+
+    /// [`Self::may_be_protected`] for the read direction.
+    fn may_protect_reads(&self, name: &ObjectName) -> bool {
+        name.0.last().is_some_and(|ident| self.read_bare_names.contains(&normalize(ident)))
+    }
+}
+
+/// A SQL table name as the catalog keys it: `(schema, table)`, with an
+/// unqualified name resolved against `public`.
+fn resolved_name(name: &ObjectName) -> Option<(String, String)> {
+    let mut parts = name.0.iter().rev();
+    let table = normalize(parts.next()?);
+    let schema = parts.next().map_or_else(|| "public".to_owned(), normalize);
+    Some((schema, table))
 }
 
 /// One SQL identifier as the catalog holds it — folded by the same
@@ -630,6 +669,19 @@ impl QueryRewriter {
         Ok(None)
     }
 
+    /// [`Self::table`] for the read direction: whether reading this table
+    /// streams something the read path is supposed to open or mask. See
+    /// [`WriteCatalog::protects_reads`] for why the two lookups differ.
+    fn reads_protected(&self, name: &ObjectName) -> Result<bool, Rejection> {
+        if self.search_path_trusted || name.0.len() > 1 {
+            return Ok(self.catalog.protects_reads(name));
+        }
+        if self.catalog.may_protect_reads(name) {
+            self.unprotected(&Unprotected::SearchPath(name))?;
+        }
+        Ok(false)
+    }
+
     fn rewrite_sql(&mut self, query: &[u8]) -> Result<SqlOutcome, Error> {
         let Ok(text) = std::str::from_utf8(query) else {
             return self.unprotected_sql(&Unprotected::NonUtf8);
@@ -723,6 +775,14 @@ impl QueryRewriter {
                 // site as the target's own. Dropping it with the `..` left the
                 // comparison relayed verbatim — no rewrite, and no signal.
                 let scope = self.scope(std::iter::once(&*table).chain(from.as_ref()))?;
+                // A join constraint in that FROM resolves against the same
+                // scope the WHERE does, so it is the same rewrite site — and
+                // one only `rewrite_select` used to walk.
+                changed |= self.rewrite_join_conditions(
+                    std::iter::once(&mut *table).chain(from.as_mut()),
+                    &scope,
+                    params,
+                )?;
                 if let Some(selection) = selection {
                     changed |= self.rewrite_predicate(selection, &scope, params)?;
                 }
@@ -756,6 +816,14 @@ impl QueryRewriter {
                     sqlparser::ast::FromTable::WithFromKeyword(tables)
                     | sqlparser::ast::FromTable::WithoutKeyword(tables) => tables,
                 };
+                // Same as the UPDATE arm: a `USING a JOIN b ON …` constraint
+                // resolves against this scope and is as much a rewrite site as
+                // the WHERE.
+                changed |= self.rewrite_join_conditions(
+                    tables.iter_mut().chain(delete.using.iter_mut().flatten()),
+                    &scope,
+                    params,
+                )?;
                 changed |= self.rewrite_derived_tables(
                     tables.iter_mut().chain(delete.using.iter_mut().flatten()),
                     params,
@@ -765,7 +833,20 @@ impl QueryRewriter {
             Statement::Copy { source, to, .. } => {
                 match source {
                     sqlparser::ast::CopySource::Table { table_name, .. } => {
-                        if self.table(table_name)?.is_some() {
+                        // The two directions ask different questions of the
+                        // catalog. `COPY … FROM STDIN` is a write, so what
+                        // matters is whether a value would have needed sealing
+                        // — a plaintext bulk load into a mask-only column is
+                        // correct and must not be refused. `COPY … TO` is a
+                        // read, and its rows leave as `CopyData` frames the
+                        // read path relays verbatim, so a mask-only column
+                        // leaves as the plaintext its mask exists to hide.
+                        let protected = if *to {
+                            self.reads_protected(table_name)?
+                        } else {
+                            self.table(table_name)?.is_some()
+                        };
+                        if protected {
                             self.unprotected(&Unprotected::Copy { table: table_name, to: *to })?;
                         }
                     }
@@ -780,15 +861,33 @@ impl QueryRewriter {
                     // `COPY users TO STDOUT` and relayed
                     // `COPY (SELECT email FROM users) TO STDOUT`.
                     //
-                    // The query is classified, not rewritten. Rewriting it
-                    // would mean re-rendering a `COPY` through sqlparser's
-                    // `Display`, and `COPY ... FROM STDIN` has no wire-valid
-                    // rendering (see [`parse_sql`]) — so a searchable
-                    // predicate inside a COPY query is still left matching
-                    // nothing under `warn`, which is tracked separately.
+                    // The query is classified *and* rewritten. Classified
+                    // first, so `reject` refuses the leak before anything is
+                    // rendered; rewritten second, because under `warn` the
+                    // statement is relayed and its predicates are ordinary
+                    // predicates — a searchable equality left alone compares
+                    // the client's plaintext against the stored
+                    // `blind_index || envelope` and matches no row, which is
+                    // the failure [`Self::rewrite_nested_queries`] documents
+                    // as the unsafe one.
+                    //
+                    // Only the `TO` direction is rewritten, and that is what
+                    // keeps the re-rendering safe: PostgreSQL allows a query
+                    // source only on the way out, so a statement that changes
+                    // here is never a `COPY ... FROM STDIN` — the one COPY
+                    // shape with no wire-valid rendering through sqlparser's
+                    // `Display` (see [`parse_sql`], which parses it only by
+                    // appending a terminator the wire cannot carry). Anything
+                    // not rewritten keeps its original source text verbatim
+                    // ([`reassemble`]), and anything that is rewritten is
+                    // re-parsed and compared before it is sent
+                    // ([`render_validated`]).
                     sqlparser::ast::CopySource::Query(query) => {
                         for table in self.copied_protected_tables(query)? {
                             self.unprotected(&Unprotected::CopyQuery { table })?;
+                        }
+                        if *to {
+                            return self.rewrite_query(query, params);
                         }
                     }
                 }
@@ -1074,14 +1173,7 @@ impl QueryRewriter {
         params: &mut ParamTransforms,
     ) -> Result<bool, Rejection> {
         let scope = self.scope(&select.from)?;
-        let mut changed = false;
-        for table in &mut select.from {
-            for join in &mut table.joins {
-                if let Some(constraint) = join_condition(&mut join.join_operator) {
-                    changed |= self.rewrite_selection(constraint, &scope, params)?;
-                }
-            }
-        }
+        let mut changed = self.rewrite_join_conditions(&mut select.from, &scope, params)?;
         changed |= self.rewrite_derived_tables(&mut select.from, params)?;
         for predicate in [select.selection.as_mut(), select.having.as_mut()].into_iter().flatten() {
             changed |= self.rewrite_predicate(predicate, &scope, params)?;
@@ -1124,12 +1216,63 @@ impl QueryRewriter {
             for factor in std::iter::once(&mut table.relation)
                 .chain(table.joins.iter_mut().map(|join| &mut join.relation))
             {
-                if let TableFactor::Derived { subquery, .. } = factor {
-                    changed |= self.rewrite_query(subquery, params)?;
+                match factor {
+                    TableFactor::Derived { subquery, .. } => {
+                        changed |= self.rewrite_query(subquery, params)?;
+                    }
+                    // A derived table inside a parenthesised join, e.g.
+                    // `FROM (users JOIN (SELECT ... WHERE email = '…') s ON …)`.
+                    // See [`Self::scope_of`] for why the nesting hides it.
+                    TableFactor::NestedJoin { table_with_joins, .. } => {
+                        changed |= self.rewrite_derived_tables(
+                            std::iter::once(&mut **table_with_joins),
+                            params,
+                        )?;
+                    }
+                    _ => {}
                 }
             }
         }
         Ok(changed)
+    }
+
+    /// Rewrites the `ON` conditions of a relation list against the enclosing
+    /// scope, descending into parenthesised joins.
+    ///
+    /// A join constraint over a searchable column is as much a rewrite site as
+    /// a `WHERE` is, and the constraints of a join written as
+    /// `FROM (a JOIN b ON …)` live in the [`TableFactor::NestedJoin`]'s own
+    /// [`TableWithJoins`] — never in the top-level `joins` list a flat pass
+    /// looks at.
+    fn rewrite_join_conditions<'from>(
+        &self,
+        from: impl IntoIterator<Item = &'from mut TableWithJoins>,
+        scope: &TableScope<'_>,
+        params: &mut ParamTransforms,
+    ) -> Result<bool, Rejection> {
+        let mut changed = false;
+        for table in from {
+            changed |= self.rewrite_nested_join(&mut table.relation, scope, params)?;
+            for join in &mut table.joins {
+                changed |= self.rewrite_nested_join(&mut join.relation, scope, params)?;
+                if let Some(constraint) = join_condition(&mut join.join_operator) {
+                    changed |= self.rewrite_selection(constraint, scope, params)?;
+                }
+            }
+        }
+        Ok(changed)
+    }
+
+    /// The [`Self::rewrite_join_conditions`] step for one factor: recurse when
+    /// it is a parenthesised join, and do nothing otherwise.
+    fn rewrite_nested_join(
+        &self,
+        factor: &mut TableFactor,
+        scope: &TableScope<'_>,
+        params: &mut ParamTransforms,
+    ) -> Result<bool, Rejection> {
+        let TableFactor::NestedJoin { table_with_joins, .. } = factor else { return Ok(false) };
+        self.rewrite_join_conditions(std::iter::once(&mut **table_with_joins), scope, params)
     }
 
     /// A predicate owned by a statement or select: rewritten against its own
@@ -1265,19 +1408,50 @@ impl QueryRewriter {
     ) -> Result<TableScope<'_>, Rejection> {
         let mut tables = Vec::new();
         for table_with_joins in from {
-            let factors = std::iter::once(&table_with_joins.relation)
-                .chain(table_with_joins.joins.iter().map(|join| &join.relation));
-            for factor in factors {
-                let TableFactor::Table { name, alias, .. } = factor else { continue };
-                let Some(columns) = self.table(name)? else { continue };
-                tables.push(ScopedTable {
-                    alias: alias.as_ref().map(|alias| normalize(&alias.name)),
-                    name: name.0.iter().map(normalize).collect(),
-                    columns,
-                });
-            }
+            self.scope_of(table_with_joins, &mut tables)?;
         }
         Ok(TableScope { tables })
+    }
+
+    /// Adds one relation and its joins to a scope, descending into the
+    /// parenthesised joins sqlparser keeps as [`TableFactor::NestedJoin`].
+    ///
+    /// `FROM (users JOIN orders ON orders.id = users.id)` parses as a single
+    /// `NestedJoin` holding the whole join rather than as two `Table` factors,
+    /// so a walk that stops at the top level finds no table at all: every
+    /// protected table inside the parentheses drops out of the scope, and a
+    /// predicate over one is neither rewritten into an index match nor raised
+    /// as an [`Unprotected`] site — so `reject` relayed it verbatim and the
+    /// comparison matched no row. The parentheses only group the join; the
+    /// names inside them are in scope for the enclosing query exactly as they
+    /// would be without them, which is why the nesting is flattened away here.
+    fn scope_of<'a>(
+        &'a self,
+        table_with_joins: &TableWithJoins,
+        tables: &mut Vec<ScopedTable<'a>>,
+    ) -> Result<(), Rejection> {
+        let factors = std::iter::once(&table_with_joins.relation)
+            .chain(table_with_joins.joins.iter().map(|join| &join.relation));
+        for factor in factors {
+            match factor {
+                TableFactor::Table { name, alias, .. } => {
+                    let Some(columns) = self.table(name)? else { continue };
+                    tables.push(ScopedTable {
+                        alias: alias.as_ref().map(|alias| normalize(&alias.name)),
+                        name: name.0.iter().map(normalize).collect(),
+                        columns,
+                    });
+                }
+                TableFactor::NestedJoin { table_with_joins, .. } => {
+                    self.scope_of(table_with_joins, tables)?;
+                }
+                // A derived table brings its own scope, and a set-returning
+                // function, `UNNEST` or `JSON_TABLE` names no base table the
+                // catalog could resolve.
+                _ => {}
+            }
+        }
+        Ok(())
     }
 
     /// Every protected table a `COPY (query) TO STDOUT` would read, gathered
@@ -1293,11 +1467,13 @@ impl QueryRewriter {
     /// is also what the table-form `COPY t TO STDOUT` already does, so the two
     /// forms of one statement now behave alike.
     ///
-    /// This walk recognises two table shapes [`Self::scope`] does not — a
-    /// parenthesised join and the `PIVOT`/`UNPIVOT`/`MATCH_RECOGNIZE` wrappers
-    /// — because the consequence of missing one differs. There, a missed table
-    /// leaves a predicate unrewritten, which the client sees as an empty
-    /// result; here it hands the client a protected column's stored bytes.
+    /// This walk recognises one table shape [`Self::scope`] does not — the
+    /// `PIVOT`/`UNPIVOT`/`MATCH_RECOGNIZE` wrappers — because the consequence
+    /// of missing one differs. There, a missed table leaves a predicate
+    /// unrewritten, which the client sees as an empty result; here it hands
+    /// the client a protected column's stored bytes. (The parenthesised join
+    /// used to be the second such shape; [`Self::scope_of`] descends into it
+    /// now, since the empty result it caused was no safer.)
     fn copied_protected_tables(&self, query: &Query) -> Result<Vec<String>, Rejection> {
         let mut found = Vec::new();
         self.collect_copied_tables(query, &mut found)?;
@@ -1391,7 +1567,10 @@ impl QueryRewriter {
         name: &ObjectName,
         found: &mut Vec<String>,
     ) -> Result<(), Rejection> {
-        if self.table(name)?.is_none() {
+        // The read-direction lookup: a query source only exists in the `TO`
+        // direction, and a mask-only table read this way streams the plaintext
+        // its mask exists to hide. See [`WriteCatalog::protects_reads`].
+        if !self.reads_protected(name)? {
             return Ok(());
         }
         let name = name.to_string();
@@ -2836,6 +3015,11 @@ enum Unprotected<'a> {
     /// `INSERT ... SELECT`: the values are rows, not literals.
     InsertFromSelect(&'a ObjectName),
     /// `COPY`, whose payload is a `CopyData` stream the proxy does not parse.
+    ///
+    /// The `to` direction fires for anything the read path protects, the
+    /// `from` direction only for what the write path would have sealed — see
+    /// [`WriteCatalog::protects_reads`] for why a mask-only table belongs in
+    /// the first set and not the second.
     Copy { table: &'a ObjectName, to: bool },
     /// `COPY (query) TO STDOUT` over a protected table. Kept apart from
     /// [`Self::Copy`] because the remedy differs — there is no table to bulk
@@ -2882,9 +3066,11 @@ enum Unprotected<'a> {
 
 impl Unprotected<'_> {
     /// Emits the site's warning. The wording of the six original passthrough
-    /// sites is unchanged so log-based alerting keeps matching; only the
-    /// fields that carried plaintext (the bound expression, the parser's
-    /// message) are gone, replaced by the shape and the parser error kind.
+    /// sites is kept prefix-compatible so log-based alerting keeps matching;
+    /// only the fields that carried plaintext (the bound expression, the
+    /// parser's message) are gone, replaced by the shape and the parser error
+    /// kind. [`Self::Copy`] gained "or masked" once it started firing for
+    /// mask-only tables, which carry no encryption to be bypassed.
     fn warn(&self) {
         match self {
             Self::NonUtf8 => {
@@ -2907,7 +3093,7 @@ impl Unprotected<'_> {
             Self::Copy { table, to } => tracing::warn!(
                 table = %table,
                 direction = if *to { "to" } else { "from" },
-                "COPY on a protected table is not encrypted by the proxy"
+                "COPY on a protected table is not encrypted or masked by the proxy"
             ),
             Self::CopyQuery { table } => tracing::warn!(
                 table,
@@ -2991,7 +3177,7 @@ impl Unprotected<'_> {
                 format!("INSERT ... SELECT into protected table {table} cannot be encrypted")
             }
             Self::Copy { table, to } => format!(
-                "COPY {} protected table {table} bypasses the proxy's encryption",
+                "COPY {} protected table {table} bypasses the proxy's encryption and masking",
                 if *to { "from" } else { "into" }
             ),
             Self::CopyQuery { table } => format!(
@@ -3165,6 +3351,28 @@ mod tests {
         accounts.table = "accounts".into();
         let users = column("email", transform(true), true);
         Arc::new(WriteCatalog::new(&[users, accounts], on_unprotected))
+    }
+
+    /// A table whose only protection is a read-path mask. Its column has no
+    /// transform, so nothing on the write path seals it and its stored form is
+    /// the plaintext — the mask applied on the way out is all that hides it.
+    fn mask_only_catalog(on_unprotected: OnUnprotected) -> Arc<WriteCatalog> {
+        Arc::new(WriteCatalog::new(
+            &[ProtectedColumn {
+                schema: "public".into(),
+                table: "notes".into(),
+                column: "body".into(),
+                transform: None,
+                searchable: false,
+                readable: false,
+                mask: Some(dbsec_core::mask::MaskSpec {
+                    keep_first: 1,
+                    keep_last: 0,
+                    mask_with: '*',
+                }),
+            }],
+            on_unprotected,
+        ))
     }
 
     fn strict_catalog(searchable: bool) -> Arc<WriteCatalog> {
@@ -3532,6 +3740,65 @@ mod tests {
         .expect("rewritten");
         assert!(!sql.contains("bob@x.io") && !sql.contains("c@y.io"), "{sql}");
         assert_eq!(sql.matches("SUBSTRING(u.email FROM 1 FOR 32)").count(), 2, "{sql}");
+    }
+
+    /// A parenthesised join is one `TableFactor::NestedJoin` holding the whole
+    /// join, not the two `Table` factors the same query has without the
+    /// parentheses. The scope walk stopped at the top level, so every
+    /// protected table inside them was invisible: the equality was relayed
+    /// comparing the client's plaintext against the stored
+    /// `blind_index || envelope`, which matches no row and reads as "no such
+    /// user" — reached by adding one pair of parentheses.
+    #[test]
+    fn a_parenthesized_join_puts_its_protected_tables_in_scope() {
+        use crate::rows::tests::INDEX_KEY;
+
+        let mut rewriter = rewriter(catalog(true));
+        let expected = blind_index::compute(&INDEX_KEY, b"alice@example.com");
+
+        for sql in [
+            // The enclosing predicate.
+            "SELECT 1 FROM (users JOIN orders ON orders.id = users.id) \
+             WHERE users.email = 'alice@example.com'",
+            // A join constraint *inside* the parentheses.
+            "SELECT 1 FROM (orders JOIN users ON users.email = 'alice@example.com')",
+            // A derived table nested inside them, with its own predicate.
+            "SELECT 1 FROM (orders JOIN (SELECT id FROM users WHERE \
+             email = 'alice@example.com') s ON s.id = orders.id)",
+            // Nested twice over, and reached through an UPDATE's FROM rather
+            // than a SELECT's.
+            "UPDATE orders SET total = 1 FROM ((users JOIN accounts ON accounts.id = users.id)) \
+             WHERE users.email = 'alice@example.com'",
+        ] {
+            let rewritten = rewritten_query(&mut rewriter, sql).unwrap_or_else(|| {
+                panic!("relayed verbatim instead of rewritten: {sql}");
+            });
+            assert!(!rewritten.contains("alice@example.com"), "{sql}: {rewritten}");
+            assert!(rewritten.contains(&sealed_literal(&expected)), "{sql}: {rewritten}");
+        }
+    }
+
+    /// The other half of the same gap: a shape no blind index can answer, over
+    /// a table only the parenthesised join brings into scope, has to reach
+    /// [`QueryRewriter::unprotected`] — otherwise `reject` does not fail closed
+    /// for this syntax and the comparison is relayed to match nothing.
+    #[test]
+    fn an_unrewritable_predicate_inside_a_parenthesized_join_is_refused() {
+        let mut strict = rewriter(strict_catalog(true));
+        for sql in [
+            "SELECT 1 FROM (users JOIN orders ON orders.id = users.id) \
+             WHERE users.email LIKE 'a%'",
+            "SELECT 1 FROM (orders JOIN users ON users.email > 'a')",
+            "SELECT 1 FROM (orders JOIN (SELECT id FROM users WHERE email LIKE 'a%') s \
+             ON s.id = orders.id)",
+        ] {
+            let action = strict.on_frame(b'Q', &query_frame(sql)).unwrap();
+            assert!(
+                refusal(&action).contains("searchable column email"),
+                "{sql}: {}",
+                refusal(&action)
+            );
+        }
     }
 
     #[test]
@@ -4209,6 +4476,133 @@ mod tests {
             assert!(event.contains("read path cannot decrypt or mask"), "{event}");
             assert!(event.contains("users"), "{event}");
         }
+    }
+
+    /// A table protected only by a read-path mask never enters
+    /// [`WriteCatalog`]: a mask-only column has no transform, and that catalog
+    /// exists to say what a *write* must seal. Right for writes, and exactly
+    /// wrong for `COPY … TO`, whose rows leave as `CopyData` frames the read
+    /// path relays verbatim — the stored value *is* the plaintext, so the
+    /// statement hands the client the very value the mask exists to hide.
+    /// This is the sharpest form of the COPY leak: an encrypted column at
+    /// least leaves as ciphertext.
+    #[test]
+    fn a_mask_only_table_is_a_copy_out_site_in_both_forms_and_both_modes() {
+        use tracing_subscriber::layer::SubscriberExt as _;
+
+        let out = ["COPY notes TO STDOUT", "COPY (SELECT body FROM notes) TO STDOUT"];
+
+        let mut strict = rewriter(mask_only_catalog(OnUnprotected::Reject));
+        for sql in out {
+            let action = strict.on_frame(b'Q', &query_frame(sql)).unwrap();
+            assert!(refusal(&action).contains("notes"), "{sql}: {}", refusal(&action));
+        }
+
+        // The write direction is deliberately not a site. A mask-only column
+        // is stored in plaintext, so a plaintext write to it is the correct
+        // outcome — flagging one would be a false refusal, which is what keeps
+        // operators off the fail-closed setting.
+        for sql in [
+            "COPY notes FROM STDIN",
+            "COPY notes (body) FROM STDIN",
+            "INSERT INTO notes (body) VALUES ('plaintext')",
+            "UPDATE notes SET body = 'plaintext' WHERE body = 'x'",
+        ] {
+            assert!(
+                matches!(strict.on_frame(b'Q', &query_frame(sql)).unwrap(), FrameAction::Relay),
+                "{sql}"
+            );
+        }
+
+        // Under warn the reads relay with one warning each, naming the table,
+        // and the write stays silent.
+        let _capture = crate::log_capture();
+        let captured = CapturedEvents::default();
+        let subscriber = tracing_subscriber::registry().with(captured.clone());
+        tracing::subscriber::with_default(subscriber, || {
+            let mut permissive = rewriter(mask_only_catalog(OnUnprotected::Warn));
+            for sql in out.iter().chain(&["COPY notes FROM STDIN"]) {
+                assert!(
+                    matches!(
+                        permissive.on_frame(b'Q', &query_frame(sql)).unwrap(),
+                        FrameAction::Relay
+                    ),
+                    "{sql}"
+                );
+            }
+        });
+
+        let events = captured.0.lock().expect("captured events");
+        assert_eq!(events.len(), out.len(), "one warning per read, none for the write: {events:?}");
+        for event in events.iter() {
+            assert!(event.contains("notes"), "{event}");
+        }
+    }
+
+    /// A searchable predicate inside `COPY (query) TO STDOUT` is an ordinary
+    /// predicate: left alone it compares the client's plaintext against the
+    /// stored `blind_index || envelope`, matching no row — and "no rows" is
+    /// indistinguishable from "no such user". Under `reject` the leak site
+    /// refuses the statement before anything is rendered; under `warn` it
+    /// relays, so the predicate has to be rewritten for the relayed text to
+    /// mean what the client wrote.
+    #[test]
+    fn a_searchable_predicate_inside_a_copy_query_is_rewritten_or_reported() {
+        use crate::rows::tests::INDEX_KEY;
+
+        let sql = "COPY (SELECT id FROM users WHERE email = 'alice@example.com') TO STDOUT";
+
+        let mut strict = rewriter(strict_catalog(true));
+        let action = strict.on_frame(b'Q', &query_frame(sql)).unwrap();
+        assert!(refusal(&action).contains("protected table users"), "{}", refusal(&action));
+
+        let _capture = crate::log_capture();
+        let mut permissive = rewriter(catalog(true));
+        let rewritten = rewritten_query(&mut permissive, sql).expect("rewritten");
+        let expected = blind_index::compute(&INDEX_KEY, b"alice@example.com");
+        assert!(!rewritten.contains("alice@example.com"), "{rewritten}");
+        assert!(rewritten.contains("SUBSTRING(email FROM 1 FOR 32)"), "{rewritten}");
+        assert!(rewritten.contains(&sealed_literal(&expected)), "{rewritten}");
+        assert!(
+            rewritten.starts_with("COPY (") && rewritten.ends_with(") TO STDOUT"),
+            "still a COPY: {rewritten}"
+        );
+
+        // A predicate the blind index cannot answer, in a subquery the
+        // leak-site walk does not reach, is raised as its own site instead of
+        // being relayed to match nothing.
+        let mut strict = rewriter(strict_catalog(true));
+        let action = strict
+            .on_frame(
+                b'Q',
+                &query_frame(
+                    "COPY (SELECT id FROM other WHERE id IN \
+                     (SELECT id FROM users WHERE email LIKE 'a%')) TO STDOUT",
+                ),
+            )
+            .unwrap();
+        assert!(refusal(&action).contains("searchable column email"), "{}", refusal(&action));
+
+        // `COPY ... FROM STDIN` is never re-rendered: only the `TO` direction
+        // has a query source to rewrite, so nothing marks it changed and
+        // `reassemble` keeps its source text byte for byte — including when a
+        // statement beside it in the same batch *is* rewritten. Re-rendering
+        // it would drop it back to text the wire has no form for.
+        let mut permissive = rewriter(catalog(true));
+        assert!(
+            matches!(
+                permissive.on_frame(b'Q', &query_frame("COPY users (email) FROM STDIN")).unwrap(),
+                FrameAction::Relay
+            ),
+            "COPY FROM STDIN relayed verbatim"
+        );
+        let batch = rewritten_query(
+            &mut permissive,
+            "UPDATE users SET email = 'bob@x.io'; COPY users (email) FROM STDIN",
+        )
+        .expect("rewritten");
+        assert!(batch.ends_with("COPY users (email) FROM STDIN"), "{batch}");
+        assert!(!batch.contains("bob@x.io"), "{batch}");
     }
 
     /// A refusal inside a transaction reports the aborted state, so the
@@ -5367,11 +5761,28 @@ mod tests {
             assert!(rewritten.contains("FROM 1 FOR 32"), "{rewritten}");
         }
 
+        // A join constraint inside that FROM/USING resolves against the same
+        // scope the WHERE does, so it is the same rewrite site — and only
+        // `rewrite_select` used to walk one, so these two left it comparing
+        // plaintext against the stored form.
+        for sql in [
+            "DELETE FROM sessions USING accounts JOIN users ON users.email = 'a@b.io'",
+            "UPDATE sessions SET valid = false FROM accounts JOIN users \
+             ON users.email = 'a@b.io'",
+        ] {
+            let mut permissive = rewriter(catalog(true));
+            let rewritten =
+                rewritten_query(&mut permissive, sql).unwrap_or_else(|| panic!("{sql}"));
+            assert!(!rewritten.contains("a@b.io"), "{rewritten}");
+            assert!(rewritten.contains("FROM 1 FOR 32"), "{rewritten}");
+        }
+
         // The inversion is the dangerous half and no index can answer it, so
         // it has to reach the gate rather than delete the table.
         for sql in [
             "DELETE FROM sessions USING users WHERE users.email <> 'a@b.io'",
             "UPDATE sessions SET valid = false FROM users WHERE users.email LIKE 'a%'",
+            "DELETE FROM sessions USING accounts JOIN users ON users.email LIKE 'a%'",
         ] {
             let mut strict = rewriter(strict_catalog(true));
             let action = strict.on_frame(b'Q', &query_frame(sql)).unwrap();
