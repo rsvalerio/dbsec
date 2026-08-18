@@ -976,10 +976,17 @@ mod tests {
 
     /// The migrated key stays readable at the old path too, so the operator
     /// who has to retire it must be able to see which names moved.
+    ///
+    /// The capture guard is deliberately held across the `await`: the window
+    /// this test must have to itself is exactly the one in which the
+    /// subscriber is installed, and the work it is capturing happens inside
+    /// it. See [`crate::LOG_CAPTURE`].
+    #[allow(clippy::await_holding_lock)]
     #[tokio::test]
     async fn migrating_out_of_the_shared_map_warns_and_names_the_key() {
         use tracing_subscriber::layer::SubscriberExt as _;
 
+        let _capture = crate::log_capture();
         let store = FakeStore::default();
         *store.legacy.lock().expect("lock") =
             Some(HashMap::from([(NAME.to_owned(), hex::encode(STORED))]));
