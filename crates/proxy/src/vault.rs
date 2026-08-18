@@ -980,7 +980,7 @@ mod tests {
     /// The capture guard is deliberately held across the `await`: the window
     /// this test must have to itself is exactly the one in which the
     /// subscriber is installed, and the work it is capturing happens inside
-    /// it. See [`crate::LOG_CAPTURE`].
+    /// it. See [`crate::log_capture`].
     #[allow(clippy::await_holding_lock)]
     #[tokio::test]
     async fn migrating_out_of_the_shared_map_warns_and_names_the_key() {
