@@ -46,6 +46,11 @@ rustls-pki-types = "1"
 # kms
 vaultrs = "0.7"
 base64 = "0.22"
+# `[vault] addr` is parsed before it reaches vaultrs, whose own address setter
+# is documented "# Panics" and does `Url::parse(..).unwrap()`. Same crate and
+# same version vaultrs itself resolves, so the two agree on what a valid Vault
+# address is by construction rather than by imitation.
+url = "2"
 
 # process hardening (unix only): `RLIMIT_CORE` and `prctl(PR_SET_DUMPABLE)`.
 # rustix rather than libc because the workspace forbids `unsafe_code` — these

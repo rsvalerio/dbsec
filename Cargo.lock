@@ -411,6 +411,7 @@ dependencies = [
  "toml",
  "tracing",
  "tracing-subscriber",
+ "url",
  "vaultrs",
  "zeroize",
 ]

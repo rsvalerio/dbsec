@@ -20,6 +20,7 @@ tokio-postgres = { workspace = true }
 tokio-postgres-rustls = { workspace = true }
 sqlparser = { workspace = true }
 vaultrs = { workspace = true }
+url = { workspace = true }
 base64 = { workspace = true }
 rand = { workspace = true }
 zeroize = { workspace = true }
