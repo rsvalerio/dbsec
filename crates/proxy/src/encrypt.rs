@@ -4351,7 +4351,11 @@ mod tests {
         let mut permissive = rewriter(catalog(false));
         let rewritten = rewritten_query(&mut permissive, sql).expect("rewritten");
         assert!(!rewritten.contains("a@b.io"), "{rewritten}");
-        assert_eq!(rewritten.matches("'\\x").count(), 1, "only the VALUES literal: {rewritten}");
+        assert_eq!(
+            rewritten.matches(SEALED_PREFIX).count(),
+            1,
+            "only the VALUES literal: {rewritten}"
+        );
         assert!(rewritten.contains("EXCLUDED.email"), "{rewritten}");
 
         let mut strict = rewriter(strict_catalog(false));
