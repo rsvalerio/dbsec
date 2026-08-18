@@ -24,9 +24,10 @@ column: it would take a plaintext write, a searchable predicate would match
 nothing, or a read would hand back the stored form. The sites are non-UTF-8 and
 unparseable SQL, `INSERT` without a column list, `INSERT ... SELECT`, `COPY`,
 `MERGE`, `PREPARE` of a write, a non-literal expression assigned to a protected
-column, an unqualified name under a changed `search_path`, a predicate over a
-searchable column that no blind-index match can express, and a protected column
-projected through an expression — `email::text`, `ccnum || ''`,
+column, an unqualified name under a changed `search_path`, a session that turned
+`standard_conforming_strings` off, a predicate over a searchable column that no
+blind-index match can express, and a protected column projected through an
+expression — `email::text`, `ccnum || ''`,
 `coalesce(email, '')` — whose result PostgreSQL describes with no table
 identity, so the read path cannot decrypt or mask it.
 
@@ -44,9 +45,25 @@ Run on `warn`, collect the warnings, fix them, then switch.
 **`search_path`** — a `[[column]]` entry without a schema means `public`, and
 the write path resolves an unqualified SQL name the same way. A session that
 points `search_path` elsewhere breaks that equivalence in both directions, so
-the proxy watches the startup packet and `SET search_path` and stops resolving
-bare names once the default no longer holds (an `on_unprotected` site).
-Schema-qualifying either the config or the SQL avoids the question entirely.
+the proxy watches the startup packet and every spelling that moves the setting —
+`SET search_path`, `SET SCHEMA`, `set_config('search_path', …)` — and stops
+resolving bare names once the default no longer holds (an `on_unprotected`
+site). Schema-qualifying either the config or the SQL avoids the question
+entirely.
+
+**`standard_conforming_strings`** — the proxy assumes the default, `on`, in
+which a backslash in an ordinary string literal is just a backslash. Sealed
+values go out as `E'\\x…'` so they mean the same bytes either way, but a
+session that turns the setting off makes the server read the *client's* own
+literals differently from the proxy's parser, so the change is an
+`on_unprotected` site.
+
+**Identifier names** — a `[[column]]` name is the name the catalog holds. SQL
+identifiers are folded the way PostgreSQL folds them before they are compared
+against it: unquoted names are downcased ASCII-only (a multibyte character is
+left exactly as written), and every name is clipped to 63 bytes. A configured
+name longer than that is refused at startup, and one that is not itself in
+folded form warns — only a double-quoted SQL reference will ever match it.
 
 **`column_refresh_secs`** — how often the `[[column]]` list is re-resolved to
 `(table oid, attnum)`. The read path matches result columns on those; the write

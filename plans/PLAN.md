@@ -62,8 +62,9 @@ Two kinds of failure, and they fail in opposite directions:
   would match nothing): non-UTF-8 or unparseable SQL, `INSERT` without a column list,
   `INSERT ... SELECT`, `COPY`, `MERGE`, `PREPARE` of a write, a non-literal expression
   assigned to a protected column, an unqualified name in a session that moved
-  `search_path`, and a predicate over a searchable column that no blind-index match can
-  express. `on_unprotected = "warn"` (the default) logs and relays; `on_unprotected =
+  `search_path`, a session that turned `standard_conforming_strings` off, and a predicate
+  over a searchable column that no blind-index match can express. `on_unprotected =
+  "warn"` (the default) logs and relays; `on_unprotected =
   "reject"` answers the client with a PostgreSQL ErrorResponse and never forwards the
   statement. The refusal is statement-level — the connection stays open and the session
   recovers at the next `ReadyForQuery` — because the statement never reached the backend.
@@ -169,9 +170,21 @@ TLS: `MaybeTls` stream enum both hops. Downstream handles `SSLRequest` from clie
   can miss the catalog (plaintext at rest) or match the wrong table (sealed for a table
   the read path, which resolves by OID, never looks at, so it reads back as ciphertext
   forever). The proxy therefore watches the startup packet's `search_path`/`options`
-  parameters and `SET search_path`, and once the default no longer holds it stops
-  resolving unqualified names at all; that is an `on_unprotected` site too. Qualifying
-  either the config or the SQL removes the question.
+  parameters and every spelling that moves the setting in-session — `SET search_path`,
+  `SET SCHEMA`, `set_config('search_path', …)`, read from the SQL token stream because
+  two of the three are invisible in the parsed statement — and once the default no longer
+  holds it stops resolving unqualified names at all; that is an `on_unprotected` site
+  too. Qualifying either the config or the SQL removes the question.
+- **Sealed literals assume nothing about `standard_conforming_strings`.** They go out as
+  `E'\\x…'`, whose backslash handling does not depend on the setting, rather than the
+  plain `'\x…'` that reads as `bytea` hex input only while it is on. The proxy still
+  reports a session that turns it off as an `on_unprotected` site: from that point the
+  server reads the *client's* own string literals differently from the proxy's parser.
+- **Identifiers are folded the way PostgreSQL folds them.** Unquoted names are downcased
+  ASCII-only — Rust's `to_lowercase` would fold `Ä` and the Kelvin sign, where the server
+  leaves every multibyte character alone — and every name is clipped to 63 bytes
+  (`NAMEDATALEN - 1`). One function does it for both the write path's SQL identifiers and
+  the configured `[[column]]` names, so the two sides of a name comparison cannot drift.
 - **Ciphertext relocation is detected across columns, not across rows.** The envelope AAD
   binds `schema.table.column`, so pasting a stored value into a different column or table
   fails authentication; pasting it into the *same* column of another row does not. Binding
