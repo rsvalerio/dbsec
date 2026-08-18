@@ -66,11 +66,19 @@ proptest! {
         let mut ct = envelope::encrypt(&key, &[1u8; KEY_ID_LEN], &test_context(), &plaintext).unwrap();
         let pos = pos.index(ct.len());
         ct[pos] ^= flip;
-        // Corrupting the magic makes it non-enveloped; anything else must
-        // fail authentication (key id is bound as AAD, nonce feeds the tag).
+        // Which error comes back is decided by whether the corruption left
+        // something still shaped like an envelope, not by where it landed.
+        // The magic is no longer one value: `DBS1` and `DBS2` are both
+        // recognised, and they differ in one bit of the version byte, so a
+        // flip inside the magic can still yield an envelope — a `DBS2` header
+        // relabelled `DBS1`, which then fails authentication rather than
+        // parsing as garbage. That is the intended behaviour: the tag was
+        // computed over the context AAD, so verifying it under the key id
+        // alone cannot succeed, and the relabelling downgrades nothing.
+        let still_an_envelope = envelope::is_enveloped(&ct);
         match envelope::decrypt(&key, &test_context(), &ct) {
-            Err(Error::Malformed) => prop_assert!(pos < envelope::MAGIC.len()),
-            Err(Error::Decrypt) => prop_assert!(pos >= envelope::MAGIC.len()),
+            Err(Error::Malformed) => prop_assert!(!still_an_envelope),
+            Err(Error::Decrypt) => prop_assert!(still_an_envelope),
             Ok(_) => prop_assert!(false, "tampered ciphertext decrypted"),
             Err(e) => prop_assert!(false, "unexpected error: {e}"),
         }
