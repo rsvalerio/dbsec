@@ -9,6 +9,7 @@ mod encrypt;
 mod hardening;
 mod portal;
 mod resolve;
+mod rowkey;
 mod rows;
 mod session;
 mod tls;
@@ -186,6 +187,11 @@ pub enum Error {
     UpstreamTlsRefused { addr: String },
     #[error("invalid config: {0}")]
     InvalidConfig(String),
+    /// A declared row key could not be canonicalised, so nothing can be bound
+    /// to the row it names. Kept apart from a decryption failure: the value is
+    /// intact, the proxy just cannot say which row it belongs to.
+    #[error("row key cannot be canonicalised: {0}")]
+    RowKeyType(String),
     #[error("binding listen address {addr}: {source}")]
     Listen {
         addr: String,
@@ -470,14 +476,16 @@ async fn serve(validated: ValidatedConfig) -> Result<(), Error> {
                 }
             };
             let columns = Arc::new(columns::build(&config, &keys));
+            let row_keys = Arc::new(columns::row_keys(&config));
             let dsn = protected.control_dsn.clone();
-            let resolved = resolve::resolve_columns(&dsn, &tls, &columns, CONNECT_TIMEOUT).await?;
+            let resolved =
+                resolve::resolve_columns(&dsn, &tls, &columns, &row_keys, CONNECT_TIMEOUT).await?;
             let rows = Arc::new(RowContext::new(
                 resolved,
                 config.on_unprotected,
                 config.max_protected_value_bytes,
             ));
-            refresh = Some((rows.clone(), dsn, columns.clone()));
+            refresh = Some((rows.clone(), dsn, columns.clone(), row_keys.clone()));
             (
                 Some(rows),
                 Some(Arc::new(encrypt::WriteCatalog::new(&columns, config.on_unprotected))),
@@ -514,13 +522,14 @@ async fn serve(validated: ValidatedConfig) -> Result<(), Error> {
     // shutdown can wait for them instead of dropping the runtime out from
     // under a half-written frame (CONC-6).
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
-    let refresher = refresh.map(|(rows, dsn, columns)| {
+    let refresher = refresh.map(|(rows, dsn, columns, row_keys)| {
         tokio::spawn(resolve::refresh_loop(
             resolve::Refresher {
                 ctx: rows,
                 dsn,
                 tls,
                 columns,
+                row_keys,
                 interval: Duration::from_secs(config.column_refresh_secs),
                 deadline: CONNECT_TIMEOUT,
             },

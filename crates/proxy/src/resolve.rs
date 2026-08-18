@@ -28,13 +28,14 @@ use tokio_postgres::tls::{MakeTlsConnect, TlsConnect};
 use tokio_postgres::Socket;
 
 use crate::columns::ProtectedColumn;
+use crate::columns::RowKeyDecl;
 use crate::config::Dsn;
-use crate::rows::{ColumnMap, ReadColumn, Resolved, RowContext};
+use crate::rows::{ColumnMap, ReadColumn, Resolved, ResolvedRowKey, RowContext};
 use crate::tls::TlsContext;
 use crate::Error;
 
 const LOOKUP: &str = "\
-SELECT a.attrelid, a.attnum
+SELECT a.attrelid, a.attnum, a.atttypid
 FROM pg_catalog.pg_attribute a
 JOIN pg_catalog.pg_class c ON c.oid = a.attrelid
 JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
@@ -47,6 +48,9 @@ pub struct Refresher {
     pub dsn: Dsn,
     pub tls: Arc<TlsContext>,
     pub columns: Arc<Vec<ProtectedColumn>>,
+    /// The declared row keys, resolved alongside the columns so a migration
+    /// that moves the key column is picked up by the same refresh.
+    pub row_keys: Arc<Vec<RowKeyDecl>>,
     /// Zero disables the timer, leaving only the on-demand path.
     pub interval: Duration,
     /// The same per-step network deadline startup resolution uses.
@@ -62,7 +66,7 @@ pub struct Refresher {
 /// Returns when `shutdown` fires. `interval` of zero disables the timer, which
 /// leaves only the on-demand path.
 pub async fn refresh_loop(refresher: Refresher, mut shutdown: crate::session::ShutdownRx) {
-    let Refresher { ctx, dsn, tls, columns, interval, deadline } = refresher;
+    let Refresher { ctx, dsn, tls, columns, row_keys, interval, deadline } = refresher;
     loop {
         let tick = async {
             if interval.is_zero() {
@@ -76,7 +80,7 @@ pub async fn refresh_loop(refresher: Refresher, mut shutdown: crate::session::Sh
             () = ctx.refresh_requested() => {}
             _ = shutdown.changed() => return,
         }
-        match resolve_columns(&dsn, &tls, &columns, deadline).await {
+        match resolve_columns(&dsn, &tls, &columns, &row_keys, deadline).await {
             Ok(resolved) => {
                 report_drift(&ctx.resolved(), &resolved);
                 ctx.publish(resolved);
@@ -121,6 +125,7 @@ pub async fn resolve_columns(
     dsn: &Dsn,
     tls: &TlsContext,
     columns: &[ProtectedColumn],
+    row_keys: &[RowKeyDecl],
     deadline: Duration,
 ) -> Result<Resolved, Error> {
     let client = connect(dsn, tls, deadline).await?;
@@ -163,9 +168,55 @@ pub async fn resolve_columns(
             map.insert((table_oid, attnum), read);
         }
     }
+    let mut resolved_row_keys = std::collections::HashMap::new();
+    for decl in row_keys {
+        let row = timeout(
+            deadline,
+            client.query_opt(
+                LOOKUP,
+                &[&decl.schema.as_str(), &decl.table.as_str(), &decl.column.as_str()],
+            ),
+        )
+        .await
+        .map_err(|_| Error::ControlTimeout { host: control_host(dsn.as_str()), timeout: deadline })?
+        .map_err(|source| Error::Control { host: control_host(dsn.as_str()), source })?
+        .ok_or_else(|| Error::ColumnNotFound {
+            table: format!("{}.{}", decl.schema, decl.table),
+            column: decl.column.clone(),
+        })?;
+        let table_oid: u32 = row.get(0);
+        let attnum: i16 = row.get(1);
+        let type_oid: u32 = row.get(2);
+        // Refused here rather than per row on the data path: the operator
+        // learns at startup that this column cannot be a row key, instead of
+        // every protected read failing later with the same reason.
+        if !crate::rowkey::supported(type_oid) {
+            return Err(Error::RowKeyType(format!(
+                "{}.{}.{} has type oid {type_oid}, which cannot be canonicalised as a row key; \
+                 use an integer, text or uuid column",
+                decl.schema, decl.table, decl.column
+            )));
+        }
+        tracing::info!(
+            row_key = %format!("{}.{}.{}", decl.schema, decl.table, decl.column),
+            table_oid,
+            attnum,
+            type_oid,
+            "row key resolved; this table's encrypted values are bound to their row"
+        );
+        resolved_row_keys
+            .insert(table_oid, ResolvedRowKey { attnum, type_oid, name: decl.column.clone() });
+    }
+
     // `generation` is stamped by `RowContext::publish`, which is the only
     // thing that knows which resolution this becomes.
-    Ok(Resolved { columns: map, names, positions, ..Resolved::default() })
+    Ok(Resolved {
+        columns: map,
+        names,
+        positions,
+        row_keys: resolved_row_keys,
+        ..Resolved::default()
+    })
 }
 
 /// What the read path should do with a resolved column, or `None` when it
@@ -290,7 +341,7 @@ mod tests {
         let dsn = Dsn::new(format!("postgres://dbsec:hunter2@127.0.0.1:{}/app", addr.port()));
         let deadline = Duration::from_millis(200);
         let started = std::time::Instant::now();
-        let Err(err) = resolve_columns(&dsn, &tls, &[], deadline).await else {
+        let Err(err) = resolve_columns(&dsn, &tls, &[], &[], deadline).await else {
             panic!("a control endpoint that never answers must not resolve");
         };
 
@@ -382,7 +433,7 @@ mod tests {
         let tls = TlsContext::from_config(&Config::default().validated().unwrap()).unwrap();
         let dsn =
             Dsn::new(format!("host={} user=dbsec password=hunter2 dbname=app", socket.display()));
-        let Err(err) = resolve_columns(&dsn, &tls, &[], Duration::from_secs(5)).await else {
+        let Err(err) = resolve_columns(&dsn, &tls, &[], &[], Duration::from_secs(5)).await else {
             panic!("a control socket that does not exist must not resolve");
         };
 

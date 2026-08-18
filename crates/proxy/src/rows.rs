@@ -147,6 +147,10 @@ pub struct Resolved {
     /// Where each configured column resolved to, by qualified name, so a
     /// re-resolution can name what moved instead of only which OID did.
     pub positions: HashMap<String, (u32, i16)>,
+    /// Each protected table's declared row key, by table OID. Absent means the
+    /// table has no `[[table]] row_key`, which is the default and keeps
+    /// cell-only binding.
+    pub row_keys: HashMap<u32, ResolvedRowKey>,
     /// Which resolution this is, counting from the one built at startup.
     ///
     /// Assigned by [`RowContext::publish`] and ignored on the way in, so a
@@ -154,6 +158,20 @@ pub struct Resolved {
     /// [`Described`] can say which resolution it was computed against — see
     /// [`Described::rederived`].
     pub generation: u64,
+}
+
+/// Where a table's declared row key lives, once resolved against the catalog.
+///
+/// The type OID is carried because a row key has to be canonicalised before it
+/// can be bound, and the wire bytes alone do not say how (see
+/// [`crate::rowkey`]). The name is kept for messages: a refusal that says
+/// which column the client failed to project is actionable, one that says
+/// "attnum 1" is not.
+#[derive(Debug, Clone)]
+pub struct ResolvedRowKey {
+    pub attnum: i16,
+    pub type_oid: u32,
+    pub name: String,
 }
 
 impl Resolved {
