@@ -3,11 +3,11 @@ id: TASK-0132
 title: >-
   A parenthesized (nested) join hides its protected tables from the predicate
   scope
-status: To Do
+status: Done
 assignee:
   - TASK-0139
 created_date: '2026-08-17 20:35'
-updated_date: '2026-08-18 09:59'
+updated_date: '2026-08-18 10:35'
 labels:
   - code-review-rust
   - security
@@ -59,7 +59,13 @@ kind), so it wants its own tests rather than riding another wave's diff.
 
 ## Acceptance Criteria
 <!-- AC:BEGIN -->
-- [ ] #1 A searchable equality over a protected table inside a parenthesized join is rewritten to blind-index form
-- [ ] #2 An unrewritable predicate over such a table routes through the on_unprotected gate instead of being relayed
-- [ ] #3 Tests cover both, including a join constraint and a derived table nested inside the parentheses
+- [x] #1 A searchable equality over a protected table inside a parenthesized join is rewritten to blind-index form
+- [x] #2 An unrewritable predicate over such a table routes through the on_unprotected gate instead of being relayed
+- [x] #3 Tests cover both, including a join constraint and a derived table nested inside the parentheses
 <!-- AC:END -->
+
+## Implementation Notes
+
+<!-- SECTION:NOTES:BEGIN -->
+Fixed in wave TASK-0139. scope() now delegates to scope_of(), which flattens TableFactor::NestedJoin; rewrite_derived_tables recurses into it; a new rewrite_join_conditions() walks join constraints through the nesting and is now also called from the UPDATE and DELETE arms, which had never rewritten a join constraint at all. Tests: a_parenthesized_join_puts_its_protected_tables_in_scope, an_unrewritable_predicate_inside_a_parenthesized_join_is_refused, plus new cases in the_joined_relation_of_update_from_and_delete_using_is_in_scope.
+<!-- SECTION:NOTES:END -->

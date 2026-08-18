@@ -3,11 +3,11 @@ id: TASK-0135
 title: >-
   A searchable predicate inside a COPY (query) TO STDOUT is never rewritten, so
   it silently matches no rows
-status: To Do
+status: Done
 assignee:
   - TASK-0139
 created_date: '2026-08-17 20:58'
-updated_date: '2026-08-18 09:59'
+updated_date: '2026-08-18 10:35'
 labels:
   - code-review-rust
   - correctness
@@ -33,7 +33,13 @@ priority: medium
 
 ## Acceptance Criteria
 <!-- AC:BEGIN -->
-- [ ] #1 A searchable predicate inside a COPY (query) TO STDOUT is either rewritten to an index match or reported as an Unprotected predicate site
-- [ ] #2 The fix does not re-render a COPY ... FROM STDIN into text the wire cannot carry
-- [ ] #3 A test drives COPY (SELECT ... WHERE searchable = 'literal') TO STDOUT in both modes
+- [x] #1 A searchable predicate inside a COPY (query) TO STDOUT is either rewritten to an index match or reported as an Unprotected predicate site
+- [x] #2 The fix does not re-render a COPY ... FROM STDIN into text the wire cannot carry
+- [x] #3 A test drives COPY (SELECT ... WHERE searchable = 'literal') TO STDOUT in both modes
 <!-- AC:END -->
+
+## Implementation Notes
+
+<!-- SECTION:NOTES:BEGIN -->
+Fixed in wave TASK-0139. Decision on the re-rendering question: rewriting is safe and was applied. The COPY arm classifies the source first (so reject still refuses the leak before anything is rendered), then calls rewrite_query on the query source, gated on `to`. A query source only exists in the TO direction, so a statement marked changed here is never COPY ... FROM STDIN — the one shape with no wire-valid Display rendering. Everything else keeps its original source text via reassemble, and anything re-rendered is re-parsed and compared by render_validated. Verified empirically that every COPY (query) TO {STDOUT,PROGRAM,file} form, with modern and legacy options, round-trips through sqlparser 0.53 Display. Test: a_searchable_predicate_inside_a_copy_query_is_rewritten_or_reported (covers both modes, the unindexable-predicate site, and a COPY ... FROM STDIN relayed byte-for-byte beside a rewritten statement).
+<!-- SECTION:NOTES:END -->

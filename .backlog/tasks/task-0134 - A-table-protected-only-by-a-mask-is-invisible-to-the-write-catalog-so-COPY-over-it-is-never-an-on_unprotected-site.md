@@ -3,11 +3,11 @@ id: TASK-0134
 title: >-
   A table protected only by a mask is invisible to the write catalog, so COPY
   over it is never an on_unprotected site
-status: To Do
+status: Done
 assignee:
   - TASK-0139
 created_date: '2026-08-17 20:58'
-updated_date: '2026-08-18 09:59'
+updated_date: '2026-08-18 10:34'
 labels:
   - code-review-rust
   - security
@@ -33,8 +33,14 @@ priority: high
 
 ## Acceptance Criteria
 <!-- AC:BEGIN -->
-- [ ] #1 A table whose only protection is a mask is recognised by the read-direction refusal sites
-- [ ] #2 COPY t TO STDOUT and COPY (SELECT masked FROM t) TO STDOUT are refused under reject and warned about under warn when the only protection is a mask
-- [ ] #3 A plaintext write to a mask-only column is still not flagged, since it is the correct behaviour
-- [ ] #4 A test covers a mask-only table in both COPY forms and in both modes
+- [x] #1 A table whose only protection is a mask is recognised by the read-direction refusal sites
+- [x] #2 COPY t TO STDOUT and COPY (SELECT masked FROM t) TO STDOUT are refused under reject and warned about under warn when the only protection is a mask
+- [x] #3 A plaintext write to a mask-only column is still not flagged, since it is the correct behaviour
+- [x] #4 A test covers a mask-only table in both COPY forms and in both modes
 <!-- AC:END -->
+
+## Implementation Notes
+
+<!-- SECTION:NOTES:BEGIN -->
+Fixed in wave TASK-0139 (branch code-review/TASK-0139). WriteCatalog now carries a read-direction table set (read_tables/read_bare_names) holding every configured column, not only the transform-bearing ones; QueryRewriter::reads_protected is its search_path-aware lookup. COPY ... TO (table form) and COPY (query) TO (via record_copied_table) consult it; COPY ... FROM STDIN and every write site keep using the transform catalog, so a plaintext write to a mask-only column is still not flagged. Copy site wording gained "or masked" since it now fires for tables with no encryption. Test: a_mask_only_table_is_a_copy_out_site_in_both_forms_and_both_modes.
+<!-- SECTION:NOTES:END -->

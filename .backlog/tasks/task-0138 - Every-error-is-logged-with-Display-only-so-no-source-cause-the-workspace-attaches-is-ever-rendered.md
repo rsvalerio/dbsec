@@ -3,11 +3,11 @@ id: TASK-0138
 title: >-
   Every error is logged with Display only, so no #[source] cause the workspace
   attaches is ever rendered
-status: To Do
+status: Done
 assignee:
   - TASK-0142
 created_date: '2026-08-18 09:44'
-updated_date: '2026-08-18 10:00'
+updated_date: '2026-08-18 10:57'
 labels:
   - code-review-rust
   - error-handling
@@ -53,7 +53,13 @@ echo a credential-bearing config line, so a chain renderer must not reintroduce 
 
 ## Acceptance Criteria
 <!-- AC:BEGIN -->
-- [ ] #1 A failed control connection logs the io::Error under the tokio_postgres error, not just its top line
-- [ ] #2 A key-backend failure logs the vaultrs cause that DEFAULT_LOG_FILTER silences at its own target
-- [ ] #3 No renderer prints Error::ConfigParse's dropped toml source, so a credential-bearing config line still cannot reach the log
+- [x] #1 A failed control connection logs the io::Error under the tokio_postgres error, not just its top line
+- [x] #2 A key-backend failure logs the vaultrs cause that DEFAULT_LOG_FILTER silences at its own target
+- [x] #3 No renderer prints Error::ConfigParse's dropped toml source, so a credential-bearing config line still cannot reach the log
 <!-- AC:END -->
+
+## Implementation Notes
+
+<!-- SECTION:NOTES:BEGIN -->
+Fixed in wave TASK-0142. New crates/proxy/src/diag.rs: `chain(&dyn Error) -> Chain<'_>`, a Display wrapper that walks source() and joins the links with ": ". Two deliberate properties: (a) a cause whose text the message above it already contains is not repeated — Error::Control, Error::Listen and Error::Hardening interpolate {source} into their own Display, so an unconditional join would print the same sentence twice before reaching the new link; the walk still descends past it, which is where the io::Error lives; (b) the walk is bounded at MAX_CAUSES = 8 and ends in ": …" rather than trusting a source() chain it does not own. Applied at the handling sites: main.rs (startup failed, failed to start runtime, proxy exited with error, both arms of log_session_error), resolve.rs (refresh_loop warn, the control-connection task warn) and vault.rs (check_token's two warns). Deliberately NOT applied in session.rs/rows.rs: session.rs logs and then propagates to log_session_error, which now renders the chain, and rows.rs::refuse only ever sees source-less proxy variants (is_refusal). Error::ConfigParse is untouched and still carries no #[source] — the renderer cannot reach around that, and main::tests::rendering_a_config_parse_failure_cannot_reach_the_line_it_choked_on loads a malformed credential-bearing DSN and asserts the rendered chain equals Display and contains no credential (AC3). AC1: resolve::tests::a_failed_control_connection_keeps_its_typed_cause now also asserts diag::chain renders the io::Error under the tokio_postgres error, with the password still absent. AC2: main::tests::a_key_backend_failure_reports_the_cause_the_vault_target_is_silenced_for. diag.rs has its own unit tests for the join, the no-cause case, the de-duplication and the depth bound. DEFAULT_LOG_FILTER and log_session_error doc comments updated: the vaultrs cause is now printed, not merely "reachable".
+<!-- SECTION:NOTES:END -->

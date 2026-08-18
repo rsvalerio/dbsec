@@ -1,11 +1,11 @@
 ---
 id: TASK-0142
 title: code-review-plan-wave25
-status: To Do
+status: Done
 assignee:
   - code-review-wave
 created_date: '2026-08-18 09:59'
-updated_date: '2026-08-18 09:59'
+updated_date: '2026-08-18 14:25'
 labels:
   - code-review-wave
 dependencies:
@@ -29,4 +29,6 @@ Operator-facing diagnostics and the startup surface
 
 <!-- SECTION:NOTES:BEGIN -->
 Overlaps: none
+
+Branch: code-review/TASK-0142
 <!-- SECTION:NOTES:END -->

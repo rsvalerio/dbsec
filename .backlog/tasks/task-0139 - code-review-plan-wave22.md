@@ -1,11 +1,11 @@
 ---
 id: TASK-0139
 title: code-review-plan-wave22
-status: To Do
+status: Done
 assignee:
   - code-review-wave
 created_date: '2026-08-18 09:58'
-updated_date: '2026-08-18 09:59'
+updated_date: '2026-08-18 10:37'
 labels:
   - code-review-wave
 dependencies:
@@ -26,4 +26,6 @@ SQL rewrite: scope gaps and COPY coverage
 
 <!-- SECTION:NOTES:BEGIN -->
 Overlaps: TASK-0140 wave23 (crates/proxy/src/encrypt.rs)
+
+Branch: code-review/TASK-0139
 <!-- SECTION:NOTES:END -->
