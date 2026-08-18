@@ -17,7 +17,17 @@
 //! - **`COPY`.** A `COPY ... FROM` payload arrives as a `CopyData` stream the
 //!   proxy does not parse, so a bulk load into a protected table stores
 //!   plaintext; `COPY ... TO` bypasses the read path, so a masked column
-//!   leaves as its unmasked stored value. Both are `on_unprotected` sites.
+//!   leaves as its unmasked stored value. Both are `on_unprotected` sites, and
+//!   so is the query form `COPY (SELECT ...) TO STDOUT`, which is flagged
+//!   whenever its query reads a protected table — its rows leave as `CopyData`
+//!   too, so the read path never sees them.
+//! - **The function-call fast path.** `FunctionCall`/`FunctionCallResponse`
+//!   invokes a function by OID with no SQL and no `RowDescription`, so its
+//!   answer carries no column identity: a function that reads a protected
+//!   column returns the stored form, and a mask-only column's plaintext. It is
+//!   an `on_unprotected` site too — relayed with one warning per session under
+//!   `warn`, refused under `reject`. Drivers reach it only through libpq's
+//!   large-object API.
 
 use std::fmt;
 use std::ops::Range;

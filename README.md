@@ -107,7 +107,22 @@ covered in `plans/PLAN.md`.
 frames rather than SQL, and `COPY ... TO` bypasses the read path — so a
 protected column leaves as its stored form, which for a mask-only column is the
 *unmasked* value. Both are `on_unprotected` sites; bulk-load through `INSERT`,
-or seal the data before it reaches the proxy.
+or seal the data before it reaches the proxy. The query form,
+`COPY (SELECT ...) TO STDOUT`, is the same site: it is flagged when the query
+reads a protected table anywhere — its own `FROM`, a join, a derived table, a
+CTE or a set-operation branch — because the projection of a COPY query does not
+say which columns actually leave. Run the query as an ordinary `SELECT` and its
+rows come back as `DataRow` frames the read path can decrypt and mask.
+
+The legacy function-call fast path is the other read shape the proxy cannot
+cover. `FunctionCall`/`FunctionCallResponse` invokes a function by OID with no
+SQL and no `RowDescription`, so its one-value answer carries no column identity
+at all — a function that reads a protected column (`lo_get`, a custom accessor,
+a `SECURITY DEFINER` reader) would return the stored form, and for a mask-only
+column the unmasked value. It is an `on_unprotected` site like `COPY`: `warn`
+relays it and logs once per session, `reject` refuses it. Modern drivers use it
+only for libpq's large-object API, so switching to `reject` may need those calls
+moved to SQL (`lo_get(oid)`).
 
 ## Deploying the proxy
 
