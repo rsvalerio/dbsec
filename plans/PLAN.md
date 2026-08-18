@@ -178,6 +178,26 @@ TLS: `MaybeTls` stream enum both hops. Downstream handles `SSLRequest` from clie
   a row identity would need a primary key on both paths, and the read path has none — it
   matches result columns by `(table oid, attnum)` and never sees the key. Rows written
   before the binding (`DBS1`) have neither guarantee until they are re-encrypted.
+- **Authentication is relayed, not terminated, so `SCRAM-SHA-256-PLUS` cannot work and
+  GSSAPI encryption is always refused.** The proxy never speaks the auth exchange itself:
+  it forwards the SASL frames verbatim between two independent TLS sessions. Channel
+  binding is what that breaks — `-PLUS` binds the SCRAM proof to *its own* TLS session's
+  endpoint data, and there are two different sessions here, so a client that selects
+  `-PLUS` (which a TLS-aware client does whenever the server advertises it) computes its
+  proof over the downstream channel while the server checks it against the upstream one,
+  and authentication fails. `channel_binding=require` clients therefore cannot connect
+  through the proxy at all. Separately, a client that sends `GSSENCRequest` is answered
+  `N` and falls back to the ordinary startup flow — which is plaintext when downstream TLS
+  is not configured.
+  **Decision: `channel_binding=require` is not supported, and re-originating SCRAM is
+  rejected.** Making `-PLUS` work means terminating authentication at the proxy: holding
+  or verifying the client's credential to run one SCRAM exchange downstream and another
+  upstream, which turns a proxy that has never needed a password into one that stores
+  them, and puts an auth implementation in the trusted path next to the crypto. The
+  proxy's own answer to MITM detection is `verify-full` upstream TLS with a pinned CA and
+  hostname, plus a downstream certificate the client verifies — the property channel
+  binding provides, established per hop rather than end to end. Deployments that must have
+  end-to-end channel binding should not put a TLS-terminating proxy in the path.
 - FF1 on tiny domains (<6 digits) is brute-forceable — refuse in config validation.
 - Rotating the blind-index/FPE/token keys breaks determinism; only DEKs rotate freely.
   Rotation is an operator re-index, not a proxy feature — see below.

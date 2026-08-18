@@ -158,6 +158,22 @@ running as the same user. `dbsec --allow-core-dumps` turns both off for
 debugging a crash — with the understanding that the resulting core is key
 material.
 
+**Authentication passes through, which rules out SCRAM channel binding.** The
+proxy never terminates or re-originates the auth exchange — it relays the SASL
+frames between two independent TLS sessions, so it holds no credential of yours.
+The cost is `SCRAM-SHA-256-PLUS`: it binds the client's proof to *its own* TLS
+session, and there are two of them here, so a client that selects `-PLUS` — what
+a TLS-aware client does whenever the server advertises it — fails to
+authenticate, and a client configured `channel_binding=require` cannot connect at
+all. Use `channel_binding=prefer` (libpq's default, which falls back) or
+`disable`. A client that asks for GSSAPI *encryption* is answered `N` and falls
+back to the ordinary startup flow, which is plaintext unless downstream TLS is
+configured — so configure `[tls.downstream]` if any client might prefer GSSENC.
+What replaces channel binding here is per-hop verification: `verify-full`
+upstream TLS with a pinned CA and hostname, and a downstream certificate the
+client verifies. A deployment that needs end-to-end channel binding cannot use a
+TLS-terminating proxy of any kind.
+
 **Swap is the other half, and it is a host setting.** Key material paged out
 lands on disk just as a core file would. The proxy deliberately does not call
 `mlockall` itself: to be worth anything it would have to cover every allocation
