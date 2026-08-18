@@ -3,11 +3,11 @@ id: TASK-0106
 title: >-
   An ambiguous unqualified searchable column is silently not rewritten and is
   not an on_unprotected site
-status: To Do
+status: Done
 assignee:
   - TASK-0121
 created_date: '2026-08-14 18:16'
-updated_date: '2026-08-17 20:04'
+updated_date: '2026-08-17 20:28'
 labels:
   - security-review
   - security
@@ -38,7 +38,7 @@ SELECT * FROM users u JOIN accounts a ON u.id = a.uid WHERE email = 'a@b.io'
 
 ## Acceptance Criteria
 <!-- AC:BEGIN -->
-- [ ] #1 An ambiguous unqualified searchable column reaches `unprotected()` instead of returning `Ok(false)`
-- [ ] #2 Under `reject` the statement is refused with an ErrorResponse; under `warn` it is logged
-- [ ] #3 A test covers two protected tables sharing a searchable column joined in one query
+- [x] #1 An ambiguous unqualified searchable column reaches `unprotected()` instead of returning `Ok(false)`
+- [x] #2 Under `reject` the statement is refused with an ErrorResponse; under `warn` it is logged
+- [x] #3 A test covers two protected tables sharing a searchable column joined in one query
 <!-- AC:END -->

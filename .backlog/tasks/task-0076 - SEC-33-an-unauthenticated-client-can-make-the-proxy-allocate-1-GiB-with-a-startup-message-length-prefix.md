@@ -3,11 +3,11 @@ id: TASK-0076
 title: >-
   SEC-33: an unauthenticated client can make the proxy allocate 1 GiB with a
   startup-message length prefix
-status: To Do
+status: Done
 assignee:
   - TASK-0125
 created_date: '2026-08-14 12:33'
-updated_date: '2026-08-17 20:04'
+updated_date: '2026-08-17 20:23'
 labels:
   - code-review-rust
   - security
@@ -50,7 +50,32 @@ invalid length is refused today.
 
 ## Acceptance Criteria
 <!-- AC:BEGIN -->
-- [ ] #1 A startup message with a length prefix over the new cap is refused without the allocation being made
-- [ ] #2 A legitimate startup message (including one with a large options parameter) still connects
-- [ ] #3 A test drives the oversized-length case against read_startup_message or the binary
+- [x] #1 A startup message with a length prefix over the new cap is refused without the allocation being made
+- [x] #2 A legitimate startup message (including one with a large options parameter) still connects
+- [x] #3 A test drives the oversized-length case against read_startup_message or the binary
 <!-- AC:END -->
+
+## Implementation Notes
+
+<!-- SECTION:NOTES:BEGIN -->
+Fixed on code-review/TASK-0125.
+
+- `pgwire::MAX_STARTUP_MESSAGE_LEN` (16 KiB) added and enforced inside
+  `startup_body_len`, before `read_startup_message` sizes any buffer from the
+  client's length prefix. Postgres' own cap is `MAX_STARTUP_PACKET_LENGTH`
+  (10,000 bytes), so 16 KiB keeps headroom for a long `options=-c ...`.
+- New `dbsec_core::Error::StartupMessageTooLarge { len, max }` keeps the
+  allocation bound distinguishable from a malformed length
+  (`BadMessageLength`).
+- `crates/core/tests/props.rs::startup_lengths_never_panic` now pins the
+  startup cap rather than the 1 GiB frame limit.
+- Tests: `pgwire::tests::startup_len_refuses_packets_over_the_startup_cap`,
+  `session::tests::oversized_startup_length_is_refused_before_anything_is_allocated`
+  (feeds only the 4-byte length field, so an implementation that allocated
+  first would fail with UnexpectedEof instead),
+  `session::tests::a_startup_message_with_a_large_options_parameter_still_reads`.
+
+The related pre-auth relay bound noted in the description (1 GiB frames
+buffered and SQL-parsed before the backend has authenticated the client) is
+out of scope here and filed separately.
+<!-- SECTION:NOTES:END -->

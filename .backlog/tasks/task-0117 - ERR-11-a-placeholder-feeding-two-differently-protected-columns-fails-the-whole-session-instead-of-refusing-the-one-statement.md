@@ -3,11 +3,11 @@ id: TASK-0117
 title: >-
   ERR-11: a placeholder feeding two differently-protected columns fails the
   whole session instead of refusing the one statement
-status: To Do
+status: Done
 assignee:
   - TASK-0124
 created_date: '2026-08-14 16:49'
-updated_date: '2026-08-17 20:04'
+updated_date: '2026-08-18 09:26'
 labels:
   - code-review-rust
   - idioms-correctness
@@ -52,8 +52,14 @@ Refusing the statement is the right severity: nothing has been sent upstream at 
 
 ## Acceptance Criteria
 <!-- AC:BEGIN -->
-- [ ] #1 A conflicting placeholder is refused at statement level with an ErrorResponse naming the placeholder, and the session stays usable
-- [ ] #2 In the extended protocol the refusal follows the existing awaiting_sync path, so the batch is discarded up to Sync and answered with ReadyForQuery
-- [ ] #3 The refusal happens under both on_unprotected settings, since the statement cannot be honoured either way
-- [ ] #4 Tests cover INSERT INTO t (a, b) VALUES ($1, $1) with differing transforms, in both the simple and extended protocols
+- [x] #1 A conflicting placeholder is refused at statement level with an ErrorResponse naming the placeholder, and the session stays usable
+- [x] #2 In the extended protocol the refusal follows the existing awaiting_sync path, so the batch is discarded up to Sync and answered with ReadyForQuery
+- [x] #3 The refusal happens under both on_unprotected settings, since the statement cannot be honoured either way
+- [x] #4 Tests cover INSERT INTO t (a, b) VALUES ($1, $1) with differing transforms, in both the simple and extended protocols
 <!-- AC:END -->
+
+## Implementation Notes
+
+<!-- SECTION:NOTES:BEGIN -->
+Fixed in wave TASK-0124: encrypt::record_param wraps every ParamTransforms::record call, turning Error::ConflictingParameter into Rejection::Refused instead of Rejection::Fatal. The statement is therefore refused through the existing SqlOutcome::Refuse path — an ErrorResponse naming the placeholder, the extended-protocol batch discarded up to Sync and answered with a synthesized ReadyForQuery, the session left usable. The refusal does not consult on_unprotected: there is no "warn and relay" answer, since relaying would seal a value and then blind-index the ciphertext (or re-seal an already sealed one, which is irreversible). index_value now returns Rejection for the same reason. Tests: encrypt::one_placeholder_for_two_protected_columns_is_refused_under_both_policies (INSERT INTO users (email, backup_email) VALUES ($1, $1), simple and extended, Warn and Reject) and the extended-protocol tail added to a_placeholder_in_two_protected_roles_is_refused_rather_than_transformed_twice.
+<!-- SECTION:NOTES:END -->

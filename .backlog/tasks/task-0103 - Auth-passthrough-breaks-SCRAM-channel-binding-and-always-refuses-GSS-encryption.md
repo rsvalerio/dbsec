@@ -3,11 +3,11 @@ id: TASK-0103
 title: >-
   Auth passthrough breaks SCRAM channel binding and always refuses GSS
   encryption
-status: To Do
+status: Done
 assignee:
   - TASK-0124
 created_date: '2026-08-14 14:06'
-updated_date: '2026-08-17 20:04'
+updated_date: '2026-08-17 20:52'
 labels:
   - security-review
   - protocol
@@ -32,6 +32,12 @@ priority: low
 
 ## Acceptance Criteria
 <!-- AC:BEGIN -->
-- [ ] #1 The channel-binding and GSSENC limitations are documented for operators
-- [ ] #2 A decision is recorded on whether channel_binding=require needs to be supported
+- [x] #1 The channel-binding and GSSENC limitations are documented for operators
+- [x] #2 A decision is recorded on whether channel_binding=require needs to be supported
 <!-- AC:END -->
+
+## Implementation Notes
+
+<!-- SECTION:NOTES:BEGIN -->
+Documented in wave TASK-0124: README.md "Deploying the proxy" gains an operator-facing note on auth passthrough (channel_binding=prefer/disable, configure [tls.downstream] if a client may prefer GSSENC); plans/PLAN.md caveats record the decision — channel_binding=require is NOT supported and re-originating SCRAM is rejected, since it would make the proxy hold client credentials; per-hop verify-full TLS stands in for channel binding. crates/proxy/src/session.rs module docs and the GSSENC arm carry the same record at the code.
+<!-- SECTION:NOTES:END -->

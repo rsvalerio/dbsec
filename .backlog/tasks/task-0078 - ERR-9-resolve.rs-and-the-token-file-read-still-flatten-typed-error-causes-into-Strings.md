@@ -3,11 +3,11 @@ id: TASK-0078
 title: >-
   ERR-9: resolve.rs and the token-file read still flatten typed error causes
   into Strings
-status: To Do
+status: Done
 assignee:
   - TASK-0126
 created_date: '2026-08-14 12:34'
-updated_date: '2026-08-17 20:04'
+updated_date: '2026-08-18 09:40'
 labels:
   - code-review-rust
   - error-handling
@@ -48,6 +48,12 @@ stragglers.
 
 ## Acceptance Criteria
 <!-- AC:BEGIN -->
-- [ ] #1 A control-connection failure exposes the tokio_postgres cause through std::error::Error::source()
-- [ ] #2 A token-file read failure names the path and keeps the io::Error as a source
+- [x] #1 A control-connection failure exposes the tokio_postgres cause through std::error::Error::source()
+- [x] #2 A token-file read failure names the path and keeps the io::Error as a source
 <!-- AC:END -->
+
+## Implementation Notes
+
+<!-- SECTION:NOTES:BEGIN -->
+Error::Control is now { host, #[source] tokio_postgres::Error } and both resolve.rs sites carry the typed cause (the endpoint is parsed out of the DSN the same way ControlTimeout does it, so no password is echoed). Error::Vault(String) had exactly one producer — the [vault] token_file read — and was replaced by Error::VaultToken { path, #[source] io::Error }; the orphaned Vault variant was removed. New tests: resolve::tests::a_failed_control_connection_keeps_its_typed_cause (walks err -> tokio_postgres -> io::Error) and config::tests::an_unreadable_token_file_names_the_path_and_keeps_its_cause.
+<!-- SECTION:NOTES:END -->

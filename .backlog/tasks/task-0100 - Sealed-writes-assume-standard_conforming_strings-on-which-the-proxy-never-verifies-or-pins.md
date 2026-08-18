@@ -3,11 +3,11 @@ id: TASK-0100
 title: >-
   Sealed writes assume standard_conforming_strings = on, which the proxy never
   verifies or pins
-status: To Do
+status: Done
 assignee:
   - TASK-0122
 created_date: '2026-08-14 14:06'
-updated_date: '2026-08-17 20:04'
+updated_date: '2026-08-18 09:34'
 labels:
   - security-review
   - sql-rewrite
@@ -31,6 +31,12 @@ priority: low
 
 ## Acceptance Criteria
 <!-- AC:BEGIN -->
-- [ ] #1 Sealed bytea literals are robust to standard_conforming_strings being off, or the proxy pins/refuses the change
-- [ ] #2 A test covers a session that sets standard_conforming_strings off before a protected write
+- [x] #1 Sealed bytea literals are robust to standard_conforming_strings being off, or the proxy pins/refuses the change
+- [x] #2 A test covers a session that sets standard_conforming_strings off before a protected write
 <!-- AC:END -->
+
+## Implementation Notes
+
+<!-- SECTION:NOTES:BEGIN -->
+Fixed in wave TASK-0122 (branch code-review/TASK-0122). Sealed BYTEA values and blind-index tokens now go out as `E'\\x…' (bytea_literal), whose backslash handling does not depend on standard_conforming_strings, instead of the plain `'\x…' that only reads as hex input while the setting is on. Turning the setting off is additionally tracked as an on_unprotected site (Unprotected::EscapeStringsChanged), and once it is off any ordinary single-quoted literal carrying a backslash is reported (Unprotected::AmbiguousLiteral) rather than sealed on a guess, because the server and sqlparser no longer read it as the same bytes. Tests: sealed_bytea_literals_do_not_depend_on_standard_conforming_strings, turning_standard_conforming_strings_off_is_an_unprotected_site, a_write_after_standard_conforming_strings_off_is_still_sealed_readably, a_backslash_literal_after_the_setting_moved_is_reported_not_guessed_at, turning_standard_conforming_strings_on_is_not_reported.
+<!-- SECTION:NOTES:END -->

@@ -3,11 +3,11 @@ id: TASK-0109
 title: >-
   The legacy FunctionCallResponse (V) message is relayed un-decrypted, leaking a
   protected column's stored bytes
-status: To Do
+status: Done
 assignee:
   - TASK-0123
 created_date: '2026-08-14 18:16'
-updated_date: '2026-08-17 20:04'
+updated_date: '2026-08-17 20:41'
 labels:
   - security-review
   - security
@@ -32,7 +32,13 @@ priority: low
 
 ## Acceptance Criteria
 <!-- AC:BEGIN -->
-- [ ] #1 `FunctionCallResponse` ('V') is no longer silently relayed through the catch-all arm
-- [ ] #2 The fast-path is either refused or its results are subject to the read-path refusal policy
-- [ ] #3 The chosen behaviour is documented alongside the COPY caveat
+- [x] #1 `FunctionCallResponse` ('V') is no longer silently relayed through the catch-all arm
+- [x] #2 The fast-path is either refused or its results are subject to the read-path refusal policy
+- [x] #3 The chosen behaviour is documented alongside the COPY caveat
 <!-- AC:END -->
+
+## Implementation Notes
+
+<!-- SECTION:NOTES:BEGIN -->
+FunctionCallResponse ('V') now has its own arm in RowDecryptor::inspect. It is an on_unprotected site: under reject it raises the new Error::FunctionCallResult, which is_refusal() answers with the same 42501 ErrorResponse + session close every other read-path refusal uses; under warn it relays and logs once per session. Documented in the rows.rs module Refusals section, config.rs and the README next to the COPY caveat.
+<!-- SECTION:NOTES:END -->

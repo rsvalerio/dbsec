@@ -3,11 +3,11 @@ id: TASK-0083
 title: >-
   Vault TLS verification is not pinned, so an env var can silently disable it
   (inverted semantics)
-status: To Do
+status: Done
 assignee:
   - TASK-0119
 created_date: '2026-08-14 14:06'
-updated_date: '2026-08-17 20:03'
+updated_date: '2026-08-17 20:59'
 labels:
   - security-review
   - security
@@ -34,7 +34,13 @@ priority: high
 
 ## Acceptance Criteria
 <!-- AC:BEGIN -->
-- [ ] #1 The Vault client sets certificate verification explicitly rather than inheriting the env default
-- [ ] #2 VAULT_SKIP_VERIFY cannot silently disable verification for a proxy that intends to verify
-- [ ] #3 A test asserts the built client verifies the Vault certificate
+- [x] #1 The Vault client sets certificate verification explicitly rather than inheriting the env default
+- [x] #2 VAULT_SKIP_VERIFY cannot silently disable verification for a proxy that intends to verify
+- [x] #3 A test asserts the built client verifies the Vault certificate
 <!-- AC:END -->
+
+## Implementation Notes
+
+<!-- SECTION:NOTES:BEGIN -->
+Fixed in TASK-0119 (branch code-review/TASK-0119). `vault::client_settings` now pins `.verify(true)` explicitly and pre-parses `addr` as a URL before handing it to vaultrs; `VAULT_SKIP_VERIFY` can no longer decide verification and is reported at WARN when present (its value is passed in as an argument so the report is testable without mutating the process environment). `VAULT_CACERT`/`VAULT_CAPATH` are deliberately still honoured — they only add trust roots. `DEFAULT_LOG_FILTER` keeps `vaultrs=off`, with a note recording that the only security-relevant vaultrs WARN is now unreachable. Tests: `the_vault_client_verifies_the_server_certificate`, `vault_skip_verify_can_neither_disable_verification_nor_pass_unreported`.
+<!-- SECTION:NOTES:END -->

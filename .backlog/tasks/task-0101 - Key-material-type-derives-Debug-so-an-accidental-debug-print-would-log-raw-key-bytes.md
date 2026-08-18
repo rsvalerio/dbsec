@@ -3,11 +3,11 @@ id: TASK-0101
 title: >-
   Key material type derives Debug, so an accidental debug-print would log raw
   key bytes
-status: To Do
+status: Done
 assignee:
   - TASK-0118
 created_date: '2026-08-14 14:06'
-updated_date: '2026-08-17 20:03'
+updated_date: '2026-08-17 20:38'
 labels:
   - security-review
   - security
@@ -32,6 +32,16 @@ priority: low
 
 ## Acceptance Criteria
 <!-- AC:BEGIN -->
-- [ ] #1 Key material cannot be Debug-formatted into its raw bytes
-- [ ] #2 A struct holding a Key can derive Debug without exposing key material
+- [x] #1 Key material cannot be Debug-formatted into its raw bytes
+- [x] #2 A struct holding a Key can derive Debug without exposing key material
 <!-- AC:END -->
+
+## Implementation Notes
+
+<!-- SECTION:NOTES:BEGIN -->
+Fixed in wave TASK-0118. `keys::Key` is now a newtype over `Zeroizing<[u8; 32]>` instead of an alias for it, with a hand-written `Debug` that prints `Key(<redacted>)` — the same treatment `Secret`, `IndexKeyRecord` and `TlsContext` already get. `Deref<Target = [u8; 32]>`, `AsRef<[u8]>`, `Key::new` and `From<Zeroizing<[u8; 32]>>` keep every existing use site working unchanged (`*key`, `key.as_ref()`, deref coercion into `blind_index::compute` and `Cipher::with_budget`), so the redaction covers formatting only, not access.
+
+AC #1 is pinned by `keys::tests::debugging_a_key_never_prints_its_bytes`; AC #2 by `keys::tests::a_struct_holding_a_key_can_derive_debug_safely`, which derives `Debug` on a struct holding a `Key` and asserts the non-secret field still prints while the key bytes do not.
+
+Side effect cleaned up in-wave: the `zeroize` dependency in `fuzz/Cargo.toml` had no remaining user once the fuzz target's key source switched to `Key::new`, so it was removed (`cargo check` in fuzz/ still passes).
+<!-- SECTION:NOTES:END -->

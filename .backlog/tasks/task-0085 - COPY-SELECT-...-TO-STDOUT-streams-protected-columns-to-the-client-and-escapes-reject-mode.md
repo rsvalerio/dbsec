@@ -3,11 +3,11 @@ id: TASK-0085
 title: >-
   COPY (SELECT ...) TO STDOUT streams protected columns to the client and
   escapes reject mode
-status: To Do
+status: Done
 assignee:
   - TASK-0123
 created_date: '2026-08-14 14:06'
-updated_date: '2026-08-17 20:04'
+updated_date: '2026-08-17 20:38'
 labels:
   - security-review
   - security
@@ -34,7 +34,13 @@ priority: medium
 
 ## Acceptance Criteria
 <!-- AC:BEGIN -->
-- [ ] #1 A query-source COPY TO whose query references a protected column is refused under reject
-- [ ] #2 Under warn the same statement emits an on_unprotected warning
-- [ ] #3 A test drives COPY (SELECT protected FROM t) TO STDOUT in both modes
+- [x] #1 A query-source COPY TO whose query references a protected column is refused under reject
+- [x] #2 Under warn the same statement emits an on_unprotected warning
+- [x] #3 A test drives COPY (SELECT protected FROM t) TO STDOUT in both modes
 <!-- AC:END -->
+
+## Implementation Notes
+
+<!-- SECTION:NOTES:BEGIN -->
+Classified CopySource::Query COPY-OUT as an on_unprotected site (new Unprotected::CopyQuery). The query is walked for protected tables through its FROM clauses, joins, parenthesised joins, PIVOT/UNPIVOT/MATCH_RECOGNIZE wrappers, derived tables, CTE bodies and set-operation branches; each protected table is reported once. The table is reported rather than the column because a COPY query's projection (SELECT *, a CTE reference, a function) does not say which columns leave. README and config.rs docs updated. Note: "protected" here is the write catalog's notion, which only covers tables with a transform, so a mask-only table is still not flagged — the same pre-existing gap the table-form COPY has; filed separately.
+<!-- SECTION:NOTES:END -->

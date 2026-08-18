@@ -3,11 +3,11 @@ id: TASK-0086
 title: >-
   UPDATE ... FROM and DELETE ... USING silently skip searchable predicates over
   the joined relation
-status: To Do
+status: Done
 assignee:
   - TASK-0121
 created_date: '2026-08-14 14:06'
-updated_date: '2026-08-17 20:04'
+updated_date: '2026-08-17 20:36'
 labels:
   - security-review
   - security
@@ -32,7 +32,13 @@ priority: medium
 
 ## Acceptance Criteria
 <!-- AC:BEGIN -->
-- [ ] #1 A searchable predicate over an UPDATE ... FROM or DELETE ... USING relation is rewritten to blind-index form
-- [ ] #2 If such a predicate cannot be rewritten it routes through the on_unprotected gate rather than relaying verbatim
-- [ ] #3 Tests cover DELETE ... USING with both equality and inequality over a searchable column
+- [x] #1 A searchable predicate over an UPDATE ... FROM or DELETE ... USING relation is rewritten to blind-index form
+- [x] #2 If such a predicate cannot be rewritten it routes through the on_unprotected gate rather than relaying verbatim
+- [x] #3 Tests cover DELETE ... USING with both equality and inequality over a searchable column
 <!-- AC:END -->
+
+## Implementation Notes
+
+<!-- SECTION:NOTES:BEGIN -->
+Fixed in TASK-0121 (wave 16). The same walk gap applied to derived tables beside the target — UPDATE ... FROM (SELECT ...) and DELETE ... USING (SELECT ...) never descended into the subquery — so `rewrite_derived_tables` was extracted from `rewrite_select` and is now called from all three sites, with tests. The parenthesized-join variant of the same class is filed as TASK-0132.
+<!-- SECTION:NOTES:END -->

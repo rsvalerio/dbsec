@@ -1,11 +1,11 @@
 ---
 id: TASK-0124
 title: code-review-plan-wave19
-status: To Do
+status: Done
 assignee:
   - code-review-wave
 created_date: '2026-08-17 20:02'
-updated_date: '2026-08-17 20:03'
+updated_date: '2026-08-18 09:32'
 labels:
   - code-review-wave
 dependencies:
@@ -29,4 +29,6 @@ Protocol and session state: portal queue integrity, auth passthrough, connection
 
 <!-- SECTION:NOTES:BEGIN -->
 Overlaps: TASK-0121 wave16, TASK-0122 wave17, TASK-0123 wave18 (crates/proxy/src/encrypt.rs); TASK-0125 wave20, TASK-0126 wave21 (crates/proxy/src/session.rs)
+
+Branch: code-review/TASK-0124
 <!-- SECTION:NOTES:END -->

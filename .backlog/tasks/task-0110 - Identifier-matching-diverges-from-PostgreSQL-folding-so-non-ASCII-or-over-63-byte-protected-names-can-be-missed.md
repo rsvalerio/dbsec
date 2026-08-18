@@ -3,11 +3,11 @@ id: TASK-0110
 title: >-
   Identifier matching diverges from PostgreSQL folding, so non-ASCII or
   over-63-byte protected names can be missed by the write path
-status: To Do
+status: Done
 assignee:
   - TASK-0122
 created_date: '2026-08-14 18:16'
-updated_date: '2026-08-17 20:04'
+updated_date: '2026-08-18 09:34'
 labels:
   - security-review
   - security
@@ -34,7 +34,13 @@ priority: low
 
 ## Acceptance Criteria
 <!-- AC:BEGIN -->
-- [ ] #1 A single folding function (ASCII-only downcase, 63-byte truncation) is applied to both config names and SQL identifiers
-- [ ] #2 Config validation rejects or warns on identifiers that PostgreSQL would fold differently than stored
-- [ ] #3 Tests cover a non-ASCII-named protected column and a ≥63-byte name
+- [x] #1 A single folding function (ASCII-only downcase, 63-byte truncation) is applied to both config names and SQL identifiers
+- [x] #2 Config validation rejects or warns on identifiers that PostgreSQL would fold differently than stored
+- [x] #3 Tests cover a non-ASCII-named protected column and a ≥63-byte name
 <!-- AC:END -->
+
+## Implementation Notes
+
+<!-- SECTION:NOTES:BEGIN -->
+Fixed in wave TASK-0122 (branch code-review/TASK-0122). One folding function, config::fold_identifier (ASCII-only downcase for unquoted names, 63-byte clip on a character boundary, quoted names unfolded), is now the single implementation: encrypt::normalize delegates to it and Config::validate checks the configured [[column]] names against it. Validation errors on any schema/table/column name longer than MAX_IDENTIFIER_BYTES (no catalog row can carry it) and warns when a name is not already in folded form (only a double-quoted SQL reference will match). Tests: config::tests::identifiers_fold_the_way_postgres_folds_them, over_long_identifiers_are_rejected, names_outside_the_folded_form_still_validate; encrypt::tests::a_non_ascii_column_name_is_folded_the_way_postgres_folds_it, an_over_long_identifier_matches_the_name_postgres_truncated_it_to.
+<!-- SECTION:NOTES:END -->

@@ -3,11 +3,11 @@ id: TASK-0108
 title: >-
   A stray CopyData/CopyDone/CopyFail frame lets a client desync the pending
   queue and force spurious refusals
-status: To Do
+status: Done
 assignee:
   - TASK-0124
 created_date: '2026-08-14 18:16'
-updated_date: '2026-08-17 20:04'
+updated_date: '2026-08-17 20:56'
 labels:
   - security-review
   - protocol
@@ -33,7 +33,13 @@ priority: medium
 
 ## Acceptance Criteria
 <!-- AC:BEGIN -->
-- [ ] #1 The proxy only treats `d`/`c`/`f` as copy-in payload while a `CopyInResponse` has been observed and not yet completed
-- [ ] #2 A stray copy frame outside copy mode cannot pop `Pending::Batch` markers
-- [ ] #3 A test interleaves stray `CopyData` before a real batch and asserts the following batch's rows are still attributed correctly
+- [x] #1 The proxy only treats `d`/`c`/`f` as copy-in payload while a `CopyInResponse` has been observed and not yet completed
+- [x] #2 A stray copy frame outside copy mode cannot pop `Pending::Batch` markers
+- [x] #3 A test interleaves stray `CopyData` before a real batch and asserts the following batch's rows are still attributed correctly
 <!-- AC:END -->
+
+## Implementation Notes
+
+<!-- SECTION:NOTES:BEGIN -->
+Fixed in wave TASK-0124: SessionPortals gains a copy_in flag set by the read direction on CopyInResponse/CopyBothResponse (session::note_backend_state, which also records the transaction status) and cleared on CopyDone/CopyFail or any ReadyForQuery. SessionPortals::copy_data now takes the message type and returns without touching the queue unless a copy is really in progress, so a stray d/c/f can no longer pop Pending::Batch markers; the frame is still relayed, matching what PostgreSQL does with it. Tests: portal::a_stray_copy_frame_outside_copy_mode_moves_nothing (strays before and inside a batch, following batch still attributed), portal::copy_mode_ends_with_the_copy_and_a_later_sync_is_answered, session::the_read_direction_records_the_backends_copy_and_transaction_state.
+<!-- SECTION:NOTES:END -->

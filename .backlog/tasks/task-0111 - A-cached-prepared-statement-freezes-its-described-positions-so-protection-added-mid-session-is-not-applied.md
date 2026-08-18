@@ -3,11 +3,11 @@ id: TASK-0111
 title: >-
   A cached prepared statement freezes its described positions, so protection
   added mid-session is not applied and stale-mapping is never re-checked
-status: To Do
+status: Done
 assignee:
   - TASK-0123
 created_date: '2026-08-14 18:16'
-updated_date: '2026-08-17 20:04'
+updated_date: '2026-08-17 20:57'
 labels:
   - security-review
   - security
@@ -32,7 +32,13 @@ priority: low
 
 ## Acceptance Criteria
 <!-- AC:BEGIN -->
-- [ ] #1 Cached-statement Executes re-check protected positions when the catalog generation has changed since Describe
-- [ ] #2 A column whose protection is added mid-session is applied (or refused) on the next Execute of a cached statement
-- [ ] #3 A test describes once, changes the catalog, and asserts the cached Execute no longer relays stored bytes
+- [x] #1 Cached-statement Executes re-check protected positions when the catalog generation has changed since Describe
+- [x] #2 A column whose protection is added mid-session is applied (or refused) on the next Execute of a cached statement
+- [x] #3 A test describes once, changes the catalog, and asserts the cached Execute no longer relays stored bytes
 <!-- AC:END -->
+
+## Implementation Notes
+
+<!-- SECTION:NOTES:BEGIN -->
+Positions are no longer a frozen Vec: portal::Positions is now Arc<rows::Described>, which keeps the (table_oid, attnum) of every described field plus the generation of the Resolved it was computed against. RowContext::publish stamps a monotonic generation and republishes it through an AtomicU64 read without the resolution lock, so the per-DataRow check costs one relaxed load. When a cached Execute finds its description stale, RowDecryptor::current re-derives the mapping and writes it back through SessionPortals::rederived, so the cost is one pass per Execute rather than per row. The mapping only ever grows: a position the new resolution no longer covers keeps the transform it was described with, because a column that moved OID still has rows in the old form (the envelope keys by key id) — dropping it would have relayed ciphertext where freezing decrypted. Two tests: protection added after the Describe is applied on the next cached Execute, and a re-resolution that moves the column does not unprotect one.
+<!-- SECTION:NOTES:END -->

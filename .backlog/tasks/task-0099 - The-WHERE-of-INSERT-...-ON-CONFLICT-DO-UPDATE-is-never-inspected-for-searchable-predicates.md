@@ -3,11 +3,11 @@ id: TASK-0099
 title: >-
   The WHERE of INSERT ... ON CONFLICT DO UPDATE is never inspected for
   searchable predicates
-status: To Do
+status: Done
 assignee:
   - TASK-0121
 created_date: '2026-08-14 14:06'
-updated_date: '2026-08-17 20:04'
+updated_date: '2026-08-17 20:25'
 labels:
   - security-review
   - sql-rewrite
@@ -31,6 +31,6 @@ priority: low
 
 ## Acceptance Criteria
 <!-- AC:BEGIN -->
-- [ ] #1 A searchable predicate in a DO UPDATE WHERE is rewritten or routed through the on_unprotected gate
-- [ ] #2 A test covers ON CONFLICT DO UPDATE with a searchable equality in its WHERE
+- [x] #1 A searchable predicate in a DO UPDATE WHERE is rewritten or routed through the on_unprotected gate
+- [x] #2 A test covers ON CONFLICT DO UPDATE with a searchable equality in its WHERE
 <!-- AC:END -->

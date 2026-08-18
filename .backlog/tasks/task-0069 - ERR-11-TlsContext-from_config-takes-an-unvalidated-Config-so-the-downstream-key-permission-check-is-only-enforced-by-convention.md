@@ -3,11 +3,11 @@ id: TASK-0069
 title: >-
   ERR-11: TlsContext::from_config takes an unvalidated Config, so the downstream
   key permission check is only enforced by convention
-status: To Do
+status: Done
 assignee:
   - TASK-0126
 created_date: '2026-08-12 19:12'
-updated_date: '2026-08-17 20:04'
+updated_date: '2026-08-18 09:38'
 labels:
   - code-review-rust
   - error-handling
@@ -34,6 +34,12 @@ priority: low
 
 ## Acceptance Criteria
 <!-- AC:BEGIN -->
-- [ ] #1 TlsContext is constructible only from a config whose validation has run, so the [tls.downstream] key permission check cannot be bypassed by a call site
-- [ ] #2 Existing call sites in main.rs, session.rs and resolve.rs are updated, and no test constructs a TlsContext by a path that skips validation
+- [x] #1 TlsContext is constructible only from a config whose validation has run, so the [tls.downstream] key permission check cannot be bypassed by a call site
+- [x] #2 Existing call sites in main.rs, session.rs and resolve.rs are updated, and no test constructs a TlsContext by a path that skips validation
 <!-- AC:END -->
+
+## Implementation Notes
+
+<!-- SECTION:NOTES:BEGIN -->
+TlsContext::from_config now takes &ValidatedConfig (crates/proxy/src/tls.rs), so the SEC-29 mode check on [tls.downstream] key is a compiler-enforced precondition. serve() builds the TlsContext before destructuring ValidatedConfig; every test call site in main.rs, session.rs, resolve.rs and tls.rs goes through Config::validated(), and test key material is written 0600. New regression test tls::tests::a_world_readable_downstream_key_never_reaches_a_tls_context.
+<!-- SECTION:NOTES:END -->

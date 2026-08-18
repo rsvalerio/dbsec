@@ -1,11 +1,11 @@
 ---
 id: TASK-0093
 title: The AES-GCM key schedule inside Cipher is never zeroized on drop
-status: To Do
+status: Done
 assignee:
   - TASK-0118
 created_date: '2026-08-14 14:06'
-updated_date: '2026-08-17 20:03'
+updated_date: '2026-08-17 20:24'
 labels:
   - security-review
   - crypto
@@ -30,6 +30,12 @@ priority: low
 
 ## Acceptance Criteria
 <!-- AC:BEGIN -->
-- [ ] #1 The expanded AES round-key schedule is wiped when a Cipher is dropped
-- [ ] #2 A DEK rolling to a fresh key leaves no recoverable key schedule in freed memory
+- [x] #1 The expanded AES round-key schedule is wiped when a Cipher is dropped
+- [x] #2 A DEK rolling to a fresh key leaves no recoverable key schedule in freed memory
 <!-- AC:END -->
+
+## Implementation Notes
+
+<!-- SECTION:NOTES:BEGIN -->
+Fixed in wave TASK-0118. `aes` is now pulled with its `zeroize` feature in the workspace manifest, which gives `aes::Aes256` — the exact type `Aes256Gcm` (`AesGcm<Aes256, U12>`) holds — a `Drop` that wipes the expanded round-key schedule. `aes-gcm` 0.10 has no zeroize feature of its own; Cargo unifies features per package, so enabling it on the `aes` dependency covers every `Aes256` in the graph, including FF1's. `envelope::tests::the_aes_key_schedule_is_wiped_when_a_cipher_drops` asserts `Aes256: ZeroizeOnDrop`, so the guarantee stops compiling if the feature is ever dropped, and also pins that a rolled DEK replaces the whole `Cipher` (AC #2) rather than reusing it.
+<!-- SECTION:NOTES:END -->

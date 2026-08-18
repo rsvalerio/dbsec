@@ -3,11 +3,11 @@ id: TASK-0097
 title: >-
   thread_rng GCM nonces are fork-unsafe and the code's rationale for accepting
   thread_rng does not cover fork
-status: To Do
+status: Done
 assignee:
   - TASK-0118
 created_date: '2026-08-14 14:06'
-updated_date: '2026-08-17 20:03'
+updated_date: '2026-08-17 20:33'
 labels:
   - security-review
   - crypto
@@ -31,6 +31,16 @@ priority: low
 
 ## Acceptance Criteria
 <!-- AC:BEGIN -->
-- [ ] #1 The nonce rationale addresses the fork hazard explicitly
-- [ ] #2 If a forking deployment is supported, nonce generation is fork-safe
+- [x] #1 The nonce rationale addresses the fork hazard explicitly
+- [x] #2 If a forking deployment is supported, nonce generation is fork-safe
 <!-- AC:END -->
+
+## Implementation Notes
+
+<!-- SECTION:NOTES:BEGIN -->
+Fixed in wave TASK-0118 (documentation fix — the code's nonce source is unchanged and correct for the supported deployment model).
+
+AC #1: the rationale on the nonce draw in `Cipher::encrypt` now separates the two hazards explicitly — birthday collisions *within* one generator's stream (what `MAX_ENCRYPTIONS_PER_KEY` bounds) from two generators emitting the *same* stream (what the budget does nothing about). It names `fork()` after DEK resolution as the way to reach the second, states the consequence (identical ChaCha12 state, nonce-for-nonce collision under one key, plaintext XOR + GHASH subkey leak retroactive over every row), and says what supporting a forking model would take. Echoed in the `envelope` module docs so it is discoverable without reading the function.
+
+AC #2: a forking deployment is *not* supported, so the conditional does not fire. Rather than leave that implicit, it is now a stated constraint in three places an operator reads: the module docs, the PLAN caveats (with the two fixes a forking model would need — reseed after fork, or `OsRng` at one `getrandom` per value), and a "do not run the proxy under a pre-forking supervisor" paragraph in the README's operating section.
+<!-- SECTION:NOTES:END -->

@@ -1,11 +1,11 @@
 ---
 id: TASK-0121
 title: code-review-plan-wave16
-status: To Do
+status: Done
 assignee:
   - code-review-wave
 created_date: '2026-08-17 20:02'
-updated_date: '2026-08-17 20:03'
+updated_date: '2026-08-17 20:39'
 labels:
   - code-review-wave
 dependencies:
@@ -28,4 +28,6 @@ SQL rewrite: searchable-predicate coverage and false refusals
 
 <!-- SECTION:NOTES:BEGIN -->
 Overlaps: TASK-0122 wave17, TASK-0123 wave18, TASK-0124 wave19 (all crates/proxy/src/encrypt.rs)
+
+Branch: code-review/TASK-0121
 <!-- SECTION:NOTES:END -->

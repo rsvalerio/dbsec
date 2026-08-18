@@ -3,11 +3,11 @@ id: TASK-0112
 title: >-
   The canonical upsert DO UPDATE SET col = EXCLUDED.col is falsely refused under
   reject mode
-status: To Do
+status: Done
 assignee:
   - TASK-0121
 created_date: '2026-08-14 18:16'
-updated_date: '2026-08-17 20:04'
+updated_date: '2026-08-17 20:28'
 labels:
   - security-review
   - availability
@@ -32,7 +32,7 @@ priority: low
 
 ## Acceptance Criteria
 <!-- AC:BEGIN -->
-- [ ] #1 `INSERT ... ON CONFLICT DO UPDATE SET protected = EXCLUDED.protected` is accepted (not refused) under `reject`
-- [ ] #2 The whitelist is limited to provably-already-sealed references and does not admit arbitrary column expressions
-- [ ] #3 A test asserts the canonical upsert idiom passes under both `warn` and `reject`
+- [x] #1 `INSERT ... ON CONFLICT DO UPDATE SET protected = EXCLUDED.protected` is accepted (not refused) under `reject`
+- [x] #2 The whitelist is limited to provably-already-sealed references and does not admit arbitrary column expressions
+- [x] #3 A test asserts the canonical upsert idiom passes under both `warn` and `reject`
 <!-- AC:END -->

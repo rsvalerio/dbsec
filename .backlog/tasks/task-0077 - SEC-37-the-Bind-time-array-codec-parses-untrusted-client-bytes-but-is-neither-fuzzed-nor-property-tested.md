@@ -3,11 +3,11 @@ id: TASK-0077
 title: >-
   SEC-37: the Bind-time array codec parses untrusted client bytes but is neither
   fuzzed nor property-tested
-status: To Do
+status: Done
 assignee:
   - TASK-0121
 created_date: '2026-08-14 12:34'
-updated_date: '2026-08-17 20:04'
+updated_date: '2026-08-17 20:15'
 labels:
   - code-review-rust
   - security
@@ -48,6 +48,6 @@ dev-dependency used by `crates/core/tests/props.rs`.
 
 ## Acceptance Criteria
 <!-- AC:BEGIN -->
-- [ ] #1 decode_text_array and decode_binary_array are exercised by property-based tests or a fuzz target, covering never-panic on arbitrary bytes and a round-trip property
-- [ ] #2 The properties encode the fail-closed contract: any input the codec cannot decode faithfully yields None, never a partially indexed array
+- [x] #1 decode_text_array and decode_binary_array are exercised by property-based tests or a fuzz target, covering never-panic on arbitrary bytes and a round-trip property
+- [x] #2 The properties encode the fail-closed contract: any input the codec cannot decode faithfully yields None, never a partially indexed array
 <!-- AC:END -->

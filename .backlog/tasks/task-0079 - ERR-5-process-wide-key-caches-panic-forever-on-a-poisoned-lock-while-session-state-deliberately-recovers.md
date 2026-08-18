@@ -3,11 +3,11 @@ id: TASK-0079
 title: >-
   ERR-5: process-wide key caches panic forever on a poisoned lock while session
   state deliberately recovers
-status: To Do
+status: Done
 assignee:
   - TASK-0126
 created_date: '2026-08-14 12:34'
-updated_date: '2026-08-17 20:05'
+updated_date: '2026-08-18 09:43'
 labels:
   - code-review-rust
   - error-handling
@@ -46,6 +46,12 @@ justification the session modules carry, or a helper shared by both crates.
 
 ## Acceptance Criteria
 <!-- AC:BEGIN -->
-- [ ] #1 No lock acquisition in Ciphers or VaultKeySource can panic on poison; each site documents why the value is intact
-- [ ] #2 The workspace has one poison policy, not two
+- [x] #1 No lock acquisition in Ciphers or VaultKeySource can panic on poison; each site documents why the value is intact
+- [x] #2 The workspace has one poison policy, not two
 <!-- AC:END -->
+
+## Implementation Notes
+
+<!-- SECTION:NOTES:BEGIN -->
+New crates/core/src/sync.rs holds the workspace poison policy as one Unpoisoned extension trait, documented once. All 5 Ciphers sites (crates/core/src/envelope.rs) and all 6 VaultKeySource sites (crates/proxy/src/vault.rs) now recover instead of .expect(...); rows.rs, portal.rs and the main.rs log-capture helper were converted off their hand-rolled unwrap_or_else(PoisonError::into_inner) onto the same helper, so there is a single definition of the policy. AC #1 substitution: rather than repeating a justification at each of the 11 call sites, the reasoning lives in the crate::sync module doc with a pointer at each of the two impls (Ciphers::active, impl KeySource for VaultKeySource). New tests: sync::tests::a_poisoned_lock_still_hands_back_its_value and envelope::tests::a_poisoned_cache_keeps_serving (poisons both process-wide caches from a panicking thread and proves seal/open keep working).
+<!-- SECTION:NOTES:END -->
