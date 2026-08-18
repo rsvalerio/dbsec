@@ -2,6 +2,17 @@
 All notable changes to this project will be documented in this file. See [conventional commits](https://www.conventionalcommits.org/) for commit guidelines.
 
 - - -
+## v0.4.0 - 2026-08-18
+#### Features
+- (**config**) declare a table's row key - (b4b40f4) - Rodrigo Valerio, *Claude Opus 5 (1M context)*
+- (**core**) add the DBS3 row-bound envelope format - (425d43a) - Rodrigo Valerio, *Claude Opus 5 (1M context)*
+- (**resolve**) resolve declared row keys and canonicalise their values - (ccaf89c) - Rodrigo Valerio, *Claude Opus 5 (1M context)*
+- bind encrypted values to the row they were written in - (fc3dcd6) - Rodrigo Valerio, *Claude Opus 5 (1M context)*
+#### Documentation
+- describe row binding and what declaring a row key costs - (a78ced1) - Rodrigo Valerio, *Claude Opus 5 (1M context)*
+
+- - -
+
 ## v0.3.0 - 2026-08-18
 #### Features
 - (**config**) let a deployment set the read path's per-value ceiling - (3c1ec5b) - Rodrigo Valerio
