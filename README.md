@@ -129,7 +129,10 @@ or seal the data before it reaches the proxy. The query form,
 reads a protected table anywhere — its own `FROM`, a join, a derived table, a
 CTE or a set-operation branch — because the projection of a COPY query does not
 say which columns actually leave. Run the query as an ordinary `SELECT` and its
-rows come back as `DataRow` frames the read path can decrypt and mask.
+rows come back as `DataRow` frames the read path can decrypt and mask. Its
+*predicates* are rewritten like any other query's, so under `warn` the relayed
+statement still selects the rows the client asked for rather than none; only
+the out-direction query form is re-rendered, never `COPY ... FROM STDIN`.
 
 The legacy function-call fast path is the other read shape the proxy cannot
 cover. `FunctionCall`/`FunctionCallResponse` invokes a function by OID with no
