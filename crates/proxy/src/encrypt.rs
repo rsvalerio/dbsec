@@ -27,9 +27,11 @@
 //! sites are: non-UTF-8 and unparseable SQL, `INSERT` without a column list,
 //! `INSERT ... SELECT`, `COPY`, `MERGE`, `PREPARE` of a write, a non-literal
 //! expression bound to a protected column, an unqualified name under a
-//! changed `search_path`, an unqualified column matching a protected column
-//! in more than one relation in scope, and a predicate over a searchable
-//! column the rewriter cannot turn into a blind-index match.
+//! changed `search_path`, a session that turned
+//! `standard_conforming_strings` off and every backslash-carrying literal
+//! after it, an unqualified column matching a protected column in more than
+//! one relation in scope, and a predicate over a searchable column the
+//! rewriter cannot turn into a blind-index match.
 //!
 //! A refusal is a statement-level error, not a dropped connection: the client
 //! gets ErrorResponse + ReadyForQuery (or, in the extended protocol,
@@ -128,9 +130,10 @@ use sqlparser::ast::{
 };
 use sqlparser::dialect::PostgreSqlDialect;
 use sqlparser::parser::{Parser, ParserError};
+use sqlparser::tokenizer::{Token, Tokenizer};
 
 use crate::columns::ProtectedColumn;
-use crate::config::OnUnprotected;
+use crate::config::{fold_identifier, OnUnprotected};
 use crate::portal::{ParamAction, ParamTransforms, SessionPortals, Target};
 use crate::session::FrameAction;
 use crate::Error;
@@ -182,13 +185,13 @@ impl WriteCatalog {
     }
 }
 
-/// PG folds unquoted identifiers to lowercase; quoted ones stay verbatim.
+/// One SQL identifier as the catalog holds it — folded by the same
+/// [`crate::config::fold_identifier`] that config validation checks the
+/// configured names against, so the two sides of every name comparison cannot
+/// drift apart. See that function for the two rules and why Rust's own answer
+/// differs from the server's.
 fn normalize(ident: &Ident) -> String {
-    if ident.quote_style.is_some() {
-        ident.value.clone()
-    } else {
-        ident.value.to_lowercase()
-    }
+    fold_identifier(&ident.value, ident.quote_style.is_some()).into_owned()
 }
 
 /// Why a rewrite stopped: the session cannot continue, or this one statement
@@ -333,6 +336,11 @@ pub struct QueryRewriter {
     tx_status: Arc<AtomicU8>,
     /// Whether unqualified table names still resolve to `public`.
     search_path_trusted: bool,
+    /// Whether the session turned `standard_conforming_strings` off. With it
+    /// off, PostgreSQL reads a backslash in an ordinary `'…'` literal as the
+    /// start of an escape and sqlparser does not, so the two no longer agree
+    /// on what such a literal contains.
+    escape_strings: bool,
     /// Set after refusing an extended-protocol message: the backend never saw
     /// it, so the proxy plays the backend's part and discards the rest of the
     /// batch up to `Sync`.
@@ -346,7 +354,14 @@ impl QueryRewriter {
         tx_status: Arc<AtomicU8>,
         search_path_trusted: bool,
     ) -> Self {
-        Self { catalog, portals, tx_status, search_path_trusted, awaiting_sync: false }
+        Self {
+            catalog,
+            portals,
+            tx_status,
+            search_path_trusted,
+            escape_strings: false,
+            awaiting_sync: false,
+        }
     }
 
     /// Inspects one client→upstream frame, returning what the relay should do
@@ -578,6 +593,29 @@ impl QueryRewriter {
         }
     }
 
+    /// Whether a literal denotes the same bytes to the server as to the
+    /// proxy's parser.
+    ///
+    /// Only an ordinary `'…'` literal can disagree, and only once the session
+    /// has turned `standard_conforming_strings` off: from then on the server
+    /// reads a backslash in one as the start of an escape, while sqlparser
+    /// keeps reading it as a backslash. `E'…'`, `U&'…'` and dollar quoting all
+    /// have backslash rules the setting does not touch, so they always agree.
+    ///
+    /// Sealing a literal the two read differently would store the plaintext
+    /// the proxy guessed rather than the one the client wrote — unrecoverable,
+    /// because nothing downstream can tell it apart from a correctly sealed
+    /// value. Reporting it instead leaves the data intact and names the reason.
+    fn literal_agrees_with_server(&self, expr: &Expr) -> bool {
+        if !self.escape_strings {
+            return true;
+        }
+        !matches!(
+            unwrap_casts(expr),
+            Expr::Value(Value::SingleQuotedString(text)) if text.contains('\\')
+        )
+    }
+
     /// Resolves a table name against the catalog, refusing to guess when the
     /// session's `search_path` has moved out from under an unqualified name:
     /// sealing for the wrong table writes a value the read path can never
@@ -596,18 +634,38 @@ impl QueryRewriter {
         let Ok(text) = std::str::from_utf8(query) else {
             return self.unprotected_sql(&Unprotected::NonUtf8);
         };
-        let mut statements = match parse_sql(text) {
+        // Session settings are read from the token stream rather than from the
+        // parsed statements, because the parse cannot see them: sqlparser 0.53
+        // does not parse `SET SCHEMA` at all, and `set_config('search_path', …)`
+        // is an ordinary function call that can sit anywhere in any statement.
+        // They stay grouped per statement so a move takes effect from the
+        // statement that makes it onwards — a `SET` at the end of a batch must
+        // not retroactively stop the write in front of it from being sealed.
+        let moved = settings_moved(text);
+        let parsed = parse_sql(text);
+        // The groups line up with the statements only when the tokenizer and
+        // the parser saw the same batch. Unparseable text (where nothing is
+        // rewritten, so no ordering can change an outcome) and any other
+        // disagreement fall back to applying every move up front, which is the
+        // conservative reading.
+        let aligned = parsed.as_ref().is_ok_and(|statements| statements.len() == moved.len());
+        if !aligned {
+            match self.note_session_state(&moved.concat()) {
+                Ok(()) => {}
+                Err(Rejection::Fatal(error)) => return Err(*error),
+                Err(Rejection::Refused(message)) => return Ok(SqlOutcome::Refuse(message)),
+            }
+        }
+        let mut statements = match parsed {
             Ok(statements) => statements,
             Err(error) => return self.unprotected_sql(&Unprotected::Unparseable(&error)),
         };
 
         let mut params = ParamTransforms::default();
         let mut changed = vec![false; statements.len()];
-        for (statement, changed) in statements.iter_mut().zip(&mut changed) {
-            let result = self
-                .note_session_state(statement)
-                .and_then(|()| self.rewrite_statement(statement, &mut params));
-            match result {
+        for (index, (statement, changed)) in statements.iter_mut().zip(&mut changed).enumerate() {
+            let noted = if aligned { self.note_session_state(&moved[index]) } else { Ok(()) };
+            match noted.and_then(|()| self.rewrite_statement(statement, &mut params)) {
                 Ok(did_change) => *changed = did_change,
                 Err(Rejection::Fatal(error)) => return Err(*error),
                 Err(Rejection::Refused(message)) => return Ok(SqlOutcome::Refuse(message)),
@@ -622,20 +680,26 @@ impl QueryRewriter {
         Ok(SqlOutcome::Rewrite(RewriteOutcome { rewritten, params }))
     }
 
-    /// Watches for the session settings the catalog's assumptions depend on.
-    /// `search_path` is the only one today: once it stops making `public` the
+    /// Records the session settings a statement moved, as read out of the SQL
+    /// about to be relayed. Once `search_path` stops making `public` the
     /// schema of an unqualified name, the write path stops resolving bare
-    /// names at all.
-    fn note_session_state(&mut self, statement: &Statement) -> Result<(), Rejection> {
-        let Statement::SetVariable { variables, value, .. } = statement else { return Ok(()) };
-        let touches_search_path = variables
-            .iter()
-            .any(|name| name.0.last().is_some_and(|ident| normalize(ident) == "search_path"));
-        if !touches_search_path || is_default_search_path(value) {
-            return Ok(());
+    /// names at all; `standard_conforming_strings` is reported but changes no
+    /// catalog assumption, because what it invalidates is the proxy's reading
+    /// of the client's own literals.
+    fn note_session_state(&mut self, moved: &[SettingMoved]) -> Result<(), Rejection> {
+        for setting in moved {
+            match setting {
+                SettingMoved::SearchPath => {
+                    self.search_path_trusted = false;
+                    self.unprotected(&Unprotected::SearchPathChanged)?;
+                }
+                SettingMoved::EscapeStrings => {
+                    self.escape_strings = true;
+                    self.unprotected(&Unprotected::EscapeStringsChanged)?;
+                }
+            }
         }
-        self.search_path_trusted = false;
-        self.unprotected(&Unprotected::SearchPathChanged)
+        Ok(())
     }
 
     fn rewrite_statement(
@@ -1428,6 +1492,11 @@ impl QueryRewriter {
             self.unprotected(&Unprotected::UnindexedPredicate { column, shape: "IN list" })?;
             return Ok(false);
         }
+        if !list.iter().all(|value| self.literal_agrees_with_server(value)) {
+            let column = column_name(column).unwrap_or_default();
+            self.unprotected(&Unprotected::AmbiguousLiteral { column: &column })?;
+            return Ok(false);
+        }
         let indexable = !list.is_empty()
             && list.iter().all(|value| match unwrap_casts(value) {
                 Expr::Value(Value::Placeholder(placeholder)) => {
@@ -1466,6 +1535,11 @@ impl QueryRewriter {
                 column,
                 shape: expr_shape(value),
             })?;
+            return Ok(false);
+        }
+        if !self.literal_agrees_with_server(value) {
+            let column = column_name(column).unwrap_or_default();
+            self.unprotected(&Unprotected::AmbiguousLiteral { column: &column })?;
             return Ok(false);
         }
         let indexable = match unwrap_casts(value) {
@@ -1528,16 +1602,24 @@ impl QueryRewriter {
             Expr::Value(Value::Null) => return Ok(false),
             _ => {}
         }
+        if !self.literal_agrees_with_server(expr) {
+            self.unprotected(&Unprotected::AmbiguousLiteral { column })?;
+            return Ok(false);
+        }
         let Some(plaintext) = literal_plaintext(expr, transform.wire()) else {
             self.unprotected(&Unprotected::UnsupportedValue { column, shape: expr_shape(expr) })?;
             return Ok(false);
         };
         let sealed = transform.seal(&plaintext).map_err(Error::Wire)?;
-        let literal = match transform.wire() {
-            WireForm::Bytea => format!("\\x{}", hex::encode(sealed)),
-            WireForm::Text => String::from_utf8_lossy(&sealed).into_owned(),
+        *expr = match transform.wire() {
+            WireForm::Bytea => bytea_literal(&sealed),
+            // FPE digits and HMAC hex carry no backslash, so an ordinary
+            // literal denotes the same string under either setting of
+            // `standard_conforming_strings`.
+            WireForm::Text => Expr::Value(Value::SingleQuotedString(
+                String::from_utf8_lossy(&sealed).into_owned(),
+            )),
         };
-        *expr = Expr::Value(Value::SingleQuotedString(literal));
         Ok(true)
     }
 }
@@ -1598,27 +1680,184 @@ fn join_condition(operator: &mut JoinOperator) -> Option<&mut Expr> {
     }
 }
 
-/// Whether a `SET search_path` still leaves `public` as the schema an
-/// unqualified name resolves to. `"$user", public` is PostgreSQL's own
-/// default and stays trusted; anything else in front of `public` does not,
-/// because a bare name may resolve there instead.
-fn is_default_search_path(values: &[Expr]) -> bool {
-    let names: Vec<String> = values.iter().filter_map(setting_name).collect();
-    if names.len() != values.len() {
-        return false;
-    }
-    names.iter().all(|name| name == "public" || name == "$user")
-        && names.iter().any(|n| n == "public")
+/// A session setting the rewrite's assumptions depend on, moved off the value
+/// those assumptions need.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SettingMoved {
+    /// `search_path` no longer resolves an unqualified name to `public`.
+    SearchPath,
+    /// `standard_conforming_strings` is no longer `on`, so PostgreSQL reads a
+    /// backslash in an ordinary string literal as the start of an escape and
+    /// the proxy's parser does not.
+    EscapeStrings,
 }
 
-fn setting_name(expr: &Expr) -> Option<String> {
-    match expr {
-        Expr::Identifier(ident) => Some(normalize(ident)),
-        Expr::Value(Value::SingleQuotedString(value) | Value::DoubleQuotedString(value)) => {
-            Some(value.clone())
+/// The settings each statement of one SQL text moves, read from its **token
+/// stream** and grouped per top-level statement, in order.
+///
+/// Not from the parsed statements, because they cannot see three of the four
+/// forms that move a setting: sqlparser 0.53 rejects `SET SCHEMA 'tenant7'`
+/// outright (it arrives as [`Unprotected::Unparseable`], which under `warn`
+/// relays it), and `set_config('search_path', 'tenant7', false)` is an
+/// ordinary function call that may sit anywhere in any statement. Tokens see
+/// every form, and — unlike searching the raw text — cannot mistake the same
+/// characters inside a string literal or a quoted identifier for the keyword
+/// or the function name.
+///
+/// Grouping rather than flattening is what keeps a multi-statement batch
+/// honest: a move belongs to the statements after it, not to the ones in front
+/// of it, so `INSERT …; SET search_path …` still seals the insert.
+///
+/// `RESET` is deliberately absent: it restores whatever the role or the server
+/// makes the default, which is the same value the connect-time assumption
+/// already trusts, so treating it as a move would contradict that assumption
+/// rather than tighten it.
+fn settings_moved(text: &str) -> Vec<Vec<SettingMoved>> {
+    let Ok(all) = Tokenizer::new(&PostgreSqlDialect {}, text).tokenize() else {
+        // Text that does not tokenize does not parse either, so it is already
+        // reported as unparseable; there is nothing to add here.
+        return Vec::new();
+    };
+    // Whitespace and comments are both `Whitespace` tokens, and neither
+    // separates a keyword from what it applies to.
+    let tokens: Vec<&Token> =
+        all.iter().filter(|token| !matches!(token, Token::Whitespace(_))).collect();
+
+    // An empty run is the trailing semicolon, or one written twice; sqlparser
+    // does not count either as a statement, so neither does this.
+    tokens
+        .split(|token| matches!(token, Token::SemiColon))
+        .filter(|statement| !statement.is_empty())
+        .map(statement_settings_moved)
+        .collect()
+}
+
+/// The settings one statement moves. `tokens` are that statement's, with the
+/// whitespace and the terminating semicolon already gone.
+fn statement_settings_moved(tokens: &[&Token]) -> Vec<SettingMoved> {
+    let mut moved = Vec::new();
+    for (index, token) in tokens.iter().enumerate() {
+        let rest = &tokens[index + 1..];
+        let found = match keyword(token).as_deref() {
+            // `SET` also opens the assignment list of an `UPDATE`, where the
+            // name that follows is a column: only a statement-initial `SET` is
+            // the session command.
+            Some("set") if index == 0 => set_statement(rest),
+            Some("set_config") => set_config_call(rest),
+            _ => None,
+        };
+        if let Some(setting) = found {
+            if !moved.contains(&setting) {
+                moved.push(setting);
+            }
+        }
+    }
+    moved
+}
+
+/// The lowercased text of an unquoted word. A quoted one is an identifier the
+/// client chose, never a keyword or a function name the server resolves.
+fn keyword(token: &Token) -> Option<String> {
+    match token {
+        Token::Word(word) if word.quote_style.is_none() => Some(word.value.to_ascii_lowercase()),
+        _ => None,
+    }
+}
+
+/// `SET [SESSION | LOCAL] <name> {= | TO} <value…>`, and PostgreSQL's
+/// `SET SCHEMA <value>` shorthand for a one-element `search_path`. `tokens`
+/// starts just after the `SET`.
+fn set_statement(tokens: &[&Token]) -> Option<SettingMoved> {
+    let mut rest = tokens;
+    if matches!(keyword(rest.first()?).as_deref(), Some("session" | "local")) {
+        rest = rest.get(1..)?;
+    }
+    let name = keyword(rest.first()?)?;
+    rest = rest.get(1..)?;
+    if name == "schema" {
+        return moved_by("search_path", setting_values(rest));
+    }
+    if !matches!(rest.first()?, Token::Eq) && keyword(rest.first()?).as_deref() != Some("to") {
+        return None;
+    }
+    moved_by(&name, setting_values(rest.get(1..)?))
+}
+
+/// `set_config('<setting>', '<value>', <is_local>)` — the function spelling of
+/// `SET`, which reaches the server inside an ordinary query. `tokens` starts
+/// just after the function name.
+fn set_config_call(tokens: &[&Token]) -> Option<SettingMoved> {
+    if !matches!(tokens.first()?, Token::LParen) {
+        return None;
+    }
+    // A setting name that is not a literal could be `search_path`, and the
+    // assumption that unqualified names resolve to `public` cannot survive a
+    // change the proxy is unable to read.
+    let Some(Token::SingleQuotedString(setting)) = tokens.get(1) else {
+        return Some(SettingMoved::SearchPath);
+    };
+    if !matches!(tokens.get(2)?, Token::Comma) {
+        return Some(SettingMoved::SearchPath);
+    }
+    moved_by(&setting.to_ascii_lowercase(), setting_values(tokens.get(3..4)?))
+}
+
+/// Whether assigning `values` to `name` moves a tracked setting. `None` values
+/// mean the assignment could not be read, which counts as a move: a setting
+/// the proxy cannot evaluate is one it cannot keep assuming.
+fn moved_by(name: &str, values: Option<Vec<String>>) -> Option<SettingMoved> {
+    match name {
+        "search_path" => {
+            (!is_default_search_path(values.as_deref())).then_some(SettingMoved::SearchPath)
+        }
+        "standard_conforming_strings" => {
+            (!is_on(values.as_deref())).then_some(SettingMoved::EscapeStrings)
         }
         _ => None,
     }
+}
+
+/// The elements a setting is being assigned, stopping at the end of the
+/// statement or of the enclosing call. A list may be written as separate
+/// tokens (`SET search_path TO tenant7, public`) or as one string
+/// (`set_config('search_path', 'tenant7, public', false)`), so both are split
+/// down to the same shape. `None` means a token this cannot evaluate.
+fn setting_values(tokens: &[&Token]) -> Option<Vec<String>> {
+    let mut values = Vec::new();
+    for token in tokens {
+        match token {
+            Token::SemiColon | Token::RParen => break,
+            Token::Comma => {}
+            Token::Word(word) if word.quote_style.is_some() => values.push(word.value.clone()),
+            Token::Word(word) => values.push(word.value.to_ascii_lowercase()),
+            Token::SingleQuotedString(text) => {
+                values.extend(text.split(',').map(|part| part.trim().trim_matches('"').to_owned()))
+            }
+            Token::Number(number, _) => values.push(number.clone()),
+            _ => return None,
+        }
+    }
+    Some(values)
+}
+
+/// Whether a `search_path` value still leaves `public` as the schema an
+/// unqualified name resolves to. `"$user", public` is PostgreSQL's own default
+/// and stays trusted; anything else in front of `public` does not, because a
+/// bare name may resolve there instead.
+fn is_default_search_path(values: Option<&[String]>) -> bool {
+    let Some(values) = values else { return false };
+    values.iter().all(|name| name == "public" || name == "$user")
+        && values.iter().any(|name| name == "public")
+}
+
+/// Whether a boolean setting is being turned on, in any of the spellings
+/// PostgreSQL accepts. `DEFAULT` is not one of them: the default is whatever
+/// the server was configured with, which the proxy cannot read.
+fn is_on(values: Option<&[String]>) -> bool {
+    matches!(values, Some([value]) if matches!(
+        value.as_str(),
+        "on" | "true" | "t" | "yes" | "y" | "1"
+    ))
 }
 
 struct ScopedTable<'a> {
@@ -1956,8 +2195,23 @@ fn index_value(
     let Some(token) = transform.search_index(&plaintext).map_err(Error::Wire)? else {
         return Err(Error::Wire(dbsec_core::Error::Malformed).into());
     };
-    *value = Expr::Value(Value::SingleQuotedString(format!("\\x{}", hex::encode(token))));
+    *value = bytea_literal(&token);
     Ok(())
+}
+
+/// A BYTEA value as SQL text: `E'\\x…'`, PostgreSQL's hex input syntax inside
+/// an *escape* string literal.
+///
+/// The plain `'\x…'` spelling reads as hex bytea only while
+/// `standard_conforming_strings` is on — with it off, the server applies
+/// C-style backslash processing to the literal first and every sealed write
+/// and every blind-index match is silently corrupted. `E'…'` processes
+/// backslashes whatever that setting says, so doubling the one backslash here
+/// makes the literal mean the same thing either way. sqlparser renders the
+/// stored `\x…` back out with the backslash doubled, and reads it back to
+/// `\x…` when the rewritten text is re-parsed for validation.
+fn bytea_literal(value: &[u8]) -> Expr {
+    Expr::Value(Value::EscapedStringLiteral(format!("\\x{}", hex::encode(value))))
 }
 
 /// One transformed Bind parameter, in the format the parameter arrived in.
@@ -2590,6 +2844,10 @@ enum Unprotected<'a> {
     CopyQuery { table: String },
     /// A statement shape that writes a protected table but is not rewritten.
     Unsupported { table: &'a ObjectName, shape: &'static str },
+    /// An ordinary `'…'` literal carrying a backslash, in a session that
+    /// turned `standard_conforming_strings` off — so the server and the
+    /// proxy's parser no longer read it as the same bytes.
+    AmbiguousLiteral { column: &'a str },
     /// A non-literal expression assigned to a protected column.
     UnsupportedValue { column: &'a str, shape: &'static str },
     /// A protected column projected through an expression rather than
@@ -2609,8 +2867,14 @@ enum Unprotected<'a> {
     /// because the remedy differs: that one is a query to rewrite, this one is
     /// a column to reconfigure.
     UnindexedPredicate { column: String, shape: &'static str },
-    /// `SET search_path` moved off the schema the catalog resolves against.
+    /// `search_path` moved off the schema the catalog resolves against.
     SearchPathChanged,
+    /// `standard_conforming_strings` was turned off. Sealed values are emitted
+    /// in a form that does not depend on it ([`bytea_literal`]), but the
+    /// client's own literals are now read one way by PostgreSQL and another by
+    /// the proxy's parser — reported here once, and again per literal that the
+    /// difference actually reaches ([`Self::AmbiguousLiteral`]).
+    EscapeStringsChanged,
     /// An unqualified name that may be a protected table, in a session whose
     /// `search_path` no longer says which schema it resolves to.
     SearchPath(&'a ObjectName),
@@ -2656,6 +2920,12 @@ impl Unprotected<'_> {
                 shape,
                 "statement writes a protected table but is not rewritten; passing through unencrypted"
             ),
+            Self::AmbiguousLiteral { column } => tracing::warn!(
+                column,
+                "string literal contains a backslash and this session turned \
+                 standard_conforming_strings off, so the proxy cannot read it the way the \
+                 server will; passing through unencrypted"
+            ),
             Self::UnsupportedValue { column, shape } => tracing::warn!(
                 column,
                 shape,
@@ -2689,6 +2959,10 @@ impl Unprotected<'_> {
             Self::SearchPathChanged => tracing::warn!(
                 "session changed search_path; unqualified names no longer resolve to the \
                  configured schema"
+            ),
+            Self::EscapeStringsChanged => tracing::warn!(
+                "session turned standard_conforming_strings off; a backslash in a string \
+                 literal no longer means to PostgreSQL what the proxy reads it as"
             ),
             Self::SearchPath(table) => tracing::warn!(
                 table = %table,
@@ -2727,6 +3001,11 @@ impl Unprotected<'_> {
             Self::Unsupported { table, shape } => {
                 format!("{shape} writing protected table {table} cannot be encrypted")
             }
+            Self::AmbiguousLiteral { column } => format!(
+                "a value for protected column {column} contains a backslash and this session \
+                 turned standard_conforming_strings off, so the proxy cannot read it the way \
+                 the server will"
+            ),
             Self::UnsupportedValue { column, shape } => format!(
                 "protected column {column} was assigned a {shape}, which cannot be encrypted"
             ),
@@ -2751,6 +3030,12 @@ impl Unprotected<'_> {
             ),
             Self::SearchPathChanged => {
                 "changing search_path leaves unqualified names resolving to an unknown schema"
+                    .to_owned()
+            }
+            Self::EscapeStringsChanged => {
+                "turning standard_conforming_strings off changes what a backslash in a string \
+                 literal means, so a value bound to a protected column can no longer be read \
+                 the way the server would read it"
                     .to_owned()
             }
             Self::SearchPath(table) => format!(
@@ -2923,13 +3208,26 @@ mod tests {
         String::from_utf8_lossy(bytes).into_owned()
     }
 
+    /// How a sealed BYTEA value appears in rewritten SQL: the escape-string
+    /// literal [`bytea_literal`] emits, with its backslash doubled.
+    const SEALED_PREFIX: &str = r"E'\\x";
+
+    fn sealed_literal(value: &[u8]) -> String {
+        format!("{SEALED_PREFIX}{}'", hex::encode(value))
+    }
+
     /// Extracts the sealed hex literal out of a rewritten statement and
     /// opens it.
     fn open_hex_literal(sql: &str, searchable: bool) -> Vec<u8> {
-        let start = sql.find("'\\x").expect("hex literal") + 3;
-        let end = sql[start..].find('\'').unwrap() + start;
-        let stored = hex::decode(&sql[start..end]).unwrap();
+        let stored = hex::decode(sealed_hex(sql).expect("hex literal")).unwrap();
         transform(searchable).open(&stored).unwrap().expect("opens")
+    }
+
+    /// The hex digits of the first sealed literal in a rewritten statement.
+    fn sealed_hex(sql: &str) -> Option<&str> {
+        let start = sql.find(SEALED_PREFIX)? + SEALED_PREFIX.len();
+        let end = sql[start..].find('\'')? + start;
+        Some(&sql[start..end])
     }
 
     #[test]
@@ -2956,9 +3254,7 @@ mod tests {
         assert_eq!(open_hex_literal(&sql, true), b"bob@example.com");
 
         // The stored form carries the blind index.
-        let start = sql.find("'\\x").unwrap() + 3;
-        let end = sql[start..].find('\'').unwrap() + start;
-        let stored = hex::decode(&sql[start..end]).unwrap();
+        let stored = hex::decode(sealed_hex(&sql).unwrap()).unwrap();
         let (index, _) = blind_index::split(&stored).unwrap();
         assert_eq!(index, blind_index::compute(&crate::rows::tests::INDEX_KEY, b"bob@example.com"));
     }
@@ -3046,7 +3342,7 @@ mod tests {
 
         let expected = blind_index::compute(&INDEX_KEY, b"alice@example.com");
         assert!(sql.contains("SUBSTRING(email FROM 1 FOR 32)"), "{sql}");
-        assert!(sql.contains(&format!("'\\x{}'", hex::encode(expected))), "{sql}");
+        assert!(sql.contains(&sealed_literal(&expected)), "{sql}");
     }
 
     #[test]
@@ -3226,7 +3522,7 @@ mod tests {
         let expected = blind_index::compute(&INDEX_KEY, b"alice@example.com");
         assert!(!sql.contains("alice@example.com"), "{sql}");
         assert!(sql.contains("SUBSTRING(email FROM 1 FOR 32)"), "prefix match missing: {sql}");
-        assert!(sql.contains(&format!("'\\x{}'", hex::encode(expected))), "{sql}");
+        assert!(sql.contains(&sealed_literal(&expected)), "{sql}");
 
         // Aliased and AND-nested references rewrite too; DELETE works.
         let sql = rewritten_query(
@@ -3321,7 +3617,7 @@ mod tests {
         assert!(sql.contains("SUBSTRING(email FROM 1 FOR 32)"), "{sql}");
         assert_eq!(open_hex_literal(&sql, true), b"alice@example.com");
         let index = blind_index::compute(&crate::rows::tests::INDEX_KEY, b"alice@example.com");
-        assert!(sql.contains(&format!("'\\x{}'", hex::encode(index))), "{sql}");
+        assert!(sql.contains(&sealed_literal(&index)), "{sql}");
     }
 
     /// Two protected columns of one table under *different* transforms, so a
@@ -3410,7 +3706,7 @@ mod tests {
             "INSERT INTO users (email) VALUES ('bob@x.io'), ('bob@x.io')",
         )
         .expect("rewritten");
-        for literal in sql.split("'\\x").skip(1) {
+        for literal in sql.split(SEALED_PREFIX).skip(1) {
             let stored = hex::decode(&literal[..literal.find('\'').unwrap()]).unwrap();
             assert_eq!(transform(false).open(&stored).unwrap().unwrap(), b"bob@x.io");
         }
@@ -3561,9 +3857,7 @@ mod tests {
                 .expect("rewritten");
         assert_eq!(open_hex_literal(&sql, true), b"bob@secret.test");
 
-        let start = sql.find("'\\x").unwrap() + 3;
-        let end = sql[start..].find('\'').unwrap() + start;
-        let stored = hex::decode(&sql[start..end]).unwrap();
+        let stored = hex::decode(sealed_hex(&sql).unwrap()).unwrap();
         let (index, _) = blind_index::split(&stored).unwrap();
         assert_eq!(index, blind_index::compute(&crate::rows::tests::INDEX_KEY, b"bob@secret.test"));
     }
@@ -3580,7 +3874,7 @@ mod tests {
         .expect("rewritten");
         assert!(!sql.contains("carol@secret.test"), "the inserted value leaked: {sql}");
         assert!(!sql.contains("dave@secret.test"), "the upsert value leaked: {sql}");
-        assert_eq!(sql.matches("'\\x").count(), 2, "both values sealed: {sql}");
+        assert_eq!(sql.matches(SEALED_PREFIX).count(), 2, "both values sealed: {sql}");
     }
 
     /// A tuple whose value side cannot be paired element-wise. Each of these
@@ -3970,7 +4264,7 @@ mod tests {
         )
         .expect("rewritten");
         assert!(!sql.contains("a@b.io") && !sql.contains("c@d.io"), "{sql}");
-        assert_eq!(sql.matches("'\\x").count(), 2, "both values sealed: {sql}");
+        assert_eq!(sql.matches(SEALED_PREFIX).count(), 2, "both values sealed: {sql}");
 
         // A bound placeholder in the conflict action is sealed at Bind time.
         let parse = pgwire::encode_parse(
@@ -4141,11 +4435,285 @@ mod tests {
         assert!(!sql.contains("a@b.io"), "{sql}");
     }
 
+    /// `set_config` is the function spelling of `SET`, and it arrives as an
+    /// ordinary `SELECT` — nothing in the parsed statement marks it as a
+    /// session change. Missing it is not a plaintext leak but a silent
+    /// mis-seal: the value is sealed for `public.users` while the row lands in
+    /// `tenant7.users`, where the read path can never find it again.
     #[test]
-    fn strict_mode_refuses_a_search_path_change() {
-        let mut strict = rewriter(strict_catalog(false));
-        let action = strict.on_frame(b'Q', &query_frame("SET search_path TO tenant7")).unwrap();
-        assert!(refusal(&action).contains("search_path"));
+    fn set_config_moves_search_path_the_same_way_set_does() {
+        for sql in [
+            "SELECT set_config('search_path', 'tenant7', false)",
+            "SELECT pg_catalog.set_config('search_path', 'tenant7', false)",
+            "SELECT set_config('SEARCH_PATH', 'tenant7', false)",
+            // A list that no longer starts at `public`.
+            "SELECT set_config('search_path', 'tenant7, public', false)",
+            // A setting name the proxy cannot read could be `search_path`.
+            "SELECT set_config($1, $2, false)",
+            // Nested anywhere in the statement, not just the projection.
+            "SELECT id FROM users WHERE id = (SELECT set_config('search_path', 'x', false))::int",
+        ] {
+            let mut rewriter = rewriter(catalog(false));
+            assert!(rewritten_query(&mut rewriter, sql).is_none(), "{sql}");
+            assert!(
+                rewritten_query(&mut rewriter, "INSERT INTO users (email) VALUES ('a@b.io')")
+                    .is_none(),
+                "unqualified write was still sealed after: {sql}"
+            );
+        }
+    }
+
+    /// The value still has to be read: `set_config` back to the default leaves
+    /// unqualified names resolving to `public`, so the write is sealed.
+    #[test]
+    fn set_config_back_to_the_default_stays_trusted() {
+        let mut rewriter = rewriter(catalog(false));
+        assert!(rewritten_query(
+            &mut rewriter,
+            "SELECT set_config('search_path', '\"$user\", public', false)"
+        )
+        .is_none());
+        let sql = rewritten_query(&mut rewriter, "INSERT INTO users (email) VALUES ('a@b.io')")
+            .expect("rewritten");
+        assert!(!sql.contains("a@b.io"), "{sql}");
+    }
+
+    /// Reading the whole batch's tokens up front is what makes `SET SCHEMA`
+    /// and `set_config` visible at all, but a move still belongs only to the
+    /// statements after it. Flattening the batch would let a `SET` at its end
+    /// retroactively unseal the write in front of it — a plaintext write under
+    /// the default `warn`, for SQL the server executes in the other order.
+    #[test]
+    fn a_search_path_move_does_not_reach_back_over_the_writes_before_it() {
+        let mut rewriter = rewriter(catalog(false));
+        let sql = rewritten_query(
+            &mut rewriter,
+            "INSERT INTO users (email) VALUES ('a@b.io'); SET search_path TO tenant7",
+        )
+        .expect("rewritten");
+        assert!(!sql.contains("a@b.io"), "the write before the move was not sealed: {sql}");
+
+        // And it holds for everything after it, in the same batch or a later
+        // one.
+        assert!(
+            rewritten_query(&mut rewriter, "INSERT INTO users (email) VALUES ('c@d.io')").is_none(),
+            "the move did not stick"
+        );
+    }
+
+    /// The other half of the same rule: a move does reach the statements that
+    /// follow it inside its own batch.
+    #[test]
+    fn a_search_path_move_covers_the_writes_after_it_in_the_same_batch() {
+        let mut rewriter = rewriter(catalog(false));
+        assert!(
+            rewritten_query(
+                &mut rewriter,
+                "SET search_path TO tenant7; INSERT INTO users (email) VALUES ('e@f.io')",
+            )
+            .is_none(),
+            "a write after the move in the same batch must not be sealed"
+        );
+    }
+
+    /// sqlparser 0.53 cannot parse `SET SCHEMA` at all, so it reaches the
+    /// server as unparseable SQL and, under `warn`, is relayed. Reading the
+    /// token stream rather than the AST is what keeps it tracked anyway.
+    #[test]
+    fn set_schema_moves_search_path_even_though_it_does_not_parse() {
+        let mut rewriter = rewriter(catalog(false));
+        assert!(parse_sql("SET SCHEMA 'tenant7'").is_err(), "the premise of this test");
+        assert!(rewritten_query(&mut rewriter, "SET SCHEMA 'tenant7'").is_none());
+        assert!(
+            rewritten_query(&mut rewriter, "INSERT INTO users (email) VALUES ('a@b.io')").is_none(),
+            "an unqualified name must not be sealed once SET SCHEMA moved search_path"
+        );
+    }
+
+    /// `set_config` and `SET SCHEMA` are refused under `reject` exactly as
+    /// `SET search_path` is, so an operator who pinned the search_path cannot
+    /// have it moved out from under them by a spelling the proxy ignored.
+    #[test]
+    fn strict_mode_refuses_every_search_path_spelling() {
+        for sql in [
+            "SET search_path TO tenant7",
+            "SET SCHEMA 'tenant7'",
+            "SELECT set_config('search_path', 'tenant7', false)",
+        ] {
+            let mut strict = rewriter(strict_catalog(false));
+            let action = strict.on_frame(b'Q', &query_frame(sql)).unwrap();
+            assert!(refusal(&action).contains("search_path"), "{sql}");
+        }
+    }
+
+    /// The word `set_config` inside a string literal or a quoted identifier is
+    /// data, not a call: reading tokens rather than the raw text is what keeps
+    /// these from refusing working SQL under `reject`.
+    #[test]
+    fn session_settings_are_not_read_out_of_literals_or_column_names() {
+        for sql in [
+            "SELECT id FROM users WHERE note = 'set_config(''search_path'', ''x'', false)'",
+            "UPDATE audit SET search_path = 'tenant7' WHERE id = 1",
+        ] {
+            let mut strict = rewriter(strict_catalog(false));
+            assert!(
+                matches!(
+                    strict.on_frame(b'Q', &query_frame(sql)).unwrap(),
+                    FrameAction::Relay | FrameAction::Replace(_)
+                ),
+                "{sql}"
+            );
+        }
+    }
+
+    // --- standard_conforming_strings ---------------------------------------
+
+    /// A sealed BYTEA value goes out as `E'\\x…'`, not `'\x…'`. The plain
+    /// spelling is PostgreSQL's hex input syntax only while
+    /// `standard_conforming_strings` is on; with it off the server applies
+    /// backslash processing first and stores something else entirely. The
+    /// escape-string form means the same bytes under either setting.
+    #[test]
+    fn sealed_bytea_literals_do_not_depend_on_standard_conforming_strings() {
+        let mut rewriter = rewriter(catalog(true));
+        let sql = rewritten_query(&mut rewriter, "UPDATE users SET email = 'bob@secret.test'")
+            .expect("rewritten");
+        let hex = sealed_hex(&sql).expect("sealed literal");
+        assert!(sql.contains(&format!(r"E'\\x{hex}'")), "{sql}");
+        assert!(
+            !sql.contains(&format!(r"'\x{hex}'")),
+            "a bare hex literal is still emitted: {sql}"
+        );
+
+        // The same holds for the blind-index literal a predicate is rewritten
+        // to, which is BYTEA whatever the column's own stored form is.
+        let sql = rewritten_query(&mut rewriter, "SELECT id FROM users WHERE email = 'a@b.io'")
+            .expect("rewritten");
+        let index = blind_index::compute(&crate::rows::tests::INDEX_KEY, b"a@b.io");
+        assert!(sql.contains(&sealed_literal(&index)), "{sql}");
+    }
+
+    /// Turning the setting off is still reported: the proxy's own reading of
+    /// the *client's* literals diverges from the server's from that point on,
+    /// which no choice of output encoding can fix.
+    #[test]
+    fn turning_standard_conforming_strings_off_is_an_unprotected_site() {
+        for sql in [
+            "SET standard_conforming_strings = off",
+            "SET standard_conforming_strings TO 'off'",
+            "SET SESSION standard_conforming_strings = false",
+            "SELECT set_config('standard_conforming_strings', 'off', false)",
+        ] {
+            let mut strict = rewriter(strict_catalog(false));
+            let action = strict.on_frame(b'Q', &query_frame(sql)).unwrap();
+            assert!(refusal(&action).contains("standard_conforming_strings"), "{sql}");
+        }
+    }
+
+    /// Under the default `warn` the session carries on, and the write that
+    /// follows is still sealed in the setting-independent form.
+    #[test]
+    fn a_write_after_standard_conforming_strings_off_is_still_sealed_readably() {
+        let mut rewriter = rewriter(catalog(false));
+        assert!(rewritten_query(&mut rewriter, "SET standard_conforming_strings = off").is_none());
+        let sql = rewritten_query(&mut rewriter, "INSERT INTO users (email) VALUES ('a@b.io')")
+            .expect("rewritten");
+        assert!(sql.contains(SEALED_PREFIX), "{sql}");
+        assert_eq!(open_hex_literal(&sql, false), b"a@b.io");
+    }
+
+    /// Once the setting is off, a literal that actually carries a backslash is
+    /// one the proxy and the server read differently. Sealing it would store
+    /// the proxy's reading, which nothing downstream could tell apart from a
+    /// correct value, so the literal is reported instead and the data stays
+    /// intact. Literals without a backslash mean the same thing either way and
+    /// are still sealed.
+    #[test]
+    fn a_backslash_literal_after_the_setting_moved_is_reported_not_guessed_at() {
+        let mut lenient = rewriter(catalog(true));
+        assert!(rewritten_query(&mut lenient, "SET standard_conforming_strings = off").is_none());
+
+        assert!(
+            rewritten_query(&mut lenient, r"INSERT INTO users (email) VALUES ('a\nb@secret.test')")
+                .is_none(),
+            "a literal the two sides read differently must not be sealed"
+        );
+        assert!(
+            rewritten_query(&mut lenient, r"SELECT id FROM users WHERE email = 'a\nb@secret.test'")
+                .is_none(),
+            "nor indexed"
+        );
+
+        // No backslash, no disagreement.
+        let sql = rewritten_query(&mut lenient, "INSERT INTO users (email) VALUES ('a@b.io')")
+            .expect("rewritten");
+        assert_eq!(open_hex_literal(&sql, true), b"a@b.io");
+
+        // Under `reject` the setting change is refused outright, so the state
+        // this guards against is unreachable in the mode that enforces the
+        // invariant.
+        let mut strict = rewriter(strict_catalog(true));
+        let action =
+            strict.on_frame(b'Q', &query_frame("SET standard_conforming_strings = off")).unwrap();
+        assert!(refusal(&action).contains("standard_conforming_strings"));
+    }
+
+    /// Turning it *on* is the state the proxy already assumes, so it is not a
+    /// site at all — a signal that fires on correct SQL stops being read.
+    #[test]
+    fn turning_standard_conforming_strings_on_is_not_reported() {
+        for sql in [
+            "SET standard_conforming_strings = on",
+            "SET standard_conforming_strings TO true",
+            "SET standard_conforming_strings = 1",
+        ] {
+            let mut strict = rewriter(strict_catalog(false));
+            assert!(
+                matches!(strict.on_frame(b'Q', &query_frame(sql)).unwrap(), FrameAction::Relay),
+                "{sql}"
+            );
+        }
+    }
+
+    // --- identifier folding ------------------------------------------------
+
+    /// Rust's `to_lowercase` folds `Ä` to `ä` and the Kelvin sign to `k`;
+    /// PostgreSQL leaves every multibyte character in an unquoted identifier
+    /// alone. Folding the proxy's way meant a protected column named with a
+    /// non-ASCII letter never matched, and the write went through in plaintext.
+    #[test]
+    fn a_non_ascii_column_name_is_folded_the_way_postgres_folds_it() {
+        let catalog = Arc::new(WriteCatalog::new(
+            &[column("Ämail", transform(false), false)],
+            OnUnprotected::Warn,
+        ));
+        let mut rewriter = rewriter(catalog);
+        // Written unquoted and with the ASCII half in a different case, which
+        // is exactly what the server folds and what it does not.
+        let sql = rewritten_query(&mut rewriter, "INSERT INTO users (ÄMAIL) VALUES ('a@b.io')")
+            .expect("rewritten");
+        assert!(!sql.contains("a@b.io"), "{sql}");
+        assert_eq!(open_hex_literal(&sql, false), b"a@b.io");
+    }
+
+    /// PostgreSQL truncates every identifier to 63 bytes, so a longer name in
+    /// a query refers to the truncated catalog entry. Matching the untruncated
+    /// name meant the write was treated as unprotected.
+    #[test]
+    fn an_over_long_identifier_matches_the_name_postgres_truncated_it_to() {
+        let stored = "e".repeat(crate::config::MAX_IDENTIFIER_BYTES);
+        let catalog = Arc::new(WriteCatalog::new(
+            &[column(&stored, transform(false), false)],
+            OnUnprotected::Warn,
+        ));
+        let mut rewriter = rewriter(catalog);
+        let written = format!("{stored}toolong");
+        let sql = rewritten_query(
+            &mut rewriter,
+            &format!("INSERT INTO users ({written}) VALUES ('a@b.io')"),
+        )
+        .expect("rewritten");
+        assert_eq!(open_hex_literal(&sql, false), b"a@b.io");
     }
 
     /// A session that started with a `search_path` in its startup packet is
@@ -5088,6 +5656,9 @@ mod tests {
                 "SELECT id FROM users WHERE email IN ('fred@secret.test', lower('x'))",
                 "UPDATE users SET email 'gina@secret.test'",
                 "SET search_path TO tenant7",
+                "SET SCHEMA 'tenant7'",
+                "SELECT set_config('search_path', 'tenant7', false)",
+                "SET standard_conforming_strings = off",
                 "INSERT INTO users (email) VALUES ('hank@secret.test')",
                 // The non-`'...'` literal syntaxes. These now seal rather than
                 // pass through, but they must not reach the log on the way —

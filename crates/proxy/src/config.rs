@@ -9,11 +9,26 @@
 //!   that points `search_path` somewhere else breaks that equivalence in both
 //!   directions — an unqualified write can miss the catalog (plaintext at
 //!   rest) or match the wrong table (sealed for a table the read path never
-//!   resolves). The proxy therefore watches the startup packet and `SET
-//!   search_path` for changes, and stops resolving unqualified names once the
-//!   default no longer holds; `on_unprotected` decides whether that is a
-//!   warning or a refusal. Schema-qualifying either the config or the SQL
+//!   resolves). The proxy therefore watches the startup packet and every
+//!   spelling that moves the setting — `SET search_path`, `SET SCHEMA`,
+//!   `set_config('search_path', …)` — and stops resolving unqualified names
+//!   once the default no longer holds; `on_unprotected` decides whether that
+//!   is a warning or a refusal. Schema-qualifying either the config or the SQL
 //!   sidesteps the question entirely.
+//! - **`standard_conforming_strings`.** With it on — the default, and the only
+//!   value the proxy assumes — a backslash in an ordinary string literal is
+//!   just a backslash, which is what makes the client's `'\x…'` and the
+//!   proxy's parser agree on the bytes a BYTEA literal denotes. A session that
+//!   turns it off is an `on_unprotected` site: sealed values go out in a form
+//!   that does not depend on the setting, but the *client's* literals are then
+//!   read one way by the server and another by the proxy.
+//! - **Identifier folding.** A `[[column]]` name is the name the catalog
+//!   holds. The write path folds a SQL identifier the way PostgreSQL does
+//!   before comparing it (see [`fold_identifier`]), so a configured name that
+//!   is not itself in folded form only ever matches a double-quoted SQL
+//!   reference, and one longer than [`MAX_IDENTIFIER_BYTES`] matches nothing
+//!   at all — which validation refuses rather than leaving to be discovered at
+//!   the first unprotected write.
 //! - **`COPY`.** A `COPY ... FROM` payload arrives as a `CopyData` stream the
 //!   proxy does not parse, so a bulk load into a protected table stores
 //!   plaintext; `COPY ... TO` bypasses the read path, so a masked column
@@ -29,6 +44,7 @@
 //!   `warn`, refused under `reject`. Drivers reach it only through libpq's
 //!   large-object API.
 
+use std::borrow::Cow;
 use std::fmt;
 use std::ops::Range;
 use std::path::{Path, PathBuf};
@@ -637,6 +653,52 @@ impl ColumnConfig {
     }
 }
 
+/// PostgreSQL's `NAMEDATALEN - 1`: the most bytes of an identifier the server
+/// keeps. Anything longer is truncated on the way into the catalog, and every
+/// later reference to the long name resolves to the truncated one.
+pub const MAX_IDENTIFIER_BYTES: usize = 63;
+
+/// Folds a SQL identifier the way PostgreSQL does, so that a name written in a
+/// query and the same name written in a `[[column]]` entry compare equal.
+///
+/// Both halves of this are places where Rust's own string handling would give
+/// a different answer than the server, and a mismatch here is not a parse
+/// error: it makes a protected column look unprotected, and the write path
+/// relays the plaintext.
+///
+/// - An *unquoted* identifier is downcased **ASCII-only**. `str::to_lowercase`
+///   applies full Unicode case folding — `Ä` to `ä`, the Kelvin sign `K`
+///   (U+212A) to `k` — while PostgreSQL under a UTF-8 server encoding leaves
+///   every multibyte character exactly as written. A quoted identifier is not
+///   folded at all.
+/// - Every identifier, quoted or not, is clipped to
+///   [`MAX_IDENTIFIER_BYTES`] on a character boundary (the server's
+///   `pg_mbcliplen`).
+///
+/// The write path calls this on identifiers it reads out of SQL and
+/// [`Config::validate`] calls it on the configured names, so the two cannot
+/// drift apart.
+pub fn fold_identifier(value: &str, quoted: bool) -> Cow<'_, str> {
+    let clipped = truncate_identifier(value);
+    if quoted || !clipped.bytes().any(|byte| byte.is_ascii_uppercase()) {
+        return Cow::Borrowed(clipped);
+    }
+    Cow::Owned(clipped.to_ascii_lowercase())
+}
+
+/// Clips an identifier to the bytes PostgreSQL keeps, never splitting a
+/// character.
+fn truncate_identifier(value: &str) -> &str {
+    if value.len() <= MAX_IDENTIFIER_BYTES {
+        return value;
+    }
+    let mut end = MAX_IDENTIFIER_BYTES;
+    while !value.is_char_boundary(end) {
+        end -= 1;
+    }
+    &value[..end]
+}
+
 #[derive(Debug, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct TlsSection {
@@ -881,6 +943,7 @@ impl Config {
                     "{name}: transform = \"none\" does nothing without a mask"
                 )));
             }
+            check_identifiers(&name, schema, table, &column.column)?;
         }
         Ok(protected)
     }
@@ -931,6 +994,38 @@ fn check_control_dsn_is_not_downgradeable(dsn: &Dsn) -> Result<(), Error> {
          TLS offer, answers N to its SSLRequest, and that connection carries the control user's \
          password and resolves which columns are protected. Add sslmode=require to control_dsn"
     )))
+}
+
+/// Checks one `[[column]]` entry's three names against what PostgreSQL can
+/// actually hold, so a name the catalog could never match is caught here
+/// rather than turning into a write the proxy quietly treats as unprotected.
+///
+/// A name longer than [`MAX_IDENTIFIER_BYTES`] is an error: the server
+/// truncates on the way in, so no catalog row carries the name as written and
+/// the entry can only ever fail to resolve. A name that is not already in
+/// PostgreSQL's folded form is a warning rather than an error, because it is
+/// legitimate — a column created as `"Email"` really is stored with the
+/// capital — but it is far more often a config typo, and the consequence is
+/// worth spelling out: only a *double-quoted* SQL reference will match it.
+fn check_identifiers(name: &str, schema: &str, table: &str, column: &str) -> Result<(), Error> {
+    for (kind, ident) in [("schema", schema), ("table", table), ("column", column)] {
+        if ident.len() > MAX_IDENTIFIER_BYTES {
+            return Err(Error::InvalidConfig(format!(
+                "{name}: {kind} name is {} bytes, and PostgreSQL truncates identifiers to \
+                 {MAX_IDENTIFIER_BYTES}, so no table or column can carry it",
+                ident.len()
+            )));
+        }
+        if fold_identifier(ident, false) != ident {
+            tracing::warn!(
+                kind,
+                ident,
+                "configured identifier is not in the form PostgreSQL folds an unquoted name to; \
+                 only a double-quoted SQL reference will match it"
+            );
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -997,6 +1092,62 @@ mod tests {
         )
         .unwrap();
         assert!(matches!(dup.validate(), Err(Error::InvalidConfig(_))));
+    }
+
+    /// A name PostgreSQL would have truncated cannot name anything in the
+    /// catalog, so the entry can only ever fail to resolve — caught here
+    /// rather than at the first write it silently fails to protect.
+    #[test]
+    fn over_long_identifiers_are_rejected() {
+        let long = "e".repeat(MAX_IDENTIFIER_BYTES + 1);
+        for entry in [
+            format!("table = \"{long}\"\ncolumn = \"email\"\n"),
+            format!("table = \"users\"\ncolumn = \"{long}\"\n"),
+            format!("table = \"{long}.users\"\ncolumn = \"email\"\n"),
+        ] {
+            let cfg: Config = toml::from_str(&format!(
+                "keys_file = \"k\"\ncontrol_dsn = \"d\"\n\n[[column]]\n{entry}"
+            ))
+            .unwrap();
+            let err = cfg.validate().expect_err(&entry);
+            assert!(matches!(err, Error::InvalidConfig(_)), "got {err:?}");
+        }
+
+        // Exactly at the limit is a name the server can hold.
+        let at_limit = "e".repeat(MAX_IDENTIFIER_BYTES);
+        let cfg: Config = toml::from_str(&format!(
+            "keys_file = \"k\"\ncontrol_dsn = \"d\"\n\n[[column]]\ntable = \"users\"\ncolumn = \"{at_limit}\"\n"
+        ))
+        .unwrap();
+        cfg.validate().unwrap();
+    }
+
+    /// A mixed-case or non-ASCII name is legitimate — the column really can
+    /// have been created quoted — so it warns rather than failing, and
+    /// validation still succeeds.
+    #[test]
+    fn names_outside_the_folded_form_still_validate() {
+        let cfg: Config = toml::from_str(
+            "keys_file = \"k\"\ncontrol_dsn = \"d\"\n\n[[column]]\ntable = \"Users\"\ncolumn = \"Ämail\"\n",
+        )
+        .unwrap();
+        cfg.validate().unwrap();
+    }
+
+    #[test]
+    fn identifiers_fold_the_way_postgres_folds_them() {
+        // ASCII-only downcase: `str::to_lowercase` would map `Ä` to `ä` and
+        // the Kelvin sign to `k`, where the server leaves both alone.
+        assert_eq!(fold_identifier("EMail", false), "email");
+        assert_eq!(fold_identifier("ÄMAIL", false), "Ämail");
+        assert_eq!(fold_identifier("\u{212a}elvin", false), "\u{212a}elvin");
+        // A quoted identifier is not folded at all.
+        assert_eq!(fold_identifier("EMail", true), "EMail");
+        // Both are clipped to what the catalog holds, on a character boundary.
+        let long = "é".repeat(MAX_IDENTIFIER_BYTES);
+        let folded = fold_identifier(&long, false);
+        assert_eq!(folded, "é".repeat(MAX_IDENTIFIER_BYTES / 2));
+        assert!(folded.len() <= MAX_IDENTIFIER_BYTES);
     }
 
     #[test]
