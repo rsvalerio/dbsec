@@ -109,6 +109,18 @@ Closing the connection is what makes the backend roll that implicit transaction
 back. A refused *write*, by contrast, never reaches the backend at all, so
 there is nothing to stop and the session continues.
 
+**`max_protected_value_bytes`** — the largest single protected column value the
+read path will decrypt, mask and re-encode; the default is 16 MiB. Opening one
+value costs several times its own size in transient memory — the hex-decoded
+stored form, the plaintext, the masked copy, the hex re-encode — so an
+unbounded value near the 1 GiB frame limit drives peak resident memory to
+several GiB *per session*. A value over the ceiling is a read-path refusal
+(`ERROR` + closed session, as above), never a relay of the stored form. The
+default is generous for field-level encryption, so raising it is only for a
+deployment that really does encrypt a column holding documents, images or large
+JSONB — and it buys that with the memory. `0` is refused at startup, as is
+anything above the 1 GiB frame limit, which no `DataRow` could reach anyway.
+
 **Do not run the proxy under a pre-forking supervisor.** GCM nonces come from a
 userspace generator whose state is per thread, so a `fork()` after the process
 has resolved its DEK gives both children the same nonce stream under the same

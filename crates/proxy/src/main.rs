@@ -248,6 +248,11 @@ pub enum Error {
     )]
     ProtectedValueTooLarge { position: usize, len: usize, max: usize },
     #[error(
+        "client sent a {msg_type} frame of {body_len} bytes before the backend authenticated it, \
+         over the {max} byte pre-authentication limit"
+    )]
+    PreAuthFrameTooLarge { msg_type: char, body_len: usize, max: usize },
+    #[error(
         "result column {column} is named like a protected column but carries no table identity, \
          so it cannot be decrypted or masked; it is computed or comes from a subquery, and would \
          be returned in its stored form"
@@ -467,7 +472,11 @@ async fn serve(validated: ValidatedConfig) -> Result<(), Error> {
             let columns = Arc::new(columns::build(&config, &keys));
             let dsn = protected.control_dsn.clone();
             let resolved = resolve::resolve_columns(&dsn, &tls, &columns, CONNECT_TIMEOUT).await?;
-            let rows = Arc::new(RowContext::new(resolved, config.on_unprotected));
+            let rows = Arc::new(RowContext::new(
+                resolved,
+                config.on_unprotected,
+                config.max_protected_value_bytes,
+            ));
             refresh = Some((rows.clone(), dsn, columns.clone()));
             (
                 Some(rows),
@@ -497,6 +506,7 @@ async fn serve(validated: ValidatedConfig) -> Result<(), Error> {
         max_sessions = config.max_sessions,
         startup_timeout_secs = config.startup_timeout_secs,
         column_refresh_secs = config.column_refresh_secs,
+        max_protected_value_bytes = config.max_protected_value_bytes,
         "dbsec listening"
     );
 

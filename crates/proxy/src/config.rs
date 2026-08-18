@@ -427,6 +427,21 @@ pub struct Config {
     /// when it sees a result column it cannot explain.
     #[serde(default = "default_column_refresh_secs")]
     pub column_refresh_secs: u64,
+    /// Largest single protected column value the read path will decrypt, mask
+    /// and re-encode. A value over it is refused with an ErrorResponse and the
+    /// session ends, because the alternative is handing the client the column's
+    /// stored form.
+    ///
+    /// The bound exists because opening one value costs several times its own
+    /// size in transient memory — the hex-decoded stored form, the plaintext,
+    /// the masked copy, the hex re-encode — so an unbounded value near the
+    /// 1 GiB frame limit drives peak resident memory to several GiB per session
+    /// (SEC-33). The default is generous for field-level encryption; a
+    /// deployment that encrypts a column holding documents, images or large
+    /// JSONB raises it and accepts that cost, rather than meeting a hard read
+    /// refusal naming a limit it cannot change.
+    #[serde(default = "default_max_protected_value_bytes")]
+    pub max_protected_value_bytes: usize,
     #[serde(default)]
     pub tls: TlsSection,
     /// What to do with a statement the proxy cannot protect — see
@@ -752,6 +767,13 @@ fn default_column_refresh_secs() -> u64 {
     300
 }
 
+/// 16 MiB — the read path's own default, kept where its rationale is
+/// ([`crate::rows::DEFAULT_MAX_PROTECTED_VALUE_LEN`]) rather than restated
+/// here, so the two cannot drift.
+fn default_max_protected_value_bytes() -> usize {
+    crate::rows::DEFAULT_MAX_PROTECTED_VALUE_LEN
+}
+
 impl Default for Config {
     fn default() -> Self {
         Self {
@@ -763,6 +785,7 @@ impl Default for Config {
             startup_timeout_secs: default_startup_timeout_secs(),
             max_sessions: default_max_sessions(),
             column_refresh_secs: default_column_refresh_secs(),
+            max_protected_value_bytes: default_max_protected_value_bytes(),
             tls: TlsSection::default(),
             on_unprotected: OnUnprotected::default(),
             columns: Vec::new(),
@@ -869,6 +892,16 @@ impl Config {
         }
         if self.max_sessions == 0 {
             return Err(Error::InvalidConfig("max_sessions must be greater than 0".into()));
+        }
+        // A ceiling of 0 would refuse every protected read, and one above the
+        // frame limit could never be reached — a value cannot outgrow the
+        // DataRow carrying it — so both are configuration mistakes rather than
+        // choices, and both are worth saying so at load time (ERR-11).
+        let max_frame = dbsec_core::pgwire::MAX_MESSAGE_LEN;
+        if self.max_protected_value_bytes == 0 || self.max_protected_value_bytes > max_frame {
+            return Err(Error::InvalidConfig(format!(
+                "max_protected_value_bytes must be between 1 and {max_frame} (the frame limit)"
+            )));
         }
         // Checked whether or not any `[[column]]` is configured: the proxy
         // presents this key to every client even in plain-relay mode, so it is
@@ -1039,7 +1072,27 @@ mod tests {
         assert_eq!(cfg.upstream, "127.0.0.1:5432");
         assert_eq!(cfg.startup_timeout_secs, 30);
         assert_eq!(cfg.max_sessions, 256);
+        assert_eq!(cfg.max_protected_value_bytes, crate::rows::DEFAULT_MAX_PROTECTED_VALUE_LEN);
         cfg.validate().unwrap();
+    }
+
+    /// The read path's per-value ceiling is the operator's to set, so it needs
+    /// a load-time answer for the two settings that could never work: one that
+    /// refuses every protected read, and one no DataRow could ever reach.
+    #[test]
+    fn the_protected_value_ceiling_parses_and_is_bounded() {
+        let cfg: Config = toml::from_str("max_protected_value_bytes = 67108864").unwrap();
+        cfg.validate().unwrap();
+        assert_eq!(cfg.max_protected_value_bytes, 64 * 1024 * 1024);
+
+        for invalid in ["0".to_owned(), (dbsec_core::pgwire::MAX_MESSAGE_LEN + 1).to_string()] {
+            let cfg: Config =
+                toml::from_str(&format!("max_protected_value_bytes = {invalid}")).unwrap();
+            assert!(
+                matches!(cfg.validate(), Err(Error::InvalidConfig(_))),
+                "max_protected_value_bytes = {invalid} must be refused"
+            );
+        }
     }
 
     #[test]

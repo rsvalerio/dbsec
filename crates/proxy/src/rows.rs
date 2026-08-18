@@ -40,7 +40,8 @@
 //! ever cover it — a result of the legacy function-call fast path
 //! ([`Error::FunctionCallResult`]), which bypasses SQL entirely and so arrives
 //! with no column identity of any kind, and a protected value larger than
-//! [`MAX_PROTECTED_VALUE_LEN`], which is refused rather than decrypted because
+//! `max_protected_value_bytes` ([`DEFAULT_MAX_PROTECTED_VALUE_LEN`] unless the
+//! operator says otherwise), which is refused rather than decrypted because
 //! opening it costs several times its own size in transient memory (SEC-33).
 //! The middle three are gated on `on_unprotected = "reject"`; the size ceiling,
 //! like the undescribed row, is not. They hand the client a PostgreSQL
@@ -79,8 +80,8 @@ use crate::portal::{Positions, RowSource, SessionPortals};
 use crate::session::FrameAction;
 use crate::Error;
 
-/// Largest wire value the read path will decrypt, mask and re-encode for a
-/// single protected column.
+/// Default for `max_protected_value_bytes`: the largest wire value the read
+/// path will decrypt, mask and re-encode for a single protected column.
 ///
 /// Field-level encryption protects fields — emails, identifiers, notes — so
 /// this ceiling sits orders of magnitude above anything a configured
@@ -90,7 +91,28 @@ use crate::Error;
 /// A value over it is refused rather than relayed: passing it through would
 /// hand the client a protected column's stored form, which is the one thing
 /// this module never does.
-pub const MAX_PROTECTED_VALUE_LEN: usize = 16 * 1024 * 1024;
+///
+/// It is only the *default* because the failure it produces is a hard one — an
+/// ErrorResponse and a closed session, on the read path, naming a limit the
+/// operator would otherwise have to rebuild the binary to change. A deployment
+/// that really does encrypt a column holding documents or images raises
+/// `max_protected_value_bytes` and accepts the memory that costs; nothing about
+/// 16 MiB is a safety property, only a bound on the amplification.
+pub const DEFAULT_MAX_PROTECTED_VALUE_LEN: usize = 16 * 1024 * 1024;
+
+/// The two size bounds [`RowDecryptor::decrypt_row`] enforces while it
+/// rewrites one DataRow. Grouped because they are one policy — how much
+/// transient memory a single row may cost — and because passing them
+/// separately would make the function's signature a row of bare `usize`s
+/// (FN-3, FN-4).
+#[derive(Debug, Clone, Copy)]
+struct Bounds {
+    /// Largest single protected value that will be opened, from
+    /// `max_protected_value_bytes`.
+    max_value: usize,
+    /// Largest re-encoded body the rewritten row may reach.
+    max_body: usize,
+}
 
 /// What the read path does to one column: open with the transform (when
 /// present and readable), then mask what the client would see.
@@ -236,18 +258,30 @@ pub struct RowContext {
     /// What a session does when a RowDescription looks like it was resolved
     /// against a schema that has since changed: warn, or fail the session.
     on_unprotected: OnUnprotected,
+    /// The configured per-value read-path ceiling
+    /// (`max_protected_value_bytes`, defaulting to
+    /// [`DEFAULT_MAX_PROTECTED_VALUE_LEN`]). Carried here rather than read as a
+    /// constant so a deployment whose protected columns hold more than the
+    /// default has something to set (validated at load time by
+    /// `Config::validate`).
+    max_protected_value_len: usize,
     /// Woken by a session that saw a suspect field, so a migration is picked
     /// up at the first read that notices it rather than at the next tick.
     refresh: Notify,
 }
 
 impl RowContext {
-    pub fn new(mut resolved: Resolved, on_unprotected: OnUnprotected) -> Self {
+    pub fn new(
+        mut resolved: Resolved,
+        on_unprotected: OnUnprotected,
+        max_protected_value_len: usize,
+    ) -> Self {
         resolved.generation = 0;
         Self {
             resolved: std::sync::RwLock::new(Arc::new(resolved)),
             generation: std::sync::atomic::AtomicU64::new(0),
             on_unprotected,
+            max_protected_value_len,
             refresh: Notify::new(),
         }
     }
@@ -341,7 +375,7 @@ impl RowDecryptor {
     /// A *refusal* — a DataRow no described statement covers, a result column
     /// a stale mapping would under-match or a function-call fast-path result
     /// under `on_unprotected = "reject"`, or a protected value over
-    /// [`MAX_PROTECTED_VALUE_LEN`] — hands the client
+    /// `max_protected_value_bytes` — hands the client
     /// the same PostgreSQL ErrorResponse a refused write carries, and then
     /// ends the session.
     ///
@@ -427,7 +461,14 @@ impl RowDecryptor {
                 }
                 // `- 4` because the frame header's length field counts itself:
                 // the same arithmetic `session::encode_frame_header` inverts.
-                Self::decrypt_row(positions.columns(), body, pgwire::MAX_MESSAGE_LEN - 4)
+                Self::decrypt_row(
+                    positions.columns(),
+                    body,
+                    Bounds {
+                        max_value: self.ctx.max_protected_value_len,
+                        max_body: pgwire::MAX_MESSAGE_LEN - 4,
+                    },
+                )
             }
             // A result set ended. `described` is dropped with it so a later
             // DataRow can never inherit these positions by accident.
@@ -602,19 +643,22 @@ impl RowDecryptor {
     /// frame cap drives peak resident memory to several GiB *per session*,
     /// on top of the relay buffer already holding the frame (SEC-33). So:
     ///
-    /// 1. [`MAX_PROTECTED_VALUE_LEN`] caps each protected value, checked
-    ///    before any copy of it is made;
-    /// 2. `max_body` caps the row's projected re-encoded size, tracked as
-    ///    replacements are built, so an oversized row is refused while it is
-    ///    being assembled rather than after — which is all
+    /// 1. [`Bounds::max_value`] caps each protected value, checked before any
+    ///    copy of it is made;
+    /// 2. [`Bounds::max_body`] caps the row's projected re-encoded size,
+    ///    tracked as replacements are built, so an oversized row is refused
+    ///    while it is being assembled rather than after — which is all
     ///    `session::encode_frame_header` can do, since it sees the finished
-    ///    body. It is a parameter rather than a constant so the bound is
-    ///    testable without a gigabyte-sized fixture; production passes the
-    ///    largest body a frame header can express.
+    ///    body.
+    ///
+    /// Both arrive as parameters rather than as constants: the first is the
+    /// operator's `max_protected_value_bytes`, and the second is a constant in
+    /// production (the largest body a frame header can express) but is passed
+    /// so the bound stays testable without a gigabyte-sized fixture.
     fn decrypt_row(
         positions: &[(usize, ReadColumn)],
         body: &[u8],
-        max_body: usize,
+        bounds: Bounds,
     ) -> Result<Option<Vec<u8>>, Error> {
         let mut values: Vec<Option<Cow<'_, [u8]>>> =
             pgwire::parse_data_row(body)?.into_iter().map(|v| v.map(Cow::Borrowed)).collect();
@@ -624,11 +668,11 @@ impl RowDecryptor {
         let mut changed = false;
         for (position, column) in positions {
             let Some(Some(value)) = values.get_mut(*position) else { continue };
-            if value.len() > MAX_PROTECTED_VALUE_LEN {
+            if value.len() > bounds.max_value {
                 return Err(Error::ProtectedValueTooLarge {
                     position: *position,
                     len: value.len(),
-                    max: MAX_PROTECTED_VALUE_LEN,
+                    max: bounds.max_value,
                 });
             }
             let (replacement, hex_text) = {
@@ -654,11 +698,11 @@ impl RowDecryptor {
                 // value's own length is still part of `projected` and the
                 // subtraction cannot underflow.
                 projected = projected - value.len() + replacement.len();
-                if projected > max_body {
+                if projected > bounds.max_body {
                     return Err(Error::FrameTooLarge {
                         msg_type: 'D',
                         body_len: projected,
-                        max: max_body,
+                        max: bounds.max_body,
                     });
                 }
                 *value = Cow::Owned(replacement);
@@ -763,6 +807,7 @@ pub mod tests {
         Arc::new(RowContext::new(
             Resolved { columns, names: HashSet::from(["email".to_owned()]), ..Default::default() },
             OnUnprotected::Warn,
+            DEFAULT_MAX_PROTECTED_VALUE_LEN,
         ))
     }
 
@@ -1044,7 +1089,11 @@ pub mod tests {
     /// `warn`, and with no `'T'` for `reject` to catch either (CL-3).
     #[test]
     fn a_cached_statement_picks_up_protection_added_after_it_was_described() {
-        let ctx = Arc::new(RowContext::new(Resolved::default(), OnUnprotected::Warn));
+        let ctx = Arc::new(RowContext::new(
+            Resolved::default(),
+            OnUnprotected::Warn,
+            DEFAULT_MAX_PROTECTED_VALUE_LEN,
+        ));
         let (mut rewriter, mut decryptor) = session(&ctx);
 
         prepare(&mut rewriter, b"a", b"SELECT id, email FROM users WHERE id = $1");
@@ -1279,6 +1328,7 @@ pub mod tests {
         Arc::new(RowContext::new(
             Resolved { columns, names: HashSet::from(["email".to_owned()]), ..Default::default() },
             OnUnprotected::Reject,
+            DEFAULT_MAX_PROTECTED_VALUE_LEN,
         ))
     }
 
@@ -1374,7 +1424,7 @@ pub mod tests {
         let mut decryptor = ctx.decryptor(SessionPortals::new());
         decryptor.on_frame(b'T', &row_description(&[(1234, 1), (1234, 2)])).unwrap();
 
-        let oversized = vec![b'a'; MAX_PROTECTED_VALUE_LEN + 1];
+        let oversized = vec![b'a'; DEFAULT_MAX_PROTECTED_VALUE_LEN + 1];
         let row = data_row(&[Some(b"42"), Some(&oversized)]);
         assert!(
             matches!(decryptor.on_frame(b'D', &row).unwrap(), FrameAction::RefuseAndClose(_)),
@@ -1397,7 +1447,7 @@ pub mod tests {
 
         // Pre-migration plaintext of exactly the ceiling: nothing opens it, so
         // it relays — which is only reachable if the ceiling let it through.
-        let at_ceiling = vec![b'p'; MAX_PROTECTED_VALUE_LEN];
+        let at_ceiling = vec![b'p'; DEFAULT_MAX_PROTECTED_VALUE_LEN];
         let row = data_row(&[Some(&at_ceiling)]);
         assert!(decryptor.on_frame(b'D', &row).unwrap().body().is_none());
 
@@ -1423,16 +1473,48 @@ pub mod tests {
         // Room for the row that arrived and for the first replacement, but not
         // for the second — so the refusal lands before the row is finished.
         let max_body = row.len() + 16;
+        let max_value = DEFAULT_MAX_PROTECTED_VALUE_LEN;
         assert!(matches!(
-            RowDecryptor::decrypt_row(&positions, &row, max_body),
+            RowDecryptor::decrypt_row(&positions, &row, Bounds { max_value, max_body }),
             Err(Error::FrameTooLarge { msg_type: 'D', .. })
         ));
         // The same row under a bound that fits rewrites normally.
-        let rewritten =
-            RowDecryptor::decrypt_row(&positions, &row, pgwire::MAX_MESSAGE_LEN - 4).unwrap();
+        let rewritten = RowDecryptor::decrypt_row(
+            &positions,
+            &row,
+            Bounds { max_value, max_body: pgwire::MAX_MESSAGE_LEN - 4 },
+        )
+        .unwrap();
         assert_eq!(
             pgwire::parse_data_row(&rewritten.unwrap()).unwrap(),
             vec![Some("☃".repeat(8).as_bytes()), Some("☃".repeat(8).as_bytes())]
         );
+    }
+
+    /// The per-value ceiling is the operator's `max_protected_value_bytes`, not
+    /// a constant: what `decrypt_row` enforces is whatever the config carried,
+    /// above *and* below the compiled-in default. A deployment whose protected
+    /// column holds documents raises it and its reads stop being refused; one
+    /// that wants a tighter bound than 16 MiB gets that too.
+    #[test]
+    fn the_configured_ceiling_is_what_the_read_path_enforces() {
+        let mask = MaskSpec { keep_first: 0, keep_last: 4, mask_with: '*' };
+        let positions = vec![(0, ReadColumn { transform: None, mask: Some(mask) })];
+        let row = data_row(&[Some(&vec![b'v'; 4096])]);
+        let bounds = |max_value| Bounds { max_value, max_body: pgwire::MAX_MESSAGE_LEN - 4 };
+
+        // Tighter than the default: refused, and the refusal names the
+        // configured limit rather than the constant.
+        assert!(matches!(
+            RowDecryptor::decrypt_row(&positions, &row, bounds(4095)),
+            Err(Error::ProtectedValueTooLarge { position: 0, len: 4096, max: 4095 })
+        ));
+        // Exactly at it, and above it: both go through.
+        for max_value in [4096, DEFAULT_MAX_PROTECTED_VALUE_LEN + 1] {
+            assert!(
+                RowDecryptor::decrypt_row(&positions, &row, bounds(max_value)).unwrap().is_some(),
+                "a value inside a ceiling of {max_value} must be masked, not refused"
+            );
+        }
     }
 }
