@@ -147,6 +147,19 @@ Prefer `token_file` over an inline `token` so the credential is not in the file
 that ships with the deployment at all. A config that carries no secret is an
 ordinary file and its mode is not checked.
 
+**Every outbound hop is refused in the clear.** The two pgwire hops already
+send their own `SSLRequest` and fail on a refusal, and startup now holds the
+other two to the same bar. `[vault] addr` must be `https` — that channel
+carries the Vault token, every DEK in plaintext and every deterministic index
+key, so a config copied out of a dev example does not get to put it on the
+wire; a plaintext dev server is reachable only by writing
+`allow_insecure_addr = true`, which is a choice rather than an oversight. And
+with `[tls.upstream]` configured, `control_dsn` must carry `sslmode=require`:
+its default is `prefer`, under which a server — or a MITM stripping the TLS
+offer — that answers `N` gets a plaintext session with no error, and that is
+the connection holding the control user's password and deciding which columns
+are protected.
+
 **Core dumps are disabled.** The process holds every DEK, every deterministic
 index key and the Vault token in memory, and a core file writes all of it to
 disk at once — the `Drop`-based zeroization the crate relies on never runs on an
