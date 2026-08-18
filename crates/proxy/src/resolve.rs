@@ -163,7 +163,9 @@ pub async fn resolve_columns(
             map.insert((table_oid, attnum), read);
         }
     }
-    Ok(Resolved { columns: map, names, positions })
+    // `generation` is stamped by `RowContext::publish`, which is the only
+    // thing that knows which resolution this becomes.
+    Ok(Resolved { columns: map, names, positions, ..Resolved::default() })
 }
 
 /// What the read path should do with a resolved column, or `None` when it

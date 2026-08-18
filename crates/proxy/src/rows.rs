@@ -12,7 +12,10 @@
 //! which only the client→upstream direction can see; [`crate::portal`] is the
 //! state the two directions share to keep them in agreement, and a DataRow
 //! whose columns nothing on the connection identifies fails the session
-//! instead of relaying possibly-protected values (CL-3).
+//! instead of relaying possibly-protected values (CL-3). Nor are those
+//! positions frozen once captured: a cached statement may never be described
+//! again, so what the Describe recorded is the *fields*, and the mapping is
+//! recomputed whenever the resolution behind it has moved on ([`Described`]).
 //!
 //! *Which* columns are protected is keyed differently here than on the write
 //! path, and the difference matters. `encrypt::WriteCatalog` matches by
@@ -28,16 +31,18 @@
 //!
 //! # Refusals
 //!
-//! This path has four of them: a DataRow no described statement covers
+//! This path has five of them: a DataRow no described statement covers
 //! ([`Error::UndescribedRow`]), a result column a stale mapping would
 //! under-match ([`Error::StaleColumnMap`]), a result column named like a
 //! protected one that carries no table identity at all
 //! ([`Error::ComputedProtectedColumn`]) — a cast, an expression or a subquery
 //! output, which PostgreSQL describes with `table_oid = 0` so no mapping can
-//! ever cover it — and a protected value larger than
+//! ever cover it — a result of the legacy function-call fast path
+//! ([`Error::FunctionCallResult`]), which bypasses SQL entirely and so arrives
+//! with no column identity of any kind, and a protected value larger than
 //! [`MAX_PROTECTED_VALUE_LEN`], which is refused rather than decrypted because
 //! opening it costs several times its own size in transient memory (SEC-33).
-//! The middle two are gated on `on_unprotected = "reject"`; the size ceiling,
+//! The middle three are gated on `on_unprotected = "reject"`; the size ceiling,
 //! like the undescribed row, is not. They hand the client a PostgreSQL
 //! ErrorResponse (SQLSTATE 42501, the same one a refused write carries) and
 //! then end the session — see [`RowDecryptor::on_frame`] for why the read path
@@ -119,16 +124,114 @@ pub struct Resolved {
     /// Where each configured column resolved to, by qualified name, so a
     /// re-resolution can name what moved instead of only which OID did.
     pub positions: HashMap<String, (u32, i16)>,
+    /// Which resolution this is, counting from the one built at startup.
+    ///
+    /// Assigned by [`RowContext::publish`] and ignored on the way in, so a
+    /// caller building a `Resolved` never has to know about it. It exists so a
+    /// [`Described`] can say which resolution it was computed against — see
+    /// [`Described::rederived`].
+    pub generation: u64,
+}
+
+impl Resolved {
+    /// Which positions of a result set whose fields resolve to
+    /// `(table_oid, attnum)` are protected, and what to do with each.
+    fn protected(&self, fields: impl Iterator<Item = (u32, i16)>) -> Vec<(usize, ReadColumn)> {
+        fields
+            .enumerate()
+            .filter_map(|(index, key)| self.columns.get(&key).map(|column| (index, column.clone())))
+            .collect()
+    }
+}
+
+/// What one RowDescription said, kept for every later Execute of the statement
+/// it described.
+///
+/// The positions alone are not enough. In the extended protocol a driver
+/// describes a statement once and then executes it from its cache forever, so
+/// the DataRows of that statement arrive with no `'T'` in front of them and
+/// nothing re-derives the mapping. A column whose protection is *added* after
+/// the Describe — an operator config change, or a re-resolution that had
+/// captured nothing because the column did not exist yet — would then be
+/// relayed in its stored form for the life of the statement, silently under
+/// `warn` and with no `'T'` for `reject` to catch either.
+///
+/// So the field identities are kept alongside, with the generation of the
+/// resolution the positions came out of. When the resolution moves on, the
+/// mapping is recomputed from the fields rather than trusted (CL-3).
+///
+/// The default is the empty description a `NoData` reply leaves behind: no
+/// fields, no protected positions, and nothing a re-derivation could change.
+#[derive(Default)]
+pub struct Described {
+    /// The resolution [`Self::columns`] was computed against.
+    generation: u64,
+    /// `(table_oid, attnum)` of every field of the RowDescription, in order —
+    /// the only part of it a later re-derivation needs. Six bytes per result
+    /// column, held once per described statement.
+    fields: Box<[(u32, i16)]>,
+    /// The protected positions of that result set.
+    columns: Vec<(usize, ReadColumn)>,
+}
+
+impl Described {
+    fn new(resolved: &Resolved, fields: impl Iterator<Item = (u32, i16)>) -> Self {
+        let fields: Box<[(u32, i16)]> = fields.collect();
+        Self {
+            generation: resolved.generation,
+            columns: resolved.protected(fields.iter().copied()),
+            fields,
+        }
+    }
+
+    /// The same result set's positions against a newer resolution.
+    ///
+    /// The mapping only ever *grows*. A newly covered position is taken from
+    /// the new resolution — that is the whole point — but a position this
+    /// description already protects keeps what it was described with, even
+    /// when the new resolution no longer covers it. That case is a column
+    /// whose `(table_oid, attnum)` moved, and the rows of this cached
+    /// statement are still in the form the old transform opens (the envelope
+    /// keys by key id, not by OID), so dropping it would relay stored bytes
+    /// where the frozen mapping decrypted them. Growing only is what makes
+    /// re-derivation strictly safer than freezing.
+    fn rederived(&self, resolved: &Resolved) -> Self {
+        let mut columns = resolved.protected(self.fields.iter().copied());
+        for (index, column) in &self.columns {
+            if !columns.iter().any(|(covered, _)| covered == index) {
+                columns.push((*index, column.clone()));
+            }
+        }
+        columns.sort_unstable_by_key(|(index, _)| *index);
+        Self { generation: resolved.generation, columns, fields: self.fields.clone() }
+    }
+
+    pub fn columns(&self) -> &[(usize, ReadColumn)] {
+        &self.columns
+    }
 }
 
 /// Shared, per-process state for the decrypt path.
 ///
 /// `resolved` is swapped by the refresher ([`crate::resolve::refresh_loop`]),
-/// so a long-lived session picks up a re-resolution at its next
-/// RowDescription without reconnecting. The lock is taken for a clone of one
-/// `Arc` and never across an `.await`.
+/// so a long-lived session picks up a re-resolution without reconnecting: at
+/// its next RowDescription, and — because a cached prepared statement may
+/// never send another one — at the next Execute of anything already described
+/// ([`Described::rederived`]). The lock is taken for a clone of one `Arc` and
+/// never across an `.await`.
 pub struct RowContext {
     resolved: std::sync::RwLock<Arc<Resolved>>,
+    /// The generation of `resolved`, published *after* it and readable without
+    /// the lock.
+    ///
+    /// Every DataRow of a cached statement has to ask "is the mapping I was
+    /// described with still current"; taking the resolution lock per row to
+    /// answer it would put a lock acquisition on the hottest path there is.
+    /// Publishing this second is what makes the unsynchronised read safe: a
+    /// session that sees the old value merely re-asks on the next row, whereas
+    /// seeing the new value while reading the old resolution would stamp a
+    /// stale re-derivation as current and never look again.
+    generation: std::sync::atomic::AtomicU64,
     /// What a session does when a RowDescription looks like it was resolved
     /// against a schema that has since changed: warn, or fail the session.
     on_unprotected: OnUnprotected,
@@ -138,9 +241,11 @@ pub struct RowContext {
 }
 
 impl RowContext {
-    pub fn new(resolved: Resolved, on_unprotected: OnUnprotected) -> Self {
+    pub fn new(mut resolved: Resolved, on_unprotected: OnUnprotected) -> Self {
+        resolved.generation = 0;
         Self {
             resolved: std::sync::RwLock::new(Arc::new(resolved)),
+            generation: std::sync::atomic::AtomicU64::new(0),
             on_unprotected,
             refresh: Notify::new(),
         }
@@ -153,9 +258,23 @@ impl RowContext {
         self.resolved.read().unwrap_or_else(PoisonError::into_inner).clone()
     }
 
-    /// Publishes a fresh resolution to every live session.
-    pub fn publish(&self, resolved: Resolved) {
-        *self.resolved.write().unwrap_or_else(PoisonError::into_inner) = Arc::new(resolved);
+    /// Publishes a fresh resolution to every live session, under the next
+    /// generation — which is what tells a cached statement's positions they
+    /// are out of date.
+    pub fn publish(&self, mut resolved: Resolved) {
+        use std::sync::atomic::Ordering;
+        let mut slot = self.resolved.write().unwrap_or_else(PoisonError::into_inner);
+        let generation = slot.generation.saturating_add(1);
+        resolved.generation = generation;
+        *slot = Arc::new(resolved);
+        drop(slot);
+        // After the swap, deliberately: see the field's own comment.
+        self.generation.store(generation, Ordering::Release);
+    }
+
+    /// The generation a description has to match to still be current.
+    fn generation(&self) -> u64 {
+        self.generation.load(std::sync::atomic::Ordering::Acquire)
     }
 
     /// Resolves as soon as the refresher is next scheduled.
@@ -176,6 +295,7 @@ impl RowContext {
             described: None,
             warned_stale: false,
             warned_computed: false,
+            warned_function_call: false,
         }
     }
 }
@@ -193,6 +313,7 @@ pub struct RowDecryptor {
     /// for exactly as long as the migration goes unnoticed.
     warned_stale: bool,
     warned_computed: bool,
+    warned_function_call: bool,
 }
 
 /// Whether an error is a refusal the client can be told about, rather than a
@@ -207,6 +328,7 @@ fn is_refusal(error: &Error) -> bool {
         Error::UndescribedRow
             | Error::StaleColumnMap { .. }
             | Error::ComputedProtectedColumn { .. }
+            | Error::FunctionCallResult
             | Error::ProtectedValueTooLarge { .. }
     )
 }
@@ -216,8 +338,9 @@ impl RowDecryptor {
     /// it.
     ///
     /// A *refusal* — a DataRow no described statement covers, a result column
-    /// a stale mapping would under-match under `on_unprotected = "reject"`, or
-    /// a protected value over [`MAX_PROTECTED_VALUE_LEN`] — hands the client
+    /// a stale mapping would under-match or a function-call fast-path result
+    /// under `on_unprotected = "reject"`, or a protected value over
+    /// [`MAX_PROTECTED_VALUE_LEN`] — hands the client
     /// the same PostgreSQL ErrorResponse a refused write carries, and then
     /// ends the session.
     ///
@@ -269,16 +392,10 @@ impl RowDecryptor {
             b'T' => {
                 let fields = pgwire::parse_row_description(body)?;
                 let resolved = self.ctx.resolved();
-                let positions: Positions = fields
-                    .iter()
-                    .enumerate()
-                    .filter_map(|(i, f)| {
-                        resolved
-                            .columns
-                            .get(&(f.table_oid, f.attnum))
-                            .map(|column| (i, column.clone()))
-                    })
-                    .collect();
+                let positions: Positions = Arc::new(Described::new(
+                    &resolved,
+                    fields.iter().map(|f| (f.table_oid, f.attnum)),
+                ));
                 self.check_for_stale_mapping(&fields, &resolved, &positions)?;
                 // Whichever Describe asked for this keeps it, so every later
                 // Execute of that statement decrypts the right positions.
@@ -293,19 +410,23 @@ impl RowDecryptor {
             }
             b'D' => {
                 let positions = match self.portals.row_source() {
-                    RowSource::Portal(positions) => positions,
+                    // A cached statement's description can be arbitrarily old,
+                    // so it is checked against the current resolution before
+                    // it is used; a simple-protocol description was built from
+                    // the `'T'` immediately in front of these rows.
+                    RowSource::Portal(positions) => self.current(positions),
                     RowSource::LastDescription => match &self.described {
                         Some(positions) => positions.clone(),
                         None => return Err(Error::UndescribedRow),
                     },
                     RowSource::Undescribed => return Err(Error::UndescribedRow),
                 };
-                if positions.is_empty() {
+                if positions.columns().is_empty() {
                     return Ok(None);
                 }
                 // `- 4` because the frame header's length field counts itself:
                 // the same arithmetic `session::encode_frame_header` inverts.
-                Self::decrypt_row(&positions, body, pgwire::MAX_MESSAGE_LEN - 4)
+                Self::decrypt_row(positions.columns(), body, pgwire::MAX_MESSAGE_LEN - 4)
             }
             // A result set ended. `described` is dropped with it so a later
             // DataRow can never inherit these positions by accident.
@@ -319,8 +440,70 @@ impl RowDecryptor {
                 self.described = None;
                 Ok(None)
             }
+            b'V' => self.function_call_result(),
             _ => Ok(None),
         }
+    }
+
+    /// The positions to decrypt a cached statement's rows with, re-derived
+    /// when the resolution has moved since the Describe that captured them.
+    ///
+    /// This is the window the refresher's "picked up at the next
+    /// RowDescription" model does not close. A driver with a prepared-statement
+    /// cache describes a statement once and then sends only Bind/Execute, so
+    /// there may never *be* a next RowDescription; a column whose protection is
+    /// added afterwards would be relayed in its stored form for as long as the
+    /// statement lives (CL-3). The field identities kept in [`Described`] are
+    /// enough to answer the question without one.
+    ///
+    /// The re-derivation is written back, so it costs one pass over the fields
+    /// per Execute rather than one per row, and it is not a refusal: the new
+    /// mapping is the *correct* answer, so there is nothing to refuse. The
+    /// name heuristics of [`Self::check_for_stale_mapping`] are not re-run
+    /// either, and cannot be — a `Described` keeps field identities, not field
+    /// names. Nothing is lost by that: those heuristics exist to notice a
+    /// mapping that stopped covering a column, and re-derivation never drops a
+    /// mapping, so a cached statement keeps decrypting exactly as it did.
+    fn current(&self, positions: Positions) -> Positions {
+        if positions.generation == self.ctx.generation() {
+            return positions;
+        }
+        let resolved = self.ctx.resolved();
+        let refreshed = Arc::new(positions.rederived(&resolved));
+        self.portals.rederived(&refreshed);
+        refreshed
+    }
+
+    /// The legacy fast path's answer (`FunctionCall` `'F'` →
+    /// `FunctionCallResponse` `'V'`), which is a result this module cannot
+    /// place.
+    ///
+    /// The fast path invokes a function by OID with binary arguments and no
+    /// SQL at all, so the rewriter never sees it and there is no
+    /// RowDescription behind it: the reply is one bare value, and nothing on
+    /// the connection says which column it came out of. A function that reads
+    /// a protected column — `lo_get`, a custom accessor, a `SECURITY DEFINER`
+    /// reader — therefore hands the client the column's stored form:
+    /// `blind_index || envelope` for an encrypted column, and the *unmasked*
+    /// value for a mask-only one.
+    ///
+    /// It is the same question `on_unprotected` answers everywhere else —
+    /// "this may be unprotected, would you rather have an error than a guess"
+    /// — so it is answered by the same switch rather than by a catch-all
+    /// relay. Under `reject` the result is refused; under `warn` it is
+    /// relayed, once per session, with a line saying so.
+    fn function_call_result(&mut self) -> Result<Option<Vec<u8>>, Error> {
+        if self.ctx.on_unprotected == OnUnprotected::Reject {
+            return Err(Error::FunctionCallResult);
+        }
+        if !self.warned_function_call {
+            self.warned_function_call = true;
+            tracing::warn!(
+                "the client used the legacy function-call fast path; its result carries no column \
+                 identity, so it cannot be decrypted or masked and is being relayed as stored"
+            );
+        }
+        Ok(None)
     }
 
     /// Notices a RowDescription that a stale `(table_oid, attnum)` mapping
@@ -349,7 +532,7 @@ impl RowDecryptor {
         resolved: &Resolved,
         positions: &Positions,
     ) -> Result<(), Error> {
-        let covered: HashSet<usize> = positions.iter().map(|(index, _)| *index).collect();
+        let covered: HashSet<usize> = positions.columns().iter().map(|(index, _)| *index).collect();
         let named_like_protected = |field: &pgwire::RowField<'_>| {
             std::str::from_utf8(field.name)
                 .is_ok_and(|name| resolved.names.contains(&name.to_lowercase()))
@@ -551,6 +734,20 @@ pub mod tests {
     /// fixture row description describes.
     pub fn cell_context() -> CellContext {
         CellContext::new("public.users.email")
+    }
+
+    /// A description of `count` protected columns at positions `0..count`, for
+    /// the tests here and in [`crate::portal`] that only care how a
+    /// description is routed rather than what it decrypts.
+    pub fn description(count: usize) -> Positions {
+        let fields: Vec<(u32, i16)> =
+            (0..count).map(|attnum| (1234, i16::try_from(attnum).expect("small"))).collect();
+        let columns: ColumnMap = fields
+            .iter()
+            .map(|key| (*key, ReadColumn { transform: Some(transform(false)), mask: None }))
+            .collect();
+        let resolved = Resolved { columns, ..Default::default() };
+        Arc::new(Described::new(&resolved, fields.into_iter()))
     }
 
     pub fn transform(searchable: bool) -> Arc<dyn FieldTransform> {
@@ -837,6 +1034,90 @@ pub mod tests {
             .is_none());
     }
 
+    /// The other half of the cached-statement story. A driver that describes
+    /// once and then sends only Bind/Execute produces DataRows with no `'T'`
+    /// in front of them, so nothing re-derives the mapping: a column whose
+    /// protection is *added* after the Describe — an operator config change,
+    /// or a first resolution that ran before the column existed — was relayed
+    /// in its stored form for the whole life of the statement. Silently under
+    /// `warn`, and with no `'T'` for `reject` to catch either (CL-3).
+    #[test]
+    fn a_cached_statement_picks_up_protection_added_after_it_was_described() {
+        let ctx = Arc::new(RowContext::new(Resolved::default(), OnUnprotected::Warn));
+        let (mut rewriter, mut decryptor) = session(&ctx);
+
+        prepare(&mut rewriter, b"a", b"SELECT id, email FROM users WHERE id = $1");
+        decryptor.on_frame(b'T', &row_description(&[(1234, 1), (1234, 2)])).unwrap();
+        decryptor.on_frame(b'Z', b"I").unwrap();
+
+        // Nothing is protected yet, so the column relays. That is the state
+        // the window opens in, and where it used to stay.
+        let ct = envelope::encrypt(&KEY, &KEY_ID, &cell_context(), b"alice@example.com").unwrap();
+        execute(&mut rewriter, b"a");
+        let row = data_row(&[Some(b"42"), Some(&ct)]);
+        assert!(decryptor.on_frame(b'D', &row).unwrap().body().is_none());
+        complete(&mut decryptor);
+
+        // A re-resolution now covers the position the statement was described
+        // with. The driver sends no Describe — it already has one.
+        let mut columns = ColumnMap::new();
+        columns.insert((1234, 2), ReadColumn { transform: Some(transform(false)), mask: None });
+        ctx.publish(Resolved { columns, ..Default::default() });
+
+        execute(&mut rewriter, b"a");
+        // Twice: the second row proves the re-derivation was written back to
+        // the portal rather than recomputed per row.
+        for _ in 0..2 {
+            let rewritten = decryptor
+                .on_frame(b'D', &row)
+                .unwrap()
+                .body()
+                .expect("a cached Execute must re-derive against the current resolution");
+            assert_eq!(
+                pgwire::parse_data_row(&rewritten).unwrap()[1],
+                Some(b"alice@example.com".as_slice())
+            );
+        }
+    }
+
+    /// The other direction of the same re-derivation: a resolution that stops
+    /// covering a position must not *un*protect it. When a column's
+    /// `(table_oid, attnum)` moves, the rows of a statement described before
+    /// the move are still in the form the old transform opens — the envelope
+    /// keys by key id, not by OID — so a re-derivation that dropped the
+    /// mapping would relay ciphertext where freezing it decrypted.
+    #[test]
+    fn a_re_resolution_that_moves_a_column_does_not_unprotect_a_cached_statement() {
+        let ctx = context(false);
+        let (mut rewriter, mut decryptor) = session(&ctx);
+
+        prepare(&mut rewriter, b"a", b"SELECT id, email FROM users WHERE id = $1");
+        decryptor.on_frame(b'T', &row_description(&[(1234, 1), (1234, 2)])).unwrap();
+        decryptor.on_frame(b'Z', b"I").unwrap();
+
+        // The table is recreated, so the column resolves somewhere else
+        // entirely and nothing covers the described position any more.
+        let mut columns = ColumnMap::new();
+        columns.insert((5678, 2), ReadColumn { transform: Some(transform(false)), mask: None });
+        ctx.publish(Resolved {
+            columns,
+            names: HashSet::from(["email".to_owned()]),
+            ..Default::default()
+        });
+
+        execute(&mut rewriter, b"a");
+        let ct = envelope::encrypt(&KEY, &KEY_ID, &cell_context(), b"alice@example.com").unwrap();
+        let rewritten = decryptor
+            .on_frame(b'D', &data_row(&[Some(b"42"), Some(&ct)]))
+            .unwrap()
+            .body()
+            .expect("the description keeps what it was described with");
+        assert_eq!(
+            pgwire::parse_data_row(&rewritten).unwrap()[1],
+            Some(b"alice@example.com".as_slice())
+        );
+    }
+
     /// The frames a refusal put on the wire, as one buffer.
     fn refused(action: FrameAction) -> Vec<u8> {
         let FrameAction::RefuseAndClose(frames) = action else {
@@ -954,22 +1235,7 @@ pub mod tests {
         assert!(warn.warned_computed, "still reported on a later result set");
 
         // reject: the client is answered instead of handed stored bytes.
-        let strict = Arc::new(RowContext::new(
-            Resolved {
-                columns: {
-                    let mut columns = ColumnMap::new();
-                    columns.insert(
-                        (1234, 2),
-                        ReadColumn { transform: Some(transform(false)), mask: None },
-                    );
-                    columns
-                },
-                names: HashSet::from(["email".to_owned()]),
-                ..Default::default()
-            },
-            OnUnprotected::Reject,
-        ));
-        let mut decryptor = strict.decryptor(SessionPortals::new());
+        let mut decryptor = strict_context().decryptor(SessionPortals::new());
         let frames = refused(decryptor.on_frame(b'T', &computed).unwrap());
         let text = String::from_utf8_lossy(&frames);
         assert!(text.contains("42501"), "the client gets a SQLSTATE: {text}");
@@ -996,18 +1262,47 @@ pub mod tests {
     /// with, so the two halves of the setting behave alike.
     #[test]
     fn a_moved_protected_column_refuses_the_result_set_in_strict_mode() {
-        let mut columns = ColumnMap::new();
-        columns.insert((1234, 2), ReadColumn { transform: Some(transform(false)), mask: None });
-        let ctx = Arc::new(RowContext::new(
-            Resolved { columns, names: HashSet::from(["email".to_owned()]), ..Default::default() },
-            OnUnprotected::Reject,
-        ));
-        let mut decryptor = ctx.decryptor(SessionPortals::new());
+        let mut decryptor = strict_context().decryptor(SessionPortals::new());
         let error = refused(
             decryptor.on_frame(b'T', &named_row_description(&[("email", 5678, 2)])).unwrap(),
         );
         let text = String::from_utf8_lossy(&error);
         assert!(text.contains("42501") && text.contains("email"), "{text}");
+    }
+
+    /// A strict context over the same one configured column, for the checks
+    /// whose whole point is what `reject` does differently.
+    fn strict_context() -> Arc<RowContext> {
+        let mut columns = ColumnMap::new();
+        columns.insert((1234, 2), ReadColumn { transform: Some(transform(false)), mask: None });
+        Arc::new(RowContext::new(
+            Resolved { columns, names: HashSet::from(["email".to_owned()]), ..Default::default() },
+            OnUnprotected::Reject,
+        ))
+    }
+
+    /// The legacy fast path (`FunctionCall` `'F'` → `FunctionCallResponse`
+    /// `'V'`) never goes through SQL, so the rewriter does not see it and no
+    /// RowDescription precedes its answer. `'V'` used to fall through the
+    /// catch-all arm and relay, which for a function that reads a protected
+    /// column hands the client the stored form — and for a mask-only column
+    /// the value the mask exists to hide.
+    #[test]
+    fn a_function_call_result_is_not_relayed_through_the_catch_all() {
+        // warn: relayed, reported, and reported only once.
+        let mut warn = context(false).decryptor(SessionPortals::new());
+        assert!(warn.on_frame(b'V', b"\0\0\0\x04spam").unwrap().body().is_none());
+        assert!(warn.warned_function_call, "the session must report it");
+        warn.warned_function_call = false;
+        warn.on_frame(b'V', b"\0\0\0\x04spam").unwrap();
+        assert!(warn.warned_function_call, "still reported on a later call");
+
+        // reject: the client is answered instead of handed the result.
+        let mut strict = strict_context().decryptor(SessionPortals::new());
+        let frames = refused(strict.on_frame(b'V', b"\0\0\0\x04spam").unwrap());
+        let text = String::from_utf8_lossy(&frames);
+        assert!(text.contains("42501"), "the client gets a SQLSTATE: {text}");
+        assert!(text.contains("fast path"), "and a reason: {text}");
     }
 
     /// A re-resolution reaches sessions that are already open: the mapping is

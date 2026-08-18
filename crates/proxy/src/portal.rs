@@ -45,7 +45,7 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use dbsec_core::transform::FieldTransform;
 
-use crate::rows::ReadColumn;
+use crate::rows::Described;
 use crate::Error;
 
 /// Prepared statements one session may hold at once. Drivers cache tens of
@@ -68,10 +68,11 @@ pub const MAX_NAME_LEN: usize = 256;
 /// session; real pipelines are orders of magnitude shorter.
 pub const MAX_PENDING_RESPONSES: usize = 4096;
 
-/// Which positions of a result set are protected, and what the read path does
-/// to each. Shared behind an `Arc` because the same description serves every
-/// Execute of the statement it belongs to.
-pub type Positions = Arc<[(usize, ReadColumn)]>;
+/// What one RowDescription said about a result set. Shared behind an `Arc`
+/// because the same description serves every Execute of the statement it
+/// belongs to — which is also why it carries the resolution it was computed
+/// against; see [`crate::rows::Described`].
+pub type Positions = Arc<Described>;
 
 /// What Bind must do to one parameter of a prepared statement.
 #[derive(Clone)]
@@ -412,7 +413,23 @@ impl SessionPortals {
     /// which is still a description — an Execute of it must not fall back to
     /// some other statement's positions.
     pub fn no_data(&self) {
-        self.describe_answered(&Positions::from(Vec::new()));
+        self.describe_answered(&Positions::default());
+    }
+
+    /// Replaces the description of the Execute now being answered with one
+    /// re-derived against a newer resolution, so the rest of that result set
+    /// costs nothing more than the comparison. Only the front entry: the
+    /// re-derivation is of *this* result set's fields, and the Executes queued
+    /// behind it describe other statements.
+    ///
+    /// See [`crate::rows::RowDecryptor::current`].
+    pub fn rederived(&self, positions: &Positions) {
+        let mut tracked = self.tracked();
+        if let Some(Pending::Execute { positions: slot @ Some(_), .. }) =
+            tracked.pending.front_mut()
+        {
+            *slot = Some(positions.clone());
+        }
     }
 
     /// Which positions the DataRow now arriving must be decrypted with.
@@ -471,13 +488,7 @@ fn push(tracked: &mut Tracked, pending: Pending) -> Result<(), Error> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::rows::tests::transform;
-
-    fn positions(count: usize) -> Positions {
-        (0..count)
-            .map(|i| (i, ReadColumn { transform: Some(transform(false)), mask: None }))
-            .collect()
-    }
+    use crate::rows::tests::{description as positions, transform};
 
     fn portals() -> Arc<SessionPortals> {
         SessionPortals::new()
@@ -501,7 +512,7 @@ mod tests {
         let RowSource::Portal(found) = portals.row_source() else {
             panic!("s1's own description must be used");
         };
-        assert_eq!(found.len(), 2);
+        assert_eq!(found.columns().len(), 2);
     }
 
     #[test]
@@ -629,7 +640,7 @@ mod tests {
         let RowSource::Portal(found) = portals.row_source() else {
             panic!("the description answered for this Execute must still reach it");
         };
-        assert_eq!(found.len(), 2);
+        assert_eq!(found.columns().len(), 2);
     }
 
     /// The same for a portal closed ahead of its own results, which is the
@@ -648,7 +659,7 @@ mod tests {
         let RowSource::Portal(found) = portals.row_source() else {
             panic!("closing the portal must not orphan the rows already in flight");
         };
-        assert_eq!(found.len(), 3);
+        assert_eq!(found.columns().len(), 3);
     }
 
     /// A description is answered for one incarnation of a name. Re-parsing the

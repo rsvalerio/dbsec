@@ -87,6 +87,22 @@ const ALLOW_CORE_DUMPS_FLAG: &str = "--allow-core-dumps";
 
 const USAGE: &str = "usage: dbsec [--plain-relay] [--allow-core-dumps] [config.toml]";
 
+/// Claims the right to install a thread-local `tracing` subscriber and assert
+/// on what it saw. Held for as long as the subscriber is.
+///
+/// `tracing` caches each callsite's interest process-wide and rebuilds that
+/// cache only when the number of scoped subscribers rises *from zero*. Every
+/// warn-mode test that runs without a subscriber leaves the callsites it
+/// touched cached as "never interested"; a capture test starting while another
+/// one is still installed does not lift that count from zero, so no rebuild
+/// happens and it captures nothing. Serialising them is what keeps the count
+/// going 0 → 1 every time.
+#[cfg(test)]
+pub fn log_capture() -> std::sync::MutexGuard<'static, ()> {
+    static LOG_CAPTURE: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    LOG_CAPTURE.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
     #[error("{message}; {USAGE}")]
@@ -183,6 +199,11 @@ pub enum Error {
          be returned in its stored form"
     )]
     ComputedProtectedColumn { column: String },
+    #[error(
+        "the legacy function-call fast path returned a result the proxy cannot attribute to any \
+         column, so it cannot be decrypted or masked; use SQL instead of the FunctionCall message"
+    )]
+    FunctionCallResult,
     #[error(transparent)]
     Wire(#[from] dbsec_core::Error),
     #[error(transparent)]
@@ -863,6 +884,7 @@ mod tests {
     fn the_default_filter_quiets_the_vault_client_without_quieting_the_proxy() {
         use tracing_subscriber::layer::SubscriberExt as _;
 
+        let _capture = log_capture();
         let subscriber = tracing_subscriber::registry()
             .with(tracing_subscriber::EnvFilter::new(DEFAULT_LOG_FILTER));
 
