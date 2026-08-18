@@ -48,7 +48,7 @@ use tokio::net::TcpStream;
 use tokio::sync::{watch, Mutex};
 use tokio::time::timeout;
 
-use crate::encrypt::{QueryRewriter, WriteCatalog};
+use crate::encrypt::{QueryRewriter, StartupSettings, WriteCatalog};
 use crate::portal::SessionPortals;
 use crate::rows::RowContext;
 use crate::tls::{MaybeTls, TlsContext};
@@ -133,9 +133,9 @@ pub enum FrameAction {
 struct Started {
     client: MaybeTls<TcpStream>,
     upstream: MaybeTls<TcpStream>,
-    /// Whether the startup packet left unqualified names resolving to
-    /// `public`, which is what the write catalog assumes.
-    search_path_trusted: bool,
+    /// What the startup packet already moved: the session settings the rewrite
+    /// depends on, in whatever state the connection begins in.
+    settings: StartupSettings,
 }
 
 pub async fn run(
@@ -150,7 +150,7 @@ pub async fn run(
     let started = timeout(ctx.startup_timeout, start_session(client, ctx))
         .await
         .map_err(|_| Error::StartupTimeout { timeout: ctx.startup_timeout })??;
-    let Some(Started { client, upstream, search_path_trusted }) = started else {
+    let Some(Started { client, upstream, settings }) = started else {
         return Ok(()); // client connected and left (health check)
     };
 
@@ -165,7 +165,7 @@ pub async fn run(
     let mut rewriter = ctx
         .writes
         .as_ref()
-        .map(|writes| QueryRewriter::new(writes.clone(), portals, tx_status, search_path_trusted));
+        .map(|writes| QueryRewriter::new(writes.clone(), portals, tx_status, settings));
     let (client_r, client_w) = tokio::io::split(client);
     let (upstream_r, upstream_w) = tokio::io::split(upstream);
     let client_w = Arc::new(Mutex::new(client_w));
@@ -346,31 +346,64 @@ async fn start_session(client: TcpStream, ctx: &SessionContext) -> Result<Option
         None => MaybeTls::Plain(upstream_tcp),
     };
     upstream.write_all(&startup).await?;
-    Ok(Some(Started { client, upstream, search_path_trusted: search_path_is_default(&startup) }))
+    Ok(Some(Started { client, upstream, settings: startup_settings(&startup) }))
 }
 
-/// Whether the startup packet leaves unqualified table names resolving to
-/// `public`, which is what the write catalog assumes. Drivers can set
-/// `search_path` as a startup parameter or through `options=-c search_path=…`;
-/// either way the assumption no longer holds and the rewriter stops resolving
-/// bare names.
-fn search_path_is_default(startup: &[u8]) -> bool {
-    let Some(mut params) = startup.get(pgwire::STARTUP_HEADER_LEN..) else { return true };
+/// The session settings the startup packet already moved, before the first
+/// statement is seen.
+///
+/// Both of them can be set here as well as mid-session, and a client that does
+/// it here is in exactly the state a `SET` would have left it in — so the
+/// connect-time half is read out of the packet and handed to the rewriter,
+/// which tracks the in-session half itself. A driver can spell either one as a
+/// startup parameter or inside `options=-c <name>=<value>`:
+///
+/// - `search_path` off `public` means unqualified names no longer resolve to
+///   the schema the write catalog assumes, so bare names stop being resolved;
+/// - `standard_conforming_strings` off means PostgreSQL reads a backslash in an
+///   ordinary `'…'` literal as the start of an escape while the proxy's parser
+///   does not, so the two no longer agree on what such a literal contains.
+///
+/// Setting names are matched case-insensitively because that is how the server
+/// resolves them: `SEARCH_PATH` in a startup packet moves `search_path`.
+fn startup_settings(startup: &[u8]) -> StartupSettings {
+    let mut settings = StartupSettings::default();
+    let Some(mut params) = startup.get(pgwire::STARTUP_HEADER_LEN..) else { return settings };
     while let Ok(key) = pgwire::take_cstr(&mut params) {
         if key.is_empty() {
             break;
         }
         let Ok(value) = pgwire::take_cstr(&mut params) else { break };
-        let mentions_search_path = match key {
-            b"search_path" => value != b"public",
-            b"options" => value.windows(11).any(|w| w == b"search_path"),
-            _ => false,
-        };
-        if mentions_search_path {
-            return false;
+        if key.eq_ignore_ascii_case(b"search_path") {
+            settings.search_path_trusted &= value == b"public";
+        } else if key.eq_ignore_ascii_case(b"standard_conforming_strings") {
+            settings.escape_strings |= !is_on(value);
+        } else if key.eq_ignore_ascii_case(b"options") {
+            // `options` is a command line, not a value: `-c name=value`,
+            // `--name=value` and shell quoting all spell the same assignment,
+            // and which value each ends up with is not something the proxy can
+            // read back reliably. A mention of either setting is therefore
+            // taken as a move — the same conservative reading the in-session
+            // scan gives an assignment it cannot evaluate.
+            settings.search_path_trusted &= !mentions(value, b"search_path");
+            settings.escape_strings |= mentions(value, b"standard_conforming_strings");
         }
     }
-    true
+    settings
+}
+
+/// Whether a command line mentions a setting by name at all.
+fn mentions(options: &[u8], setting: &[u8]) -> bool {
+    options.windows(setting.len()).any(|window| window.eq_ignore_ascii_case(setting))
+}
+
+/// Whether a startup parameter turns a boolean setting on. The spellings are
+/// [`crate::encrypt::is_on_value`]'s, so the connect-time reading of a setting
+/// cannot drift from the in-session one. Anything else — a value that is not
+/// even UTF-8 included — leaves the setting off as far as the rewrite is
+/// concerned: a value the proxy cannot read is one it cannot keep assuming.
+fn is_on(value: &[u8]) -> bool {
+    std::str::from_utf8(value).is_ok_and(crate::encrypt::is_on_value)
 }
 
 /// Sends SSLRequest upstream and requires the `S` answer; a server that
@@ -870,20 +903,64 @@ mod tests {
         assert_eq!(read.as_deref(), Some(msg.as_slice()));
     }
 
+    /// A startup message carrying `params` as its parameter section.
+    fn startup(params: &[u8]) -> Vec<u8> {
+        let mut msg = ((8 + params.len()) as i32).to_be_bytes().to_vec();
+        msg.extend_from_slice(&pgwire::PROTOCOL_V3.to_be_bytes());
+        msg.extend_from_slice(params);
+        msg
+    }
+
     #[test]
     fn startup_parameters_reveal_a_moved_search_path() {
-        let startup = |params: &[u8]| {
-            let mut msg = ((8 + params.len()) as i32).to_be_bytes().to_vec();
-            msg.extend_from_slice(&pgwire::PROTOCOL_V3.to_be_bytes());
-            msg.extend_from_slice(params);
-            msg
-        };
-        assert!(search_path_is_default(&startup(b"user\0test\0\0")));
-        assert!(search_path_is_default(&startup(b"search_path\0public\0\0")));
-        assert!(!search_path_is_default(&startup(b"search_path\0tenant7\0\0")));
-        assert!(!search_path_is_default(&startup(b"options\0-c search_path=tenant7\0\0")));
+        let trusted = |params: &[u8]| startup_settings(&startup(params)).search_path_trusted;
+        assert!(trusted(b"user\0test\0\0"));
+        assert!(trusted(b"search_path\0public\0\0"));
+        assert!(!trusted(b"search_path\0tenant7\0\0"));
+        assert!(!trusted(b"options\0-c search_path=tenant7\0\0"));
+        // The server resolves a setting name case-insensitively, so a startup
+        // packet can move `search_path` without spelling it in lower case.
+        assert!(!trusted(b"SEARCH_PATH\0tenant7\0\0"));
+        assert!(!trusted(b"options\0-c Search_Path=tenant7\0\0"));
         // A cancel request has no parameter section at all.
-        assert!(search_path_is_default(&startup(b"")));
+        assert!(trusted(b""));
+    }
+
+    /// The other setting the rewrite depends on, reachable by the same two
+    /// spellings. Missed here, the divergence it causes is silent: from the
+    /// first statement onwards a backslash in an ordinary literal means one
+    /// thing to PostgreSQL and another to the proxy's parser.
+    #[test]
+    fn startup_parameters_reveal_standard_conforming_strings_turned_off() {
+        let escapes = |params: &[u8]| startup_settings(&startup(params)).escape_strings;
+        assert!(!escapes(b"user\0test\0\0"));
+        assert!(!escapes(b"standard_conforming_strings\0on\0\0"));
+        // Every spelling of boolean true leaves the setting where the rewrite
+        // already assumes it is.
+        for on in [&b"on"[..], b"ON", b"true", b"t", b"yes", b"y", b"1"] {
+            let mut params = b"standard_conforming_strings\0".to_vec();
+            params.extend_from_slice(on);
+            params.extend_from_slice(b"\0\0");
+            assert!(!escapes(&params), "{}", String::from_utf8_lossy(on));
+        }
+        assert!(escapes(b"standard_conforming_strings\0off\0\0"));
+        assert!(escapes(b"STANDARD_CONFORMING_STRINGS\0off\0\0"));
+        assert!(escapes(b"options\0-c standard_conforming_strings=off\0\0"));
+        // A value the proxy cannot evaluate is one it cannot keep assuming.
+        assert!(escapes(b"standard_conforming_strings\0\0\0"));
+        assert!(!escapes(b""));
+    }
+
+    /// The two settings are read out of one pass, so a packet that moves both
+    /// must not have either reading swallow the other.
+    #[test]
+    fn a_startup_packet_can_move_both_settings_at_once() {
+        let settings = startup_settings(&startup(
+            b"options\0-c search_path=tenant7 -c \
+                standard_conforming_strings=off\0user\0test\0\0",
+        ));
+        assert!(!settings.search_path_trusted);
+        assert!(settings.escape_strings);
     }
 
     /// The write path's copy handling hangs off a frame only the read

@@ -130,7 +130,7 @@ use sqlparser::ast::{
 };
 use sqlparser::dialect::PostgreSqlDialect;
 use sqlparser::parser::{Parser, ParserError};
-use sqlparser::tokenizer::{Token, Tokenizer};
+use sqlparser::tokenizer::{Token, TokenWithSpan, Tokenizer};
 
 use crate::columns::ProtectedColumn;
 use crate::config::{fold_identifier, OnUnprotected};
@@ -380,10 +380,42 @@ pub struct QueryRewriter {
     /// start of an escape and sqlparser does not, so the two no longer agree
     /// on what such a literal contains.
     escape_strings: bool,
+    /// What the startup packet moved before the session's first statement, not
+    /// yet reported. Held rather than reported at construction because a
+    /// refusal has to answer a frame, and at connect time there is none: the
+    /// move is reported on the first statement instead, which is the first
+    /// moment the proxy reads a literal it and the server may disagree about.
+    startup_moved: Vec<SettingMoved>,
     /// Set after refusing an extended-protocol message: the backend never saw
     /// it, so the proxy plays the backend's part and discards the rest of the
     /// batch up to `Sync`.
     awaiting_sync: bool,
+}
+
+/// What the startup packet already told the proxy about the session, before any
+/// statement has been seen.
+///
+/// Both settings can be moved at connect time — as a startup parameter, or
+/// through `options=-c <name>=<value>` — as well as mid-session, and the two
+/// halves have to agree: a client that turns a setting off in its
+/// StartupMessage is in exactly the state a `SET` would have put it in, and the
+/// rewrite must not assume otherwise from the first statement onwards.
+#[derive(Debug, Clone, Copy)]
+pub struct StartupSettings {
+    /// Whether unqualified table names still resolve to `public`.
+    pub search_path_trusted: bool,
+    /// Whether `standard_conforming_strings` is off, so PostgreSQL reads a
+    /// backslash in an ordinary `'…'` literal as the start of an escape.
+    pub escape_strings: bool,
+}
+
+impl Default for StartupSettings {
+    /// What a startup packet that moved nothing leaves behind: unqualified
+    /// names resolve to `public`, and an ordinary literal means to the server
+    /// what it means to the proxy's parser.
+    fn default() -> Self {
+        Self { search_path_trusted: true, escape_strings: false }
+    }
 }
 
 impl QueryRewriter {
@@ -391,14 +423,23 @@ impl QueryRewriter {
         catalog: Arc<WriteCatalog>,
         portals: Arc<SessionPortals>,
         tx_status: Arc<AtomicU8>,
-        search_path_trusted: bool,
+        startup: StartupSettings,
     ) -> Self {
+        // A `search_path` moved by the startup packet is deliberately not held
+        // for reporting: it is reported per unqualified name by [`Self::table`],
+        // which can name the table it declined to resolve. A
+        // `standard_conforming_strings` already off has no such site until a
+        // backslash literal reaches one, so the session-level report is what
+        // tells the operator the connection is diverging at all.
+        let startup_moved =
+            if startup.escape_strings { vec![SettingMoved::EscapeStrings] } else { Vec::new() };
         Self {
             catalog,
             portals,
             tx_status,
-            search_path_trusted,
-            escape_strings: false,
+            search_path_trusted: startup.search_path_trusted,
+            escape_strings: startup.escape_strings,
+            startup_moved,
             awaiting_sync: false,
         }
     }
@@ -693,20 +734,33 @@ impl QueryRewriter {
         // They stay grouped per statement so a move takes effect from the
         // statement that makes it onwards — a `SET` at the end of a batch must
         // not retroactively stop the write in front of it from being sealed.
-        let moved = settings_moved(text);
-        let parsed = parse_sql(text);
+        //
+        // The parser reads those same tokens rather than lexing the text a
+        // second time, so a rewritten statement is tokenized once.
+        let dialect = PostgreSqlDialect {};
+        let (moved, parsed) = match tokenize(&dialect, text) {
+            Ok(tokens) => (settings_moved(&tokens), parse_tokens(&dialect, tokens, text)),
+            // Text that does not tokenize does not parse either, so there is
+            // nothing to read out of it beyond the error itself.
+            Err(error) => (Vec::new(), Err(error)),
+        };
         // The groups line up with the statements only when the tokenizer and
         // the parser saw the same batch. Unparseable text (where nothing is
         // rewritten, so no ordering can change an outcome) and any other
         // disagreement fall back to applying every move up front, which is the
         // conservative reading.
         let aligned = parsed.as_ref().is_ok_and(|statements| statements.len() == moved.len());
+        // Whatever the startup packet moved is reported here, ahead of the
+        // batch's own moves: it was already in force when this statement
+        // arrived.
+        let mut upfront = std::mem::take(&mut self.startup_moved);
         if !aligned {
-            match self.note_session_state(&moved.concat()) {
-                Ok(()) => {}
-                Err(Rejection::Fatal(error)) => return Err(*error),
-                Err(Rejection::Refused(message)) => return Ok(SqlOutcome::Refuse(message)),
-            }
+            upfront.extend(moved.iter().flatten().copied());
+        }
+        match self.note_session_state(&upfront) {
+            Ok(()) => {}
+            Err(Rejection::Fatal(error)) => return Err(*error),
+            Err(Rejection::Refused(message)) => return Ok(SqlOutcome::Refuse(message)),
         }
         let mut statements = match parsed {
             Ok(statements) => statements,
@@ -733,11 +787,13 @@ impl QueryRewriter {
     }
 
     /// Records the session settings a statement moved, as read out of the SQL
-    /// about to be relayed. Once `search_path` stops making `public` the
-    /// schema of an unqualified name, the write path stops resolving bare
-    /// names at all; `standard_conforming_strings` is reported but changes no
-    /// catalog assumption, because what it invalidates is the proxy's reading
-    /// of the client's own literals.
+    /// about to be relayed — or, on the session's first statement, what the
+    /// startup packet had already moved before any SQL arrived. Once
+    /// `search_path` stops making `public` the schema of an unqualified name,
+    /// the write path stops resolving bare names at all;
+    /// `standard_conforming_strings` is reported but changes no catalog
+    /// assumption, because what it invalidates is the proxy's reading of the
+    /// client's own literals.
     fn note_session_state(&mut self, moved: &[SettingMoved]) -> Result<(), Rejection> {
         for setting in moved {
             match setting {
@@ -1803,21 +1859,42 @@ impl QueryRewriter {
     }
 }
 
-/// Parses one SQL text, retrying once with a statement terminator.
+/// Lexes one SQL text into the tokens both readers work from — the session
+/// settings scan and the parser — so a statement is tokenized once rather than
+/// once per reader. The error is the parser's own, which is what
+/// [`parser_error_kind`] and the unparseable site already speak.
+fn tokenize(dialect: &PostgreSqlDialect, text: &str) -> Result<Vec<TokenWithSpan>, ParserError> {
+    Tokenizer::new(dialect, text).tokenize_with_location().map_err(ParserError::from)
+}
+
+/// Parses one SQL text from its [`tokenize`]d form, retrying once with a
+/// statement terminator.
 ///
-/// `COPY ... FROM STDIN` is the reason. sqlparser reads the TSV payload that
-/// follows it in a script, so it wants either the data and its `\.` terminator
-/// or a `;`. On the wire there is neither — the payload arrives later as
-/// `CopyData` frames — so the statement fails to parse and `COPY` would only
-/// ever be seen as unparseable SQL, with a warning naming the wrong problem.
-/// The retry costs one extra parse on text that already failed.
-fn parse_sql(text: &str) -> Result<Vec<Statement>, ParserError> {
-    let dialect = PostgreSqlDialect {};
-    let error = match Parser::parse_sql(&dialect, text) {
+/// `COPY ... FROM STDIN` is the reason for the retry. sqlparser reads the TSV
+/// payload that follows it in a script, so it wants either the data and its
+/// `\.` terminator or a `;`. On the wire there is neither — the payload arrives
+/// later as `CopyData` frames — so the statement fails to parse and `COPY`
+/// would only ever be seen as unparseable SQL, with a warning naming the wrong
+/// problem. The retry re-lexes, which costs nothing worth saving: it only
+/// happens for text that already failed to parse.
+fn parse_tokens(
+    dialect: &PostgreSqlDialect,
+    tokens: Vec<TokenWithSpan>,
+    text: &str,
+) -> Result<Vec<Statement>, ParserError> {
+    let error = match Parser::new(dialect).with_tokens_with_locations(tokens).parse_statements() {
         Ok(statements) => return Ok(statements),
         Err(error) => error,
     };
-    Parser::parse_sql(&dialect, &format!("{text};")).map_err(|_| error)
+    Parser::parse_sql(dialect, &format!("{text};")).map_err(|_| error)
+}
+
+/// Parses one SQL text, for the callers that have no tokens of their own to
+/// share — the rewrite's own re-parse of what it rendered, and the tests.
+fn parse_sql(text: &str) -> Result<Vec<Statement>, ParserError> {
+    let dialect = PostgreSqlDialect {};
+    let tokens = tokenize(&dialect, text)?;
+    parse_tokens(&dialect, tokens, text)
 }
 
 /// The table a write statement targets, for the shapes the rewrite declines
@@ -1891,16 +1968,17 @@ enum SettingMoved {
 /// makes the default, which is the same value the connect-time assumption
 /// already trusts, so treating it as a move would contradict that assumption
 /// rather than tighten it.
-fn settings_moved(text: &str) -> Vec<Vec<SettingMoved>> {
-    let Ok(all) = Tokenizer::new(&PostgreSqlDialect {}, text).tokenize() else {
-        // Text that does not tokenize does not parse either, so it is already
-        // reported as unparseable; there is nothing to add here.
-        return Vec::new();
-    };
+///
+/// `all` is the whole text's token stream, borrowed from the same [`tokenize`]
+/// call the parser is handed.
+fn settings_moved(all: &[TokenWithSpan]) -> Vec<Vec<SettingMoved>> {
     // Whitespace and comments are both `Whitespace` tokens, and neither
     // separates a keyword from what it applies to.
-    let tokens: Vec<&Token> =
-        all.iter().filter(|token| !matches!(token, Token::Whitespace(_))).collect();
+    let tokens: Vec<&Token> = all
+        .iter()
+        .map(|token| &token.token)
+        .filter(|token| !matches!(token, Token::Whitespace(_)))
+        .collect();
 
     // An empty run is the trailing semicolon, or one written twice; sqlparser
     // does not count either as a statement, so neither does this.
@@ -1917,12 +1995,12 @@ fn statement_settings_moved(tokens: &[&Token]) -> Vec<SettingMoved> {
     let mut moved = Vec::new();
     for (index, token) in tokens.iter().enumerate() {
         let rest = &tokens[index + 1..];
-        let found = match keyword(token).as_deref() {
+        let found = match keyword(token) {
             // `SET` also opens the assignment list of an `UPDATE`, where the
             // name that follows is a column: only a statement-initial `SET` is
             // the session command.
-            Some("set") if index == 0 => set_statement(rest),
-            Some("set_config") => set_config_call(rest),
+            Some(word) if index == 0 && word.eq_ignore_ascii_case("set") => set_statement(rest),
+            Some(word) if word.eq_ignore_ascii_case("set_config") => set_config_call(rest),
             _ => None,
         };
         if let Some(setting) = found {
@@ -1934,11 +2012,16 @@ fn statement_settings_moved(tokens: &[&Token]) -> Vec<SettingMoved> {
     moved
 }
 
-/// The lowercased text of an unquoted word. A quoted one is an identifier the
-/// client chose, never a keyword or a function name the server resolves.
-fn keyword(token: &Token) -> Option<String> {
+/// The text of an unquoted word, to be compared case-insensitively — an
+/// unquoted keyword or function name is folded by the server, so `SET` and
+/// `set` are one word. A quoted word is an identifier the client chose, never a
+/// keyword or a function name the server resolves.
+///
+/// Borrowed rather than lowercased into a `String`: this is called for every
+/// token of every statement, and only a handful of them are ever compared.
+fn keyword(token: &Token) -> Option<&str> {
     match token {
-        Token::Word(word) if word.quote_style.is_none() => Some(word.value.to_ascii_lowercase()),
+        Token::Word(word) if word.quote_style.is_none() => Some(word.value.as_str()),
         _ => None,
     }
 }
@@ -1948,18 +2031,22 @@ fn keyword(token: &Token) -> Option<String> {
 /// starts just after the `SET`.
 fn set_statement(tokens: &[&Token]) -> Option<SettingMoved> {
     let mut rest = tokens;
-    if matches!(keyword(rest.first()?).as_deref(), Some("session" | "local")) {
+    if keyword(rest.first()?).is_some_and(|word| {
+        word.eq_ignore_ascii_case("session") || word.eq_ignore_ascii_case("local")
+    }) {
         rest = rest.get(1..)?;
     }
     let name = keyword(rest.first()?)?;
     rest = rest.get(1..)?;
-    if name == "schema" {
+    if name.eq_ignore_ascii_case("schema") {
         return moved_by("search_path", setting_values(rest));
     }
-    if !matches!(rest.first()?, Token::Eq) && keyword(rest.first()?).as_deref() != Some("to") {
+    if !matches!(rest.first()?, Token::Eq)
+        && !keyword(rest.first()?).is_some_and(|word| word.eq_ignore_ascii_case("to"))
+    {
         return None;
     }
-    moved_by(&name, setting_values(rest.get(1..)?))
+    moved_by(name, setting_values(rest.get(1..)?))
 }
 
 /// `set_config('<setting>', '<value>', <is_local>)` — the function spelling of
@@ -1978,22 +2065,24 @@ fn set_config_call(tokens: &[&Token]) -> Option<SettingMoved> {
     if !matches!(tokens.get(2)?, Token::Comma) {
         return Some(SettingMoved::SearchPath);
     }
-    moved_by(&setting.to_ascii_lowercase(), setting_values(tokens.get(3..4)?))
+    moved_by(setting, setting_values(tokens.get(3..4)?))
 }
 
 /// Whether assigning `values` to `name` moves a tracked setting. `None` values
 /// mean the assignment could not be read, which counts as a move: a setting
 /// the proxy cannot evaluate is one it cannot keep assuming.
+///
+/// `name` is matched case-insensitively, the way the server resolves a setting
+/// name — `SET Search_Path` and `set_config('SEARCH_PATH', …)` move the same
+/// setting the lowercase spellings do.
 fn moved_by(name: &str, values: Option<Vec<String>>) -> Option<SettingMoved> {
-    match name {
-        "search_path" => {
-            (!is_default_search_path(values.as_deref())).then_some(SettingMoved::SearchPath)
-        }
-        "standard_conforming_strings" => {
-            (!is_on(values.as_deref())).then_some(SettingMoved::EscapeStrings)
-        }
-        _ => None,
+    if name.eq_ignore_ascii_case("search_path") {
+        return (!is_default_search_path(values.as_deref())).then_some(SettingMoved::SearchPath);
     }
+    if name.eq_ignore_ascii_case("standard_conforming_strings") {
+        return (!is_on(values.as_deref())).then_some(SettingMoved::EscapeStrings);
+    }
+    None
 }
 
 /// The elements a setting is being assigned, stopping at the end of the
@@ -2029,14 +2118,20 @@ fn is_default_search_path(values: Option<&[String]>) -> bool {
         && values.iter().any(|name| name == "public")
 }
 
-/// Whether a boolean setting is being turned on, in any of the spellings
-/// PostgreSQL accepts. `DEFAULT` is not one of them: the default is whatever
-/// the server was configured with, which the proxy cannot read.
+/// Whether a boolean setting is being turned on, as a `SET` spells it.
 fn is_on(values: Option<&[String]>) -> bool {
-    matches!(values, Some([value]) if matches!(
-        value.as_str(),
-        "on" | "true" | "t" | "yes" | "y" | "1"
-    ))
+    matches!(values, Some([value]) if is_on_value(value))
+}
+
+/// Whether one value spells boolean `on`, in any of the spellings PostgreSQL
+/// accepts and in any case — `'ON'` in a `SET` and `ON` in a startup parameter
+/// both turn the setting on. `DEFAULT` is not one of them: the default is
+/// whatever the server was configured with, which the proxy cannot read.
+///
+/// Shared with the startup-packet scan in [`crate::session`], so the two halves
+/// of "is this setting on" cannot drift apart.
+pub(crate) fn is_on_value(value: &str) -> bool {
+    ["on", "true", "t", "yes", "y", "1"].iter().any(|spelling| value.eq_ignore_ascii_case(spelling))
 }
 
 struct ScopedTable<'a> {
@@ -3386,7 +3481,12 @@ mod tests {
     /// drive the read path build the [`SessionPortals`] themselves and share
     /// it (see `rows::tests::session`).
     fn rewriter(catalog: Arc<WriteCatalog>) -> QueryRewriter {
-        QueryRewriter::new(catalog, SessionPortals::new(), Arc::new(AtomicU8::new(b'I')), true)
+        QueryRewriter::new(
+            catalog,
+            SessionPortals::new(),
+            Arc::new(AtomicU8::new(b'I')),
+            StartupSettings::default(),
+        )
     }
 
     fn query_frame(sql: &str) -> Vec<u8> {
@@ -4610,8 +4710,12 @@ mod tests {
     #[test]
     fn refusal_reports_the_backend_transaction_state() {
         let status = Arc::new(AtomicU8::new(b'T'));
-        let mut strict =
-            QueryRewriter::new(strict_catalog(false), SessionPortals::new(), status.clone(), true);
+        let mut strict = QueryRewriter::new(
+            strict_catalog(false),
+            SessionPortals::new(),
+            status.clone(),
+            StartupSettings::default(),
+        );
         let action = strict.on_frame(b'Q', &query_frame("COPY users FROM STDIN")).unwrap();
         let FrameAction::Reply(bytes) = action else { panic!("expected a refusal") };
         assert_eq!(bytes[bytes.len() - 1], b'E', "aborted transaction status");
@@ -5122,11 +5226,64 @@ mod tests {
             catalog(false),
             SessionPortals::new(),
             Arc::new(AtomicU8::new(b'I')),
-            false,
+            StartupSettings { search_path_trusted: false, ..StartupSettings::default() },
         );
         assert!(
             rewritten_query(&mut rewriter, "INSERT INTO users (email) VALUES ('a@b.io')").is_none()
         );
+    }
+
+    /// The other half of the same story: a startup packet that turned
+    /// `standard_conforming_strings` off leaves the session in the state a
+    /// mid-session `SET` would have left it in — reported once, on the first
+    /// statement, and with the client's own backslash literals no longer read
+    /// as the server reads them.
+    #[test]
+    fn a_startup_packet_that_turned_standard_conforming_strings_off_is_reported_once() {
+        let started_off = |catalog| {
+            QueryRewriter::new(
+                catalog,
+                SessionPortals::new(),
+                Arc::new(AtomicU8::new(b'I')),
+                StartupSettings { escape_strings: true, ..StartupSettings::default() },
+            )
+        };
+
+        // Under `reject` the divergence is refused on the first statement,
+        // exactly as the `SET` spelling is.
+        let mut strict = started_off(strict_catalog(false));
+        let action = strict.on_frame(b'Q', &query_frame("SELECT 1")).unwrap();
+        assert!(refusal(&action).contains("standard_conforming_strings"));
+
+        // Once, though: the report is the setting moving, not every statement
+        // that follows it.
+        assert!(matches!(
+            strict.on_frame(b'Q', &query_frame("SELECT 1")).unwrap(),
+            FrameAction::Relay
+        ));
+
+        // Under `warn` the session carries on, with a literal the two sides
+        // read differently left alone rather than sealed as the proxy read it.
+        let mut lenient = started_off(catalog(true));
+        assert!(
+            rewritten_query(&mut lenient, r"INSERT INTO users (email) VALUES ('a\nb@secret.test')")
+                .is_none(),
+            "a literal the two sides read differently must not be sealed"
+        );
+        let sql = rewritten_query(&mut lenient, "INSERT INTO users (email) VALUES ('a@b.io')")
+            .expect("rewritten");
+        assert_eq!(open_hex_literal(&sql, true), b"a@b.io");
+    }
+
+    /// A startup packet that moved nothing reports nothing: a signal that fires
+    /// on a correctly configured session stops being read.
+    #[test]
+    fn a_default_startup_packet_reports_nothing() {
+        let mut strict = rewriter(strict_catalog(false));
+        assert!(matches!(
+            strict.on_frame(b'Q', &query_frame("SELECT 1")).unwrap(),
+            FrameAction::Relay
+        ));
     }
 
     // --- SQL text fidelity -----------------------------------------------

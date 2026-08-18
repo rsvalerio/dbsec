@@ -832,7 +832,7 @@ pub mod tests {
             catalog,
             portals.clone(),
             Arc::new(std::sync::atomic::AtomicU8::new(b'I')),
-            true,
+            crate::encrypt::StartupSettings::default(),
         );
         (rewriter, ctx.decryptor(portals))
     }
