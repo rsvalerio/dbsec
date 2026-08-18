@@ -37,7 +37,7 @@
 //! already run and only closing the connection stops the rest of its batch.
 
 use std::future::Future;
-use std::sync::atomic::{AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::Arc;
 use std::task::Poll;
 use std::time::Duration;
@@ -77,6 +77,53 @@ pub type ShutdownRx = watch::Receiver<bool>;
 
 /// The backend's transaction status before any ReadyForQuery has been seen.
 const TX_IDLE: u8 = b'I';
+
+/// One relay direction: the label its log lines carry, and the bound it puts
+/// on an inbound frame body *before* that body is buffered.
+///
+/// The two travel together because both are properties of the side being read
+/// from, and because keeping them apart would put a sixth parameter on
+/// [`relay`] (FN-3).
+struct Direction {
+    name: &'static str,
+    limit: BodyLimit,
+}
+
+impl Direction {
+    /// A direction bounded only by the protocol's own limit. That is what
+    /// upstream→client always is: the backend is the peer this proxy was
+    /// configured to talk to, not the anonymous one the pre-authentication
+    /// bound exists to hold back.
+    fn unbounded(name: &'static str) -> Self {
+        Self { name, limit: BodyLimit::Full }
+    }
+}
+
+/// How large an inbound frame body one direction may be, re-asked per frame.
+enum BodyLimit {
+    /// [`pgwire::MAX_MESSAGE_LEN`], always.
+    Full,
+    /// [`pgwire::MAX_PRE_AUTH_MESSAGE_LEN`] until the flag is set, then
+    /// [`pgwire::MAX_MESSAGE_LEN`] — see [`note_authentication`].
+    UntilAuthenticated(Arc<AtomicBool>),
+}
+
+impl BodyLimit {
+    /// `Relaxed` is the whole ordering requirement: the flag publishes no other
+    /// data, and it is set by the transform of the very AuthenticationOk whose
+    /// forwarding is what lets the client send the frame this bound is being
+    /// asked about — so the two are already ordered by the protocol, not by
+    /// this load.
+    fn max_body(&self) -> usize {
+        match self {
+            Self::Full => pgwire::MAX_MESSAGE_LEN,
+            Self::UntilAuthenticated(seen) if seen.load(Ordering::Relaxed) => {
+                pgwire::MAX_MESSAGE_LEN
+            }
+            Self::UntilAuthenticated(_) => pgwire::MAX_PRE_AUTH_MESSAGE_LEN,
+        }
+    }
+}
 
 /// Everything a session needs beyond its socket.
 pub struct SessionContext {
@@ -166,6 +213,11 @@ pub async fn run(
         .writes
         .as_ref()
         .map(|writes| QueryRewriter::new(writes.clone(), portals, tx_status, settings));
+    // The startup packet is forwarded by now, so `MAX_STARTUP_MESSAGE_LEN` is
+    // behind us — but the client is still anonymous until the backend says
+    // otherwise, and this is what says so (SEC-33).
+    let authenticated = Arc::new(AtomicBool::new(false));
+    let seen_authentication = authenticated.clone();
     let (client_r, client_w) = tokio::io::split(client);
     let (upstream_r, upstream_w) = tokio::io::split(upstream);
     let client_w = Arc::new(Mutex::new(client_w));
@@ -174,7 +226,10 @@ pub async fn run(
         relay(
             client_r,
             Writers { forward: upstream_w.clone(), back: client_w.clone() },
-            "client->upstream",
+            Direction {
+                name: "client->upstream",
+                limit: BodyLimit::UntilAuthenticated(authenticated),
+            },
             move |msg_type, body| match &mut rewriter {
                 Some(rewriter) => rewriter.on_frame(msg_type, body),
                 None => Ok(FrameAction::Relay),
@@ -184,8 +239,9 @@ pub async fn run(
         relay(
             upstream_r,
             Writers { forward: client_w, back: upstream_w },
-            "upstream->client",
+            Direction::unbounded("upstream->client"),
             move |msg_type, body| {
+                note_authentication(msg_type, body, &seen_authentication);
                 note_backend_state(msg_type, body, &seen_status, &copy_state);
                 match &mut decryptor {
                     Some(decryptor) => decryptor.on_frame(msg_type, body),
@@ -196,6 +252,29 @@ pub async fn run(
         ),
     )
     .await
+}
+
+/// Records the one upstream→client frame that says the client is no longer
+/// anonymous, which is what lifts the pre-authentication frame bound
+/// ([`BodyLimit::UntilAuthenticated`]).
+///
+/// The proxy relays authentication rather than terminating it (see the module
+/// docs), so the backend's verdict is just another frame going past: `'R'`
+/// carries an `i32` request code, and `0` — `AuthenticationOk` — is the only
+/// value that means "accepted". The rest of the codes (3 cleartext password,
+/// 5 MD5, 10 SASL, 11/12 SASL continue and final) are the exchange still in
+/// progress, and a rejection arrives as an ErrorResponse that never reaches
+/// here. A short body cannot be an authentication request at all, so it leaves
+/// the bound where it is.
+///
+/// Set *before* the frame is forwarded, which is what makes the flag ordered
+/// against the client's next frame without any synchronisation of its own: the
+/// client cannot have sent a post-authentication frame before receiving the
+/// AuthenticationOk this call is inspecting.
+fn note_authentication(msg_type: u8, body: &[u8], authenticated: &AtomicBool) {
+    if msg_type == b'R' && body.get(..4) == Some(&0i32.to_be_bytes()[..]) {
+        authenticated.store(true, Ordering::Relaxed);
+    }
 }
 
 /// Records the upstream→client frames whose meaning the *write* path depends
@@ -501,11 +580,14 @@ struct Writers<W, B> {
 /// legitimately idle for hours; the relay cannot tell that apart from an
 /// abandoned socket, so an idle reaper would drop working connections. The
 /// exhaustion risk is bounded at admission instead (`max_sessions` in
-/// `main::accept_loop`) and before the relay by the startup deadline.
+/// `main::accept_loop`), before the relay by the startup deadline, and inside
+/// it by [`Direction::limit`] — which is what keeps a peer the backend has not
+/// authenticated from sizing this loop's buffer to the authenticated-traffic
+/// limit (SEC-33).
 async fn relay<R, W, B, T>(
     mut reader: R,
     writers: Writers<W, B>,
-    direction: &str,
+    direction: Direction,
     mut transform: T,
     mut shutdown: ShutdownRx,
 ) -> Result<(), Error>
@@ -516,6 +598,7 @@ where
     T: FnMut(u8, &[u8]) -> Result<FrameAction, Error>,
 {
     let Writers { forward, back } = writers;
+    let Direction { name: direction, limit } = direction;
     let mut header = [0u8; pgwire::FRAME_HEADER_LEN];
     let mut body = Vec::new();
     loop {
@@ -543,6 +626,17 @@ where
             tracing::warn!(direction, error = %e, "aborting desynced relay");
             e
         })?;
+        // Before the `resize` below, which is the allocation this bound exists
+        // to deny an unauthenticated peer. Under `BodyLimit::Full` the check is
+        // dead weight — `frame_body_len` already refused anything over
+        // `MAX_MESSAGE_LEN` — so this can only fire pre-authentication.
+        let max_body = limit.max_body();
+        if body_len > max_body {
+            let e =
+                Error::PreAuthFrameTooLarge { msg_type: msg_type as char, body_len, max: max_body };
+            tracing::warn!(direction, error = %e, "refusing a pre-authentication frame");
+            return Err(e);
+        }
         body.resize(body_len, 0);
         reader.read_exact(&mut body).await?;
         tracing::trace!(direction, msg_type = %(msg_type as char), body_len, "relayed frame");
@@ -702,7 +796,7 @@ mod tests {
         relay(
             input.as_slice(),
             Writers { forward: output.clone(), back: back.clone() },
-            "test",
+            Direction::unbounded("test"),
             |msg_type, body| {
                 assert!(matches!(msg_type, b'D' | b'Z'));
                 Ok(if msg_type == b'D' && body == b"old" {
@@ -733,7 +827,7 @@ mod tests {
         relay(
             input.as_slice(),
             Writers { forward: output.clone(), back: back.clone() },
-            "test",
+            Direction::unbounded("test"),
             |_, body| {
                 Ok(if body == b"refuse me" {
                     FrameAction::Reply(frame(b'E', b"nope"))
@@ -766,7 +860,7 @@ mod tests {
         relay(
             input.as_slice(),
             Writers { forward: output.clone(), back: back.clone() },
-            "test",
+            Direction::unbounded("test"),
             |_, body| {
                 Ok(match body {
                     b"refuse me" => FrameAction::RefuseAndClose(frame(b'E', b"nope")),
@@ -799,7 +893,7 @@ mod tests {
         let refusing = relay(
             refused.as_slice(),
             Writers { forward: answered.clone(), back: sink() },
-            "upstream->client",
+            Direction::unbounded("upstream->client"),
             |_, _| Ok(FrameAction::RefuseAndClose(frame(b'E', b"nope"))),
             shutdown.clone(),
         );
@@ -809,7 +903,7 @@ mod tests {
         let stalled = relay(
             client_r,
             Writers { forward: sink(), back: sink() },
-            "client->upstream",
+            Direction::unbounded("client->upstream"),
             |_, _| Ok(FrameAction::Relay),
             shutdown,
         );
@@ -855,7 +949,7 @@ mod tests {
         relay(
             input.as_slice(),
             Writers { forward: output.clone(), back },
-            "test",
+            Direction::unbounded("test"),
             |_, _| Err(Error::Wire(dbsec_core::Error::Decrypt)),
             shutdown,
         )
@@ -884,6 +978,111 @@ mod tests {
                 "length {len} should be refused without reading a body, got {result:?}"
             );
         }
+    }
+
+    /// The window TASK-0076 left open: the startup packet is forwarded, so its
+    /// 16 KiB cap no longer applies, but the backend has not accepted the
+    /// client either — so the 1 GiB frame limit, which is Postgres parity for
+    /// *authenticated* traffic, must not apply yet either (SEC-33). The
+    /// oversized frame is nothing but its header, so a relay that sized the
+    /// buffer first would fail with `UnexpectedEof` rather than with the bound.
+    #[tokio::test]
+    async fn an_oversized_frame_before_authentication_is_refused() {
+        let (_shutdown_tx, shutdown) = no_shutdown();
+        // What a client legitimately sends here: a SASL response, a few
+        // hundred bytes. It relays, and then the oversized one does not.
+        let mut input = frame(b'p', b"n,,n=user,r=fyko+d2lbbFgONRv9qkxdawL");
+        input.push(b'Q');
+        input.extend_from_slice(&((4 + pgwire::MAX_PRE_AUTH_MESSAGE_LEN + 1) as i32).to_be_bytes());
+        let relayed = input[..input.len() - pgwire::FRAME_HEADER_LEN].to_vec();
+
+        let output = sink();
+        let result = relay(
+            input.as_slice(),
+            Writers { forward: output.clone(), back: sink() },
+            Direction {
+                name: "client->upstream",
+                limit: BodyLimit::UntilAuthenticated(Arc::new(AtomicBool::new(false))),
+            },
+            |_, _| Ok(FrameAction::Relay),
+            shutdown,
+        )
+        .await;
+
+        assert!(
+            matches!(
+                result,
+                Err(Error::PreAuthFrameTooLarge {
+                    msg_type: 'Q',
+                    max: pgwire::MAX_PRE_AUTH_MESSAGE_LEN,
+                    ..
+                })
+            ),
+            "got {result:?}"
+        );
+        assert_eq!(
+            *output.lock().await,
+            relayed,
+            "the authentication frame in front of it still went through"
+        );
+    }
+
+    /// The other half of the bound, and the one it would be a regression to
+    /// get wrong: once the backend has answered AuthenticationOk the limit is
+    /// the 1 GiB Postgres parity TASK-0009 settled on, unchanged.
+    #[tokio::test]
+    async fn authentication_restores_the_full_frame_limit() {
+        let (_shutdown_tx, shutdown) = no_shutdown();
+        let authenticated = Arc::new(AtomicBool::new(false));
+        // Exactly what the upstream→client direction does with the backend's
+        // verdict, before forwarding it.
+        note_authentication(b'R', &0i32.to_be_bytes(), &authenticated);
+        assert_eq!(
+            BodyLimit::UntilAuthenticated(authenticated.clone()).max_body(),
+            pgwire::MAX_MESSAGE_LEN
+        );
+
+        // A frame the pre-authentication bound would have refused, relayed
+        // whole now that it no longer applies.
+        let big = frame(b'Q', &vec![b'x'; pgwire::MAX_PRE_AUTH_MESSAGE_LEN + 1]);
+        let output = sink();
+        relay(
+            big.as_slice(),
+            Writers { forward: output.clone(), back: sink() },
+            Direction {
+                name: "client->upstream",
+                limit: BodyLimit::UntilAuthenticated(authenticated),
+            },
+            |_, _| Ok(FrameAction::Relay),
+            shutdown,
+        )
+        .await
+        .unwrap();
+        assert_eq!(*output.lock().await, big);
+    }
+
+    /// `'R'` is the whole authentication exchange, not just its verdict, so the
+    /// bound has to key on the request code rather than on the message type.
+    #[test]
+    fn only_authentication_ok_lifts_the_pre_authentication_bound() {
+        let authenticated = AtomicBool::new(false);
+        // 3 cleartext, 5 MD5, 10 SASL, 11 SASL continue, 12 SASL final: the
+        // exchange still in progress.
+        for code in [3i32, 5, 10, 11, 12] {
+            note_authentication(b'R', &code.to_be_bytes(), &authenticated);
+            assert!(
+                !authenticated.load(Ordering::Relaxed),
+                "'R' request code {code} is not an acceptance"
+            );
+        }
+        // An ErrorResponse whose body happens to start with four zero bytes,
+        // and a truncated 'R' that carries no request code at all.
+        note_authentication(b'E', &0i32.to_be_bytes(), &authenticated);
+        note_authentication(b'R', b"ab", &authenticated);
+        assert!(!authenticated.load(Ordering::Relaxed));
+
+        note_authentication(b'R', &0i32.to_be_bytes(), &authenticated);
+        assert!(authenticated.load(Ordering::Relaxed), "AuthenticationOk lifts the bound");
     }
 
     /// The cap only has to be above what a real driver sends. A startup packet
@@ -1032,7 +1231,7 @@ mod tests {
         let result = relay(
             input.as_slice(),
             Writers { forward: output.clone(), back },
-            "test",
+            Direction::unbounded("test"),
             |_, _| {
                 // Zeroed pages: the buffer is never written to and the header
                 // check rejects it before any I/O, so this costs address
@@ -1053,7 +1252,14 @@ mod tests {
         let (writer, mut peer) = tokio::io::duplex(1024);
         let writers = Writers { forward: Arc::new(Mutex::new(writer)), back: sink() };
         let relaying = tokio::spawn(async move {
-            relay(reader, writers, "test", |_, _| Ok(FrameAction::Relay), shutdown).await
+            relay(
+                reader,
+                writers,
+                Direction::unbounded("test"),
+                |_, _| Ok(FrameAction::Relay),
+                shutdown,
+            )
+            .await
         });
 
         // Reading the whole frame back proves the relay is parked on the next

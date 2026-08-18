@@ -36,6 +36,22 @@ pub const MAX_MESSAGE_LEN: usize = 1 << 30;
 /// negligible.
 pub const MAX_STARTUP_MESSAGE_LEN: usize = 16 * 1024;
 
+/// Largest regular frame a *client* may send before the backend has answered
+/// `AuthenticationOk` — the window between the startup packet and an
+/// authenticated session, where [`MAX_STARTUP_MESSAGE_LEN`] no longer applies
+/// and [`MAX_MESSAGE_LEN`] does not yet deserve to.
+///
+/// [`MAX_MESSAGE_LEN`] is Postgres parity for *authenticated* traffic and stays
+/// exactly that: a client the backend has accepted can send 1 GiB frames
+/// because the server it is talking to would. Before that answer the peer is
+/// anonymous, and every frame it sends is a `PasswordMessage`/SASL response of
+/// at most a few hundred bytes — PostgreSQL reads those with
+/// `pq_getmessage(&buf, PQ_SMALL_MESSAGE_LIMIT)`, a 10,000-byte cap, and
+/// refuses anything larger itself. Matching [`MAX_STARTUP_MESSAGE_LEN`] here
+/// keeps the pre-authentication allocation per connection negligible while
+/// staying more permissive than the server behind the proxy (SEC-33).
+pub const MAX_PRE_AUTH_MESSAGE_LEN: usize = MAX_STARTUP_MESSAGE_LEN;
+
 /// What the client opened the connection with.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Startup {
