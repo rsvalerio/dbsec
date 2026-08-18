@@ -28,6 +28,15 @@
 //! the read path drop exactly that batch's leftovers and stay aligned with a
 //! pipelined next batch.
 //!
+//! One class of client frame is outside that argument: PostgreSQL silently
+//! discards `CopyData`/`CopyDone`/`CopyFail` received outside a copy — no
+//! ErrorResponse, no ReadyForQuery, no response at all — so seeing one tells
+//! the write path nothing about what the backend will do. Whether a copy is
+//! really in progress is only knowable from the CopyInResponse the *read* path
+//! sees, so that too is shared state here ([`SessionPortals::copy_data`]);
+//! without it a client could pop this batch's markers with a stray frame and
+//! desync every response behind it.
+//!
 //! A queued expectation therefore has to outlive the names it was made about.
 //! A client may `Close` a statement or portal in the same batch that executes
 //! it — the PostgreSQL JDBC driver does exactly that for a statement it has
@@ -67,6 +76,10 @@ pub const MAX_NAME_LEN: usize = 256;
 /// ever sending Sync would otherwise grow this queue for the life of the
 /// session; real pipelines are orders of magnitude shorter.
 pub const MAX_PENDING_RESPONSES: usize = 4096;
+
+/// The client's `CopyData` message type — the one copy frame that does *not*
+/// end the copy, unlike `CopyDone` (`'c'`) and `CopyFail` (`'f'`).
+const COPY_DATA: u8 = b'd';
 
 /// What one RowDescription said about a result set. Shared behind an `Arc`
 /// because the same description serves every Execute of the statement it
@@ -118,8 +131,10 @@ impl ParamAction {
 /// (the previous behaviour) sealed a value and then indexed the *ciphertext*,
 /// or sealed an already-sealed value — silently, and in the second case
 /// irreversibly. [`Self::record`] therefore collapses a repeat of the same
-/// action and rejects a conflicting one, which fails the session rather than
-/// writing something no read path can undo (CL-3).
+/// action and rejects a conflicting one, which refuses the statement rather
+/// than writing something no read path can undo (CL-3). The refusal is
+/// statement-level — see `encrypt::record_param`, which turns it into the
+/// ErrorResponse the client is told about.
 #[derive(Clone, Default)]
 pub struct ParamTransforms {
     entries: Vec<(usize, ParamAction)>,
@@ -233,6 +248,12 @@ struct Tracked {
     /// Source of [`StatementId`]s. Monotonic for the life of the session, so
     /// an id is never reused and a stale reference can only fail to match.
     next_statement_id: StatementId,
+    /// Whether the backend has answered with a CopyInResponse (or a
+    /// CopyBothResponse) that no CopyDone/CopyFail or ReadyForQuery has
+    /// finished yet. Only the read path can know this — the response travels
+    /// upstream→client — which is why it lives here rather than in the write
+    /// path that consumes it. See [`Self::copy_data`].
+    copy_in: bool,
 }
 
 /// One session's extended-protocol state, shared by its two relay tasks.
@@ -340,22 +361,52 @@ impl SessionPortals {
         push(&mut tracked, Pending::Execute { statement, positions })
     }
 
-    /// The client is sending a COPY payload, so the backend is in copy-in
-    /// mode — where it **ignores Flush and Sync**.
+    /// The backend answered with CopyInResponse or CopyBothResponse: from here
+    /// until the copy ends, the client's `CopyData`/`CopyDone`/`CopyFail`
+    /// frames are the payload of a copy actually in progress.
     ///
-    /// The Sync that would normally close the batch was already on the wire
-    /// before the CopyInResponse came back (drivers pipeline Bind/Execute/Sync
-    /// and only then look at the answer), so a batch marker is sitting in the
-    /// queue for a ReadyForQuery the backend will never send. Left there it
-    /// absorbs the *next* batch's ReadyForQuery, and from then on every
-    /// expectation is one response behind — which surfaces as a DataRow the
-    /// read path cannot attribute to any portal.
+    /// Observed by the *read* path, because that is the direction the response
+    /// travels in. The write path cannot tell a payload frame from a stray one
+    /// on its own — see [`Self::copy_data`].
+    pub fn copy_in_started(&self) {
+        self.tracked().copy_in = true;
+    }
+
+    /// The client sent `CopyData`, `CopyDone` or `CopyFail` (`msg_type` is
+    /// `'d'`, `'c'` or `'f'`).
+    ///
+    /// **While a copy is really in progress**, the backend **ignores Flush and
+    /// Sync**. The Sync that would normally close the batch was already on the
+    /// wire before the CopyInResponse came back (drivers pipeline
+    /// Bind/Execute/Sync and only then look at the answer), so a batch marker
+    /// is sitting in the queue for a ReadyForQuery the backend will never
+    /// send. Left there it absorbs the *next* batch's ReadyForQuery, and from
+    /// then on every expectation is one response behind — which surfaces as a
+    /// DataRow the read path cannot attribute to any portal.
     ///
     /// Only markers queued after the Execute that started the copy are
     /// dropped. A simple-protocol `COPY ... FROM STDIN` has no Execute and its
     /// ReadyForQuery is not skipped, so its marker stays.
-    pub fn copy_data(&self) {
+    ///
+    /// **Outside copy mode nothing here moves.** PostgreSQL discards `d`/`c`/
+    /// `f` received outside a copy silently — no ErrorResponse, no
+    /// ReadyForQuery, no response of any kind — so a stray copy frame owes
+    /// nothing and settles nothing. Acting on it anyway let a client pop this
+    /// batch's `Batch` marker at will and desync the queue against a backend
+    /// that had done nothing: every later response is then matched to the
+    /// expectation in front of the one it answers, which fails closed as
+    /// `Error::UndescribedRow` or a crypto error, i.e. a client-driven forced
+    /// refusal of its own session (SEC-33).
+    pub fn copy_data(&self, msg_type: u8) {
         let mut tracked = self.tracked();
+        if !tracked.copy_in {
+            return;
+        }
+        // CopyDone/CopyFail end the copy: the backend leaves copy-in mode and
+        // answers the Execute, so it is no longer skipping anything.
+        if msg_type != COPY_DATA {
+            tracked.copy_in = false;
+        }
         let Some(execute) =
             tracked.pending.iter().rposition(|p| matches!(p, Pending::Execute { .. }))
         else {
@@ -459,6 +510,11 @@ impl SessionPortals {
     /// the server skip. Anything left belongs to a batch pipelined behind it.
     pub fn batch_answered(&self) {
         let mut tracked = self.tracked();
+        // A ReadyForQuery is proof the backend is not in copy mode: it is the
+        // one message copy-in suppresses. This is the backstop for a copy that
+        // ended some other way — an ErrorResponse mid-payload, a CopyDone the
+        // proxy never saw because the client pipelined past it.
+        tracked.copy_in = false;
         while let Some(pending) = tracked.pending.pop_front() {
             if matches!(pending, Pending::Batch) {
                 break;
@@ -580,7 +636,8 @@ mod tests {
         portals.bind(b"", b"c").unwrap();
         portals.expect_execute(b"").unwrap();
         portals.expect_batch().unwrap(); // ignored by the backend
-        portals.copy_data();
+        portals.copy_in_started(); // the CopyInResponse the read path saw
+        portals.copy_data(COPY_DATA);
 
         // The copy's own CommandComplete and ReadyForQuery settle it, and the
         // Sync that follows CopyDone is the one that is really answered.
@@ -601,9 +658,78 @@ mod tests {
     fn copy_data_leaves_a_simple_protocol_batch_alone() {
         let portals = portals();
         portals.expect_batch().unwrap();
-        portals.copy_data();
+        portals.copy_in_started();
+        portals.copy_data(COPY_DATA);
         portals.expect_execute(b"nope").unwrap();
         assert!(matches!(portals.row_source(), RowSource::LastDescription));
+    }
+
+    /// PostgreSQL discards `d`/`c`/`f` sent outside a copy without answering
+    /// them, so acting on one let a client delete a `Batch` marker the backend
+    /// still owed a ReadyForQuery for. From there every response settled the
+    /// expectation in front of the one it answered, and the next batch's rows
+    /// were attributed to the wrong statement — a forced desync any client
+    /// could ask for with one stray frame.
+    #[test]
+    fn a_stray_copy_frame_outside_copy_mode_moves_nothing() {
+        let portals = portals();
+        // No CopyInResponse has ever been seen, so none of these is payload —
+        // before the batch, and again once it is queued.
+        for stray in *b"dcf" {
+            portals.copy_data(stray);
+        }
+        portals.parse(b"s1", ParamTransforms::default()).unwrap();
+        portals.bind(b"p", b"s1").unwrap();
+        portals.expect_describe(Target::Portal, b"p").unwrap();
+        portals.expect_execute(b"p").unwrap();
+        portals.expect_batch().unwrap();
+        for stray in *b"dcf" {
+            portals.copy_data(stray);
+        }
+
+        // The batch is intact: its Describe still lands on its own Execute...
+        portals.describe_answered(&positions(2));
+        let RowSource::Portal(found) = portals.row_source() else {
+            panic!("a stray copy frame must not disturb this batch's expectations");
+        };
+        assert_eq!(found.columns().len(), 2);
+        // ...and its marker is still there to absorb its own ReadyForQuery,
+        // rather than the next batch's.
+        portals.execute_answered();
+        portals.expect_execute(b"p").unwrap();
+        portals.expect_batch().unwrap();
+        portals.batch_answered();
+        let RowSource::Portal(found) = portals.row_source() else {
+            panic!("the following batch's rows must still be attributed to its own statement");
+        };
+        assert_eq!(found.columns().len(), 2);
+    }
+
+    /// The copy ends at CopyDone, so a Sync pipelined *after* it is answered
+    /// normally: the flag has to clear, or the next batch's marker would be
+    /// dropped as if the backend were still ignoring it.
+    #[test]
+    fn copy_mode_ends_with_the_copy_and_a_later_sync_is_answered() {
+        let portals = portals();
+        portals.parse(b"c", ParamTransforms::default()).unwrap();
+        portals.bind(b"", b"c").unwrap();
+        portals.expect_execute(b"").unwrap();
+        portals.expect_batch().unwrap(); // ignored by the backend
+        portals.copy_in_started();
+        portals.copy_data(COPY_DATA);
+        portals.copy_data(b'c'); // CopyDone: the backend is answering again
+
+        // The Sync that follows CopyDone is a real one, and a frame arriving
+        // after the copy is a stray again.
+        portals.expect_batch().unwrap();
+        portals.copy_data(COPY_DATA);
+        portals.execute_answered();
+        portals.batch_answered();
+
+        portals.expect_describe(Target::Statement, b"c").unwrap();
+        portals.describe_answered(&positions(1));
+        portals.expect_execute(b"").unwrap();
+        assert!(matches!(portals.row_source(), RowSource::Portal(_)));
     }
 
     #[test]

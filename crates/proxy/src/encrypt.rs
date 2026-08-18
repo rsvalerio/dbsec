@@ -199,13 +199,53 @@ enum Rejection {
     /// rewrite's return types, and [`Error`] is large enough that inlining it
     /// would make every one of them wide (`clippy::result_large_err`).
     Fatal(Box<Error>),
-    /// `on_unprotected = "reject"` met a statement it will not let through.
+    /// This one statement is refused and the session carries on: either
+    /// `on_unprotected = "reject"` met a site it will not let through, or the
+    /// statement is unrewritable under any setting ([`record_param`]).
     Refused(String),
 }
 
 impl From<Error> for Rejection {
     fn from(error: Error) -> Self {
         Self::Fatal(Box::new(error))
+    }
+}
+
+/// Records what Bind must do to one placeholder, turning the single refusal
+/// [`ParamTransforms::record`] can raise into a *statement-level* one.
+///
+/// `INSERT INTO users (email, backup_email) VALUES ($1, $1)` with the two
+/// columns under different transforms — or `UPDATE users SET email = $1 WHERE
+/// email = $1`, which needs the sealed value in the SET and the blind index in
+/// the WHERE — is valid client SQL, not a protocol violation. The Bind carries
+/// one value per placeholder, so only one of the two answers fits on the wire
+/// and the statement cannot be honoured. Refusing it is the whole remedy:
+/// nothing has gone upstream at this point, so the same
+/// [`SqlOutcome::Refuse`] path every other unrewritable statement takes
+/// applies unchanged.
+///
+/// It used to travel as [`Rejection::Fatal`], which tore the session down over
+/// well-formed SQL and told the client nothing but a closed socket — and under
+/// a connection pool the retry killed the next connection too.
+///
+/// Unlike an [`Unprotected`] site this does not consult `on_unprotected`:
+/// there is no "warn and relay" answer available. Letting it through would
+/// seal a value and then blind-index the ciphertext, or seal an already-sealed
+/// value — silently, and irreversibly in the second case (CL-3), which is the
+/// outcome [`ParamTransforms`] exists to prevent.
+fn record_param(
+    params: &mut ParamTransforms,
+    index: usize,
+    action: ParamAction,
+) -> Result<(), Rejection> {
+    match params.record(index, action) {
+        Ok(()) => Ok(()),
+        Err(Error::ConflictingParameter { placeholder }) => Err(Rejection::Refused(format!(
+            "dbsec refused this statement: placeholder ${placeholder} feeds two protected \
+             positions that need different values, and a Bind carries one value per \
+             placeholder; give each position its own placeholder"
+        ))),
+        Err(other) => Err(Rejection::Fatal(Box::new(other))),
     }
 }
 
@@ -385,11 +425,16 @@ impl QueryRewriter {
                 self.portals.expect_batch()?;
                 Ok(FrameAction::Relay)
             }
-            // CopyData, CopyDone, CopyFail: the client only sends these in
-            // copy-in mode, which is where the backend ignores the Sync it has
-            // already pipelined — see [`SessionPortals::copy_data`].
+            // CopyData, CopyDone, CopyFail. In copy-in mode these are the
+            // payload, and the backend is ignoring the Sync the client already
+            // pipelined. Outside it they are strays PostgreSQL discards
+            // without answering — and `copy_data` refuses to move the queue
+            // for them, because a client that could pop this batch's marker
+            // could desync every response behind it. Relayed either way: the
+            // backend's own handling of a stray frame is the authority, and
+            // withholding it would only differ from PostgreSQL.
             b'd' | b'c' | b'f' => {
-                self.portals.copy_data();
+                self.portals.copy_data(msg_type);
                 Ok(FrameAction::Relay)
             }
             b'C' => {
@@ -1333,7 +1378,11 @@ impl QueryRewriter {
                 // exist at Bind time, so the index is applied there.
                 if let Some((index, transform)) = array_parameter(left, right, scope) {
                     let column: Arc<str> = column_name(left).unwrap_or_default().into();
-                    params.record(index, ParamAction::SearchIndexArray { transform, column })?;
+                    record_param(
+                        params,
+                        index,
+                        ParamAction::SearchIndexArray { transform, column },
+                    )?;
                     let operand = std::mem::replace(left.as_mut(), Expr::Value(Value::Null));
                     *left.as_mut() = index_prefix(operand);
                     return Ok(true);
@@ -1472,7 +1521,7 @@ impl QueryRewriter {
         match unwrap_casts(expr) {
             Expr::Value(Value::Placeholder(placeholder)) => {
                 if let Some(index) = placeholder_index(placeholder) {
-                    params.record(index, ParamAction::Seal(transform.clone()))?;
+                    record_param(params, index, ParamAction::Seal(transform.clone()))?;
                 }
                 return Ok(false);
             }
@@ -1893,19 +1942,19 @@ fn index_value(
     value: &mut Expr,
     transform: &Arc<dyn FieldTransform>,
     params: &mut ParamTransforms,
-) -> Result<(), Error> {
+) -> Result<(), Rejection> {
     if let Expr::Value(Value::Placeholder(placeholder)) = unwrap_casts(value) {
         let Some(index) = placeholder_index(placeholder) else {
-            return Err(Error::Wire(dbsec_core::Error::Malformed));
+            return Err(Error::Wire(dbsec_core::Error::Malformed).into());
         };
-        params.record(index, ParamAction::SearchIndex(transform.clone()))?;
+        record_param(params, index, ParamAction::SearchIndex(transform.clone()))?;
         return Ok(());
     }
     let Some(plaintext) = literal_plaintext(value, transform.wire()) else {
-        return Err(Error::Wire(dbsec_core::Error::Malformed));
+        return Err(Error::Wire(dbsec_core::Error::Malformed).into());
     };
-    let Some(token) = transform.search_index(&plaintext)? else {
-        return Err(Error::Wire(dbsec_core::Error::Malformed));
+    let Some(token) = transform.search_index(&plaintext).map_err(Error::Wire)? else {
+        return Err(Error::Wire(dbsec_core::Error::Malformed).into());
     };
     *value = Expr::Value(Value::SingleQuotedString(format!("\\x{}", hex::encode(token))));
     Ok(())
@@ -3238,6 +3287,10 @@ mod tests {
     /// one value per placeholder. Before, both actions were applied in
     /// sequence and the index was computed over the ciphertext, so the WHERE
     /// matched nothing and the UPDATE silently affected no rows.
+    ///
+    /// The refusal is statement-level: this is valid client SQL, and killing
+    /// the session over it left the client with a bare connection reset — and
+    /// a pooled retry that took the next connection with it.
     #[test]
     fn a_placeholder_in_two_protected_roles_is_refused_rather_than_transformed_twice() {
         let mut extended = rewriter(catalog(true));
@@ -3246,9 +3299,18 @@ mod tests {
             b"UPDATE users SET email = $1 WHERE email = $1",
             &0i16.to_be_bytes(),
         );
+        let action = extended.on_frame(b'P', &parse).unwrap();
+        assert!(refusal(&action).contains("placeholder $1"), "{}", refusal(&action));
+        // The batch is discarded up to Sync, which the proxy answers itself,
+        // and the session is usable afterwards.
+        assert_eq!(extended.on_frame(b'B', b"").unwrap(), FrameAction::Reply(Vec::new()));
+        let FrameAction::Reply(sync) = extended.on_frame(b'S', b"").unwrap() else {
+            panic!("Sync must be answered")
+        };
+        assert_eq!(sync[0], b'Z');
         assert!(matches!(
-            extended.on_frame(b'P', &parse),
-            Err(Error::ConflictingParameter { placeholder: 1 })
+            extended.on_frame(b'Q', &query_frame("SELECT 1")).unwrap(),
+            FrameAction::Relay
         ));
         // The same shape in the simple protocol has two independent literals,
         // so both roles are served from the plaintext and it still works.
@@ -3260,6 +3322,57 @@ mod tests {
         assert_eq!(open_hex_literal(&sql, true), b"alice@example.com");
         let index = blind_index::compute(&crate::rows::tests::INDEX_KEY, b"alice@example.com");
         assert!(sql.contains(&format!("'\\x{}'", hex::encode(index))), "{sql}");
+    }
+
+    /// Two protected columns of one table under *different* transforms, so a
+    /// placeholder feeding both cannot be satisfied by one value on the wire.
+    fn two_column_catalog(on_unprotected: OnUnprotected) -> Arc<WriteCatalog> {
+        Arc::new(WriteCatalog::new(
+            &[
+                column("email", transform(false), false),
+                column("backup_email", transform(false), false),
+            ],
+            on_unprotected,
+        ))
+    }
+
+    /// `INSERT INTO users (email, backup_email) VALUES ($1, $1)` is valid
+    /// client SQL that the Bind cannot carry, so it is refused at statement
+    /// level in both protocols — and under *both* `on_unprotected` settings,
+    /// because there is no "warn and relay" answer: relaying it would seal one
+    /// value and then re-seal or blind-index the ciphertext.
+    #[test]
+    fn one_placeholder_for_two_protected_columns_is_refused_under_both_policies() {
+        const SQL: &str = "INSERT INTO users (email, backup_email) VALUES ($1, $1)";
+        for policy in [OnUnprotected::Warn, OnUnprotected::Reject] {
+            // Simple protocol: nothing reached the backend, so the proxy owes
+            // the ReadyForQuery itself.
+            let mut simple = rewriter(two_column_catalog(policy));
+            let action = simple.on_frame(b'Q', &query_frame(SQL)).unwrap();
+            let text = refusal(&action);
+            assert!(text.contains("placeholder $1"), "{text}");
+            let FrameAction::Reply(bytes) = &action else { unreachable!() };
+            assert_eq!(bytes[bytes.len() - 1], b'I', "the refusal answers the batch too");
+            assert!(
+                matches!(
+                    simple.on_frame(b'Q', &query_frame("SELECT 1")).unwrap(),
+                    FrameAction::Relay
+                ),
+                "the session stays usable"
+            );
+
+            // Extended protocol: refused at Parse, and the rest of the batch
+            // is discarded up to Sync exactly as any other refused Parse is.
+            let mut extended = rewriter(two_column_catalog(policy));
+            let parse = pgwire::encode_parse(b"i", SQL.as_bytes(), &0i16.to_be_bytes());
+            let action = extended.on_frame(b'P', &parse).unwrap();
+            assert!(refusal(&action).contains("placeholder $1"));
+            assert_eq!(extended.on_frame(b'E', b"").unwrap(), FrameAction::Reply(Vec::new()));
+            let FrameAction::Reply(sync) = extended.on_frame(b'S', b"").unwrap() else {
+                panic!("Sync must be answered")
+            };
+            assert_eq!(sync[0], b'Z');
+        }
     }
 
     /// The same action recorded twice for one placeholder — a multi-row INSERT

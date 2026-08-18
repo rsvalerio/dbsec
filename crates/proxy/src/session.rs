@@ -13,14 +13,33 @@
 //! refusal, the other one. Whole frames are written under the lock, so the
 //! two directions never interleave inside a message.
 //!
+//! Authentication is *relayed*, never terminated: the SASL frames go across
+//! verbatim, so the proxy holds no credential and needs no auth implementation
+//! of its own. Two consequences are structural rather than oversights, and are
+//! written down in `README.md` and `plans/PLAN.md` for operators:
+//!
+//! - `SCRAM-SHA-256-PLUS` cannot work. Channel binding ties the client's proof
+//!   to its own TLS session's endpoint data, and there are two independent TLS
+//!   sessions here, so the proof the client computes over the downstream
+//!   channel is checked by the server against the upstream one. A client that
+//!   selects `-PLUS` fails to authenticate, and `channel_binding=require`
+//!   cannot connect at all. Supporting it means re-originating SCRAM, which
+//!   means holding the client's credential — rejected; per-hop `verify-full`
+//!   TLS is what stands in for it.
+//! - `GSSENCRequest` is always answered `N` ([`start_session`]), because
+//!   nothing here speaks GSSAPI. The client falls back to the ordinary startup
+//!   flow, which is plaintext unless downstream TLS is configured.
+//!
 //! The read path refuses in the other direction, and does not stop there
 //! ([`FrameAction::RefuseAndClose`]): the client is the *receiver*, so the
 //! ErrorResponse replacing a result set the decryptor will not relay travels
 //! forward — and then the session ends, because a refused read's statement has
 //! already run and only closing the connection stops the rest of its batch.
 
+use std::future::Future;
 use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::Arc;
+use std::task::Poll;
 use std::time::Duration;
 
 use dbsec_core::pgwire::{self, Startup};
@@ -45,6 +64,10 @@ const TLS_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 /// once its frame has been relayed, so a single 1 GiB frame does not reserve
 /// 1 GiB for the life of the session (SEC-33).
 const RELAY_BUFFER_RETAIN: usize = 64 * 1024;
+
+/// How long the surviving relay direction may keep running after the other
+/// one has finished — see [`join_relays`].
+const RELAY_DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Receiver of the process-wide "stop taking new work" signal. Sessions
 /// observe it at frame boundaries only — see [`relay`]. A *dropped* sender
@@ -136,6 +159,7 @@ pub async fn run(
     // conversation nobody is tracking.
     let portals = SessionPortals::new();
     let mut decryptor = ctx.rows.as_ref().map(|rows| rows.decryptor(portals.clone()));
+    let copy_state = portals.clone();
     let tx_status = Arc::new(AtomicU8::new(TX_IDLE));
     let seen_status = tx_status.clone();
     let mut rewriter = ctx
@@ -146,7 +170,7 @@ pub async fn run(
     let (upstream_r, upstream_w) = tokio::io::split(upstream);
     let client_w = Arc::new(Mutex::new(client_w));
     let upstream_w = Arc::new(Mutex::new(upstream_w));
-    tokio::try_join!(
+    join_relays(
         relay(
             client_r,
             Writers { forward: upstream_w.clone(), back: client_w.clone() },
@@ -162,11 +186,7 @@ pub async fn run(
             Writers { forward: client_w, back: upstream_w },
             "upstream->client",
             move |msg_type, body| {
-                if msg_type == b'Z' {
-                    if let Some(&status) = body.first() {
-                        seen_status.store(status, Ordering::Relaxed);
-                    }
-                }
+                note_backend_state(msg_type, body, &seen_status, &copy_state);
                 match &mut decryptor {
                     Some(decryptor) => decryptor.on_frame(msg_type, body),
                     None => Ok(FrameAction::Relay),
@@ -174,8 +194,101 @@ pub async fn run(
             },
             shutdown,
         ),
-    )?;
-    Ok(())
+    )
+    .await
+}
+
+/// Records the upstream→client frames whose meaning the *write* path depends
+/// on, before the decryptor sees them.
+///
+/// Neither is row data, which is why it is here rather than in
+/// [`crate::rows::RowDecryptor`]:
+///
+/// - ReadyForQuery carries the backend's transaction status, which is the
+///   status byte the rewriter puts on a ReadyForQuery it has to synthesize for
+///   a statement it refused.
+/// - CopyInResponse (and CopyBothResponse, its replication sibling) is the
+///   only evidence that the client's following `CopyData`/`CopyDone`/
+///   `CopyFail` frames are the payload of a copy in progress rather than
+///   strays the backend silently discards — the write path cannot tell them
+///   apart on its own, and acting on a stray lets a client desync the pending
+///   queue ([`SessionPortals::copy_data`]).
+///
+/// Recorded even when no decryptor is configured, since a rewriter still can
+/// be.
+fn note_backend_state(msg_type: u8, body: &[u8], tx_status: &AtomicU8, portals: &SessionPortals) {
+    match msg_type {
+        b'Z' => {
+            if let Some(&status) = body.first() {
+                tx_status.store(status, Ordering::Relaxed);
+            }
+        }
+        b'G' | b'W' => portals.copy_in_started(),
+        _ => {}
+    }
+}
+
+/// Runs both relay directions and ends the session once the first of them
+/// does, giving the other only a bounded grace period to finish.
+///
+/// `try_join!` cannot express this: it waits for *both* halves unless one
+/// fails, and a half that is parked in `read_exact` on a peer which never
+/// writes again never finishes. Every way a session ends normally goes through
+/// that state — an upstream EOF, a read-path
+/// [`FrameAction::RefuseAndClose`], a shutdown at a frame boundary — and each
+/// of them leaves the opposite direction blocked on a client that is under no
+/// obligation to close its own write half. The session, its two descriptors
+/// and whatever frame is buffered then linger until the client closes or TCP
+/// gives up, which is a resource leak an unauthenticated peer can ask for on
+/// purpose (SEC-33).
+///
+/// The grace period rather than an immediate cancel is deliberate: a
+/// half-closing client (`shutdown(SHUT_WR)` and then read to the end) is
+/// legitimate, and the results still in flight for its last statement are
+/// exactly what the surviving direction is carrying. Ending the moment the
+/// first direction does would truncate them. Once one side is gone the other
+/// has no more work coming, so bounding it costs nothing a correct peer
+/// notices.
+///
+/// The failure of either direction is what the session reports; if the first
+/// one to end failed, the second's outcome cannot change that.
+async fn join_relays(
+    to_upstream: impl Future<Output = Result<(), Error>>,
+    to_client: impl Future<Output = Result<(), Error>>,
+) -> Result<(), Error> {
+    let mut to_upstream = std::pin::pin!(to_upstream);
+    let mut to_client = std::pin::pin!(to_client);
+    // Hand-polled rather than `select!` so the *other* future stays reachable
+    // afterwards: a `select!` arm cannot await the branch it did not take
+    // while the macro still holds it borrowed.
+    let (ended, upstream_ended) = std::future::poll_fn(|cx| {
+        if let Poll::Ready(result) = to_upstream.as_mut().poll(cx) {
+            return Poll::Ready((result, true));
+        }
+        if let Poll::Ready(result) = to_client.as_mut().poll(cx) {
+            return Poll::Ready((result, false));
+        }
+        Poll::Pending
+    })
+    .await;
+
+    let draining = async {
+        if upstream_ended {
+            to_client.as_mut().await
+        } else {
+            to_upstream.as_mut().await
+        }
+    };
+    match timeout(RELAY_DRAIN_TIMEOUT, draining).await {
+        Ok(rest) => ended.and(rest),
+        Err(_) => {
+            tracing::debug!(
+                direction = if upstream_ended { "upstream->client" } else { "client->upstream" },
+                "peer did not close its half within the drain deadline; ending the session"
+            );
+            ended
+        }
+    }
 }
 
 /// Startup phase, run under the caller's deadline: answer SSLRequest and
@@ -208,6 +321,10 @@ async fn start_session(client: TcpStream, ctx: &SessionContext) -> Result<Option
                     client = other;
                 }
             },
+            // No GSSAPI here, so the client falls back to the ordinary startup
+            // flow — over TLS if it asked for that too, in plaintext otherwise.
+            // See the module docs: this is a documented limitation, not a
+            // negotiation failure.
             Startup::GssEnc => client.write_all(b"N").await?,
             Startup::Cancel | Startup::Protocol(_) => {
                 if tls.acceptor.is_some() && client.is_plain() {
@@ -628,6 +745,67 @@ mod tests {
         assert!(back.lock().await.is_empty(), "nothing goes back to the sender");
     }
 
+    /// The other half of a refusal: the direction that refused is done, but
+    /// the opposite one is parked reading from a client that is under no
+    /// obligation to close its own write half. Waiting for it — which
+    /// `try_join!` did — kept the session, both descriptors and any buffered
+    /// frame alive until the client left or TCP timed out.
+    #[tokio::test(start_paused = true)]
+    async fn a_refused_session_does_not_wait_on_the_clients_write_half() {
+        let (_shutdown_tx, shutdown) = no_shutdown();
+        let refused = frame(b'D', b"refuse me");
+        let answered = sink();
+        let refusing = relay(
+            refused.as_slice(),
+            Writers { forward: answered.clone(), back: sink() },
+            "upstream->client",
+            |_, _| Ok(FrameAction::RefuseAndClose(frame(b'E', b"nope"))),
+            shutdown.clone(),
+        );
+        // An open, silent socket is what a client holding its write half open
+        // looks like from here: the read never completes and never EOFs.
+        let (_client, client_r) = tokio::io::duplex(64);
+        let stalled = relay(
+            client_r,
+            Writers { forward: sink(), back: sink() },
+            "client->upstream",
+            |_, _| Ok(FrameAction::Relay),
+            shutdown,
+        );
+
+        join_relays(stalled, refusing).await.unwrap();
+        assert_eq!(
+            *answered.lock().await,
+            frame(b'E', b"nope"),
+            "the refusal still reaches the client before the session ends"
+        );
+    }
+
+    /// The drain is a bound, not a cancel: a direction still carrying the
+    /// results of the client's last statement runs to completion, and its
+    /// outcome is the session's.
+    #[tokio::test(start_paused = true)]
+    async fn the_surviving_direction_finishes_inside_the_drain_window() {
+        let ended = std::future::ready(Ok(()));
+        let still_relaying = async {
+            tokio::time::sleep(RELAY_DRAIN_TIMEOUT / 2).await;
+            Err(Error::Wire(dbsec_core::Error::Decrypt))
+        };
+        assert!(matches!(
+            join_relays(ended, still_relaying).await,
+            Err(Error::Wire(dbsec_core::Error::Decrypt))
+        ));
+    }
+
+    /// A failure in the direction that ended first is the session's error, and
+    /// nothing the other one does — including never finishing — replaces it.
+    #[tokio::test(start_paused = true)]
+    async fn the_first_directions_failure_is_the_sessions_error() {
+        let failed = std::future::ready(Err(Error::PlaintextRejected));
+        let never = std::future::pending::<Result<(), Error>>();
+        assert!(matches!(join_relays(never, failed).await, Err(Error::PlaintextRejected)));
+    }
+
     #[tokio::test]
     async fn relay_fails_closed_on_transform_error() {
         let (_shutdown_tx, shutdown) = no_shutdown();
@@ -698,6 +876,45 @@ mod tests {
         assert!(!search_path_is_default(&startup(b"options\0-c search_path=tenant7\0\0")));
         // A cancel request has no parameter section at all.
         assert!(search_path_is_default(&startup(b"")));
+    }
+
+    /// The write path's copy handling hangs off a frame only the read
+    /// direction ever sees, so the wiring is part of the fix rather than
+    /// plumbing around it: without this call a real `CopyData` reads as a
+    /// stray, and the Sync the backend is ignoring stays queued to absorb the
+    /// next batch's ReadyForQuery.
+    #[test]
+    fn the_read_direction_records_the_backends_copy_and_transaction_state() {
+        use crate::portal::RowSource;
+
+        let portals = SessionPortals::new();
+        let tx_status = AtomicU8::new(TX_IDLE);
+        note_backend_state(b'Z', b"T", &tx_status, &portals);
+        assert_eq!(
+            tx_status.load(Ordering::Relaxed),
+            b'T',
+            "a refusal's synthesized ReadyForQuery reports this status"
+        );
+
+        // Execute/Sync, pipelined before the CopyInResponse came back: the
+        // Sync the backend ignores while it is in copy-in mode.
+        portals.expect_execute(b"p").unwrap();
+        portals.expect_batch().unwrap();
+        // No CopyInResponse recorded yet, so this one is a stray and the
+        // marker has to survive it.
+        portals.copy_data(b'd');
+        note_backend_state(b'G', b"", &tx_status, &portals);
+        portals.copy_data(b'd');
+
+        // CopyDone's Sync, and the batch pipelined behind it.
+        portals.expect_batch().unwrap();
+        portals.expect_execute(b"next").unwrap();
+        portals.execute_answered();
+        portals.batch_answered();
+        assert!(
+            matches!(portals.row_source(), RowSource::Undescribed),
+            "the ignored Sync must have been dropped, leaving the next batch's Execute in front"
+        );
     }
 
     #[test]
