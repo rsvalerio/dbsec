@@ -3,11 +3,11 @@ id: TASK-0136
 title: >-
   standard_conforming_strings set in the startup packet is not tracked, unlike
   search_path
-status: To Do
+status: Done
 assignee:
   - TASK-0140
 created_date: '2026-08-18 09:37'
-updated_date: '2026-08-18 09:59'
+updated_date: '2026-08-18 14:27'
 labels:
   - code-review-rust
   - security
@@ -51,6 +51,6 @@ does.
 
 ## Acceptance Criteria
 <!-- AC:BEGIN -->
-- [ ] #1 A startup packet that sets standard_conforming_strings off (directly or via options=-c) puts the session in the same state a mid-session SET does
-- [ ] #2 A test covers both startup spellings
+- [x] #1 A startup packet that sets standard_conforming_strings off (directly or via options=-c) puts the session in the same state a mid-session SET does
+- [x] #2 A test covers both startup spellings
 <!-- AC:END -->

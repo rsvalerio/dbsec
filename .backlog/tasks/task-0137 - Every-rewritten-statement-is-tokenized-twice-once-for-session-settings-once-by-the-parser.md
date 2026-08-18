@@ -3,11 +3,11 @@ id: TASK-0137
 title: >-
   Every rewritten statement is tokenized twice: once for session settings, once
   by the parser
-status: To Do
+status: Done
 assignee:
   - TASK-0140
 created_date: '2026-08-18 09:37'
-updated_date: '2026-08-18 09:59'
+updated_date: '2026-08-18 14:27'
 labels:
   - code-review-rust
   - performance
@@ -45,6 +45,6 @@ end of a batch retroactively unsealing the writes in front of it.
 
 ## Acceptance Criteria
 <!-- AC:BEGIN -->
-- [ ] #1 A rewritten statement is tokenized once, or the settings scan is skipped for text that cannot move a setting
-- [ ] #2 The per-statement grouping of setting moves is preserved, with its regression test still passing
+- [x] #1 A rewritten statement is tokenized once, or the settings scan is skipped for text that cannot move a setting
+- [x] #2 The per-statement grouping of setting moves is preserved, with its regression test still passing
 <!-- AC:END -->

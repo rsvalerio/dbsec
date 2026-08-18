@@ -1,11 +1,11 @@
 ---
 id: TASK-0140
 title: code-review-plan-wave23
-status: To Do
+status: Done
 assignee:
   - code-review-wave
 created_date: '2026-08-18 09:58'
-updated_date: '2026-08-18 09:59'
+updated_date: '2026-08-18 14:27'
 labels:
   - code-review-wave
 dependencies:
@@ -26,4 +26,6 @@ Session-settings tracking: what the rewrite learns about the connection
 
 <!-- SECTION:NOTES:BEGIN -->
 Overlaps: TASK-0139 wave22 (crates/proxy/src/encrypt.rs); TASK-0143 wave26 (crates/proxy/src/session.rs)
+
+Branch: code-review/TASK-0140
 <!-- SECTION:NOTES:END -->
