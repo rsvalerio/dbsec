@@ -2,6 +2,17 @@
 All notable changes to this project will be documented in this file. See [conventional commits](https://www.conventionalcommits.org/) for commit guidelines.
 
 - - -
+## v0.4.1 - 2026-08-18
+#### Bug Fixes
+- (**cli**) treat a closed pipe as a successful --help - (ee2a89b) - Rodrigo Valerio, *Claude Opus 5 (1M context)*
+#### Refactoring
+- (**encrypt**) split scope resolution and value sealing out too - (44b83a1) - Rodrigo Valerio, *Claude Opus 5 (1M context)*
+- (**encrypt**) split the five self-contained concerns out of encrypt.rs - (0276775) - Rodrigo Valerio, *Claude Opus 5 (1M context)*
+#### Miscellaneous Chores
+- (**backlog**) close TASK-0005 - (283308c) - Rodrigo Valerio, *Claude Opus 5 (1M context)*
+
+- - -
+
 ## v0.4.0 - 2026-08-18
 #### Features
 - (**config**) declare a table's row key - (b4b40f4) - Rodrigo Valerio, *Claude Opus 5 (1M context)*
