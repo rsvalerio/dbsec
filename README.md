@@ -157,7 +157,15 @@ does want a bare relay says so:
 ```
 dbsec /etc/dbsec/dbsec.toml   # explicit path — the shape to prefer in a unit file
 dbsec --plain-relay           # no config, no protection, on purpose
+dbsec --help                  # the flags, on stdout, exit 0
 ```
+
+The refusal only covers a *missing* file, though — a config file that exists and
+declares no `[[column]]` reaches the same zero-protection state by a likelier
+route (a `[[column]]` block lost to a bad merge or an environment overlay). That
+is allowed, because a plain relay is a legitimate deployment, but it is never
+silent: every startup that protects nothing logs one WARN saying so, naming the
+config it read. `--plain-relay` logs the same line. Alert on it.
 
 **The config file is a secret file when it carries a secret.** `keys_file`, the
 Vault `token_file` and the downstream TLS key are refused unless they are
