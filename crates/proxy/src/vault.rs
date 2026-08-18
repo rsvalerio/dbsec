@@ -679,7 +679,10 @@ impl<S: KeyStore> VaultKeySource<S> {
             Err(e) => {
                 // Not evidence of a bad token: Vault may simply be
                 // unreachable, and the caches keep serving meanwhile.
-                tracing::warn!(error = %e, "could not check the vault token's lease");
+                tracing::warn!(
+                    error = %crate::diag::chain(&e),
+                    "could not check the vault token's lease"
+                );
                 return TokenCheck::Unknown;
             }
         };
@@ -702,7 +705,7 @@ impl<S: KeyStore> VaultKeySource<S> {
             }
             Err(e) => {
                 tracing::warn!(
-                    error = %e,
+                    error = %crate::diag::chain(&e),
                     ttl_secs = status.ttl.as_secs(),
                     "the vault token is near expiry and renewal failed; issue a fresh token \
                      and restart the proxy before the lease runs out"

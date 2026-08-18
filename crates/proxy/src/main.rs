@@ -4,6 +4,7 @@
 
 mod columns;
 mod config;
+mod diag;
 mod encrypt;
 mod hardening;
 mod portal;
@@ -70,10 +71,11 @@ const REFUSAL_LOG_INTERVAL: Duration = Duration::from_secs(5);
 /// Those targets are turned off rather than lowered, because the noise is
 /// emitted at ERROR itself. Nothing is lost: the proxy attaches its own
 /// context at the site that *handles* the failure (`main`'s startup path and
-/// [`log_session_error`]), and since the `vaultrs` error is carried as a
-/// `#[source]` rather than formatted away, the library's view of it is still
-/// reachable through the error chain. An operator who sets `RUST_LOG` owns the
-/// filter completely and can put `vaultrs=debug` back in.
+/// [`log_session_error`]), the `vaultrs` error is carried as a `#[source]`
+/// rather than formatted away, and those handling sites render the whole chain
+/// with [`diag::chain`] — so the library's view of the failure is printed
+/// under the proxy's, at the one place it is actionable. An operator who sets
+/// `RUST_LOG` owns the filter completely and can put `vaultrs=debug` back in.
 ///
 /// The one security-relevant line `vaultrs` emits — the WARN it logs when it is
 /// about to accept invalid certificates — is unreachable from this proxy:
@@ -91,7 +93,32 @@ const PLAIN_RELAY_FLAG: &str = "--plain-relay";
 /// Opt-in for leaving core dumps enabled — see [`hardening`].
 const ALLOW_CORE_DUMPS_FLAG: &str = "--allow-core-dumps";
 
+/// The two spellings of "tell me what the flags are".
+const HELP_FLAGS: [&str; 2] = ["-h", "--help"];
+
 const USAGE: &str = "usage: dbsec [--plain-relay] [--allow-core-dumps] [config.toml]";
+
+/// The rest of `dbsec --help`: what each argument does, and — for the two
+/// opt-ins — what it costs, because both of them relax a default that exists
+/// to protect data.
+const OPTIONS: &str = "\
+  config.toml           config to load; with no path, ./dbsec.toml, and a run
+                        with neither is refused
+  --plain-relay         start with no config at all: no encryption, no TLS and
+                        no protected columns
+  --allow-core-dumps    leave core dumps enabled; a dump of this process can
+                        contain key material
+  -h, --help            print this help and exit";
+
+/// What a startup that protects nothing is reported as, whichever way it was
+/// reached. A config file with no `[[column]]` entries and
+/// [`PLAIN_RELAY_FLAG`] leave the proxy in exactly the same state — every
+/// value passes through as the client and the database send it — so they read
+/// the same way in the log rather than one being a WARN and the other a field
+/// inside the INFO listening line (TASK-0131).
+const NO_PROTECTION_WARNING: &str =
+    "no protected columns are configured: relaying in plaintext with no encryption and no column \
+     protection, so every value passes through exactly as the client and the database send it";
 
 /// Claims the right to install a thread-local `tracing` subscriber and assert
 /// on what it saw. Held for as long as the subscriber is.
@@ -255,9 +282,20 @@ fn main() -> ExitCode {
         .init();
 
     let config = match start(std::env::args_os().skip(1)) {
-        Ok(config) => config,
+        Ok(Startup::Help) => {
+            // Help is the one thing this binary writes to stdout, and the one
+            // run that never becomes a proxy: there is no stream to keep clean
+            // for a pipe because the process exits immediately, and `dbsec
+            // --help | grep` and `dbsec --help > flags.txt` are what an
+            // operator actually does with it. Diagnostics from a *running*
+            // proxy stay on stderr, unchanged — `tests/cli.rs` pins both
+            // halves of that split (TEST-31).
+            println!("{USAGE}\n\n{OPTIONS}");
+            return ExitCode::SUCCESS;
+        }
+        Ok(Startup::Serve(config)) => config,
         Err(e) => {
-            tracing::error!(error = %e, "startup failed");
+            tracing::error!(error = %diag::chain(&e), "startup failed");
             return ExitCode::FAILURE;
         }
     };
@@ -265,14 +303,14 @@ fn main() -> ExitCode {
     let runtime = match tokio::runtime::Runtime::new() {
         Ok(rt) => rt,
         Err(e) => {
-            tracing::error!(error = %e, "failed to start runtime");
+            tracing::error!(error = %diag::chain(&e), "failed to start runtime");
             return ExitCode::FAILURE;
         }
     };
-    match runtime.block_on(serve(config)) {
+    match runtime.block_on(serve(*config)) {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
-            tracing::error!(error = %e, "proxy exited with error");
+            tracing::error!(error = %diag::chain(&e), "proxy exited with error");
             ExitCode::FAILURE
         }
     }
@@ -288,6 +326,26 @@ struct Args {
     plain_relay: bool,
     /// Leave core dumps enabled — see [`hardening::disable_core_dumps`].
     allow_core_dumps: bool,
+    /// Print [`USAGE`] and [`OPTIONS`] and exit successfully, doing nothing
+    /// else — see [`Startup::Help`].
+    help: bool,
+}
+
+/// What [`start`] made of the command line.
+///
+/// `--help` is not a startup *failure*, so it cannot be an [`Error`]: an
+/// operator asking what the flags are must get the flags and a zero exit, not
+/// a logged ERROR and a non-zero one that a supervisor would restart on
+/// (TASK-0130).
+#[derive(Debug)]
+enum Startup {
+    /// `-h` / `--help`.
+    Help,
+    /// Boxed because [`ValidatedConfig`] carries the whole config — every
+    /// `[[column]]`, the TLS paths and the key source — and an enum is as
+    /// large as its largest variant, which would make the unit `Help` arm pay
+    /// for all of it.
+    Serve(Box<ValidatedConfig>),
 }
 
 impl Args {
@@ -306,6 +364,7 @@ impl Args {
             match arg.to_str() {
                 Some(PLAIN_RELAY_FLAG) => parsed.plain_relay = true,
                 Some(ALLOW_CORE_DUMPS_FLAG) => parsed.allow_core_dumps = true,
+                Some(flag) if HELP_FLAGS.contains(&flag) => parsed.help = true,
                 Some(unknown) if unknown.starts_with('-') => {
                     return Err(Error::Usage { message: format!("unknown option {unknown}") })
                 }
@@ -325,12 +384,18 @@ impl Args {
 /// Everything that happens before the runtime exists: the command line, the
 /// process hardening that has to be in place before any key material is read,
 /// and the config itself.
-fn start(args: impl IntoIterator<Item = OsString>) -> Result<ValidatedConfig, Error> {
+fn start(args: impl IntoIterator<Item = OsString>) -> Result<Startup, Error> {
     let args = Args::parse(args)?;
+    // Answered before the hardening and the config: `--help` must work in a
+    // directory with no config, and on a kernel where the core-dump limit
+    // cannot be set, or it is not help.
+    if args.help {
+        return Ok(Startup::Help);
+    }
     if !args.allow_core_dumps {
         hardening::disable_core_dumps()?;
     }
-    load_config(&args, Path::new(DEFAULT_CONFIG))
+    Ok(Startup::Serve(Box::new(load_config(&args, Path::new(DEFAULT_CONFIG))?)))
 }
 
 /// `dbsec [config.toml]` — with no path on the command line, `default`, which
@@ -344,22 +409,30 @@ fn start(args: impl IntoIterator<Item = OsString>) -> Result<ValidatedConfig, Er
 /// mundane: a systemd unit whose `WorkingDirectory` moved, a container whose
 /// config volume mounted somewhere else. A deployment that genuinely wants the
 /// relay says so with [`PLAIN_RELAY_FLAG`].
+///
+/// The refusal only covers the *missing* file, though. A config file that
+/// exists and declares no `[[column]]` reaches the identical zero-protection
+/// state — a `[[column]]` block lost to a bad merge, a templating mistake, an
+/// environment overlay — and is the likelier production shape of the two. So
+/// the warning is attached to the state rather than to the route taken to it:
+/// every startup that protects nothing says so once, at WARN, naming where its
+/// config came from (TASK-0131).
 fn load_config(args: &Args, default: &Path) -> Result<ValidatedConfig, Error> {
-    if let Some(path) = &args.config {
-        return Config::load(path);
+    let (loaded, source) = match &args.config {
+        Some(path) => (Config::load(path)?, path.display().to_string()),
+        None if default.exists() => (Config::load(default)?, default.display().to_string()),
+        None if args.plain_relay => {
+            (Config::default().validated()?, format!("none ({PLAIN_RELAY_FLAG})"))
+        }
+        None => return Err(Error::NoConfig { path: default.to_owned() }),
+    };
+    // `protected` is `Some` exactly when at least one `[[column]]` was
+    // configured, so this is the same condition the read and write paths are
+    // switched on — not a second, drifting definition of "protected".
+    if loaded.protected.is_none() {
+        tracing::warn!(config = %source, "{NO_PROTECTION_WARNING}");
     }
-    if default.exists() {
-        return Config::load(default);
-    }
-    if !args.plain_relay {
-        return Err(Error::NoConfig { path: default.to_owned() });
-    }
-    tracing::warn!(
-        config = %default.display(),
-        "no config file and {PLAIN_RELAY_FLAG} was given: relaying in plaintext with no protected \
-         columns"
-    );
-    Config::default().validated()
+    Ok(loaded)
 }
 
 async fn serve(validated: ValidatedConfig) -> Result<(), Error> {
@@ -674,8 +747,9 @@ async fn accept_loop<A: Accept>(
 /// this connection: every session after it fails the same way until an
 /// operator acts. That is the case [`DEFAULT_LOG_FILTER`] silences the
 /// `vaultrs`/`rustify` targets for, so it is reported here at ERROR instead,
-/// with the proxy's own context and the backend error still reachable through
-/// `source()`.
+/// with the proxy's own context and — via [`diag::chain`] — the backend error
+/// underneath it, which is the half that tells a 403 from a connection
+/// refused.
 ///
 /// Everything else stays a WARN: a malformed frame, a rejected rewrite or an
 /// envelope written under a DEK this deployment no longer has
@@ -683,9 +757,9 @@ async fn accept_loop<A: Accept>(
 /// client that retries it must not be able to fill the log with ERRORs.
 fn log_session_error(peer: &SocketAddr, e: &Error) {
     if is_key_backend_failure(e) {
-        tracing::error!(%peer, error = %e, "session ended: the key source is not usable");
+        tracing::error!(%peer, error = %diag::chain(e), "session ended: the key source is not usable");
     } else {
-        tracing::warn!(%peer, error = %e, "session ended with error");
+        tracing::warn!(%peer, error = %diag::chain(e), "session ended with error");
     }
 }
 
@@ -715,9 +789,35 @@ mod tests {
             Args {
                 config: Some(PathBuf::from("a.toml")),
                 plain_relay: true,
-                allow_core_dumps: true
+                allow_core_dumps: true,
+                ..Args::default()
             }
         );
+    }
+
+    /// TASK-0130: asking what the flags are is not a usage *error*. Both
+    /// spellings are recognised, and the answer is a `Startup::Help` rather
+    /// than an `Error::Usage` — which is what keeps the exit code at 0 and the
+    /// text out of a `tracing` ERROR record.
+    #[test]
+    fn help_is_a_startup_outcome_rather_than_a_usage_error() {
+        for flag in HELP_FLAGS {
+            assert_eq!(args(&[flag]).unwrap(), Args { help: true, ..Args::default() }, "{flag}");
+            assert!(
+                matches!(start([OsString::from(flag)]), Ok(Startup::Help)),
+                "{flag} must short-circuit startup"
+            );
+        }
+        // Help wins over the rest of the command line: an operator who is
+        // asking for the flags does not want the config loaded first.
+        assert!(matches!(
+            start([OsString::from("/nonexistent/dbsec.toml"), OsString::from("--help")]),
+            Ok(Startup::Help)
+        ));
+        // And the text it prints answers the command line it documents.
+        for flag in [PLAIN_RELAY_FLAG, ALLOW_CORE_DUMPS_FLAG].iter().chain(HELP_FLAGS.iter()) {
+            assert!(OPTIONS.contains(flag), "{flag} is undocumented");
+        }
     }
 
     /// A mistyped opt-in must not be read as a config path: it would be
@@ -956,5 +1056,49 @@ mod tests {
         );
         assert!(!is_key_backend_failure(&Error::UndescribedRow));
         assert!(!is_key_backend_failure(&Error::Io(std::io::Error::from(ErrorKind::BrokenPipe))));
+    }
+
+    /// TASK-0138: `KeyBackend`'s `Display` is `key source: {context}` and says
+    /// nothing about *why* the backend refused. The cause it keeps as a
+    /// `#[source]` is the half that separates a revoked token from an
+    /// unreachable Vault, and it is also the half `DEFAULT_LOG_FILTER`
+    /// silences at the `vaultrs` target — so the handling site has to render
+    /// it, or the process never prints it at all.
+    #[test]
+    fn a_key_backend_failure_reports_the_cause_the_vault_target_is_silenced_for() {
+        let revoked = Error::Wire(dbsec_core::Error::KeyBackend {
+            context: "reading index key public.users.email".to_owned(),
+            source: Box::new(std::io::Error::from(ErrorKind::PermissionDenied)),
+        });
+        let top = revoked.to_string();
+        assert!(!top.contains("permission denied"), "precondition: Display drops it: {top}");
+
+        let rendered = diag::chain(&revoked).to_string();
+        assert!(rendered.starts_with(&top), "the proxy's own context stays first: {rendered}");
+        assert!(rendered.contains("permission denied"), "{rendered}");
+    }
+
+    /// TASK-0138 AC3, and the one thing a chain renderer must not do here:
+    /// [`Error::ConfigParse`] deliberately holds a rendered `reason` and no
+    /// `#[source]`, because the `toml` error's own `Display` quotes the
+    /// offending line back — which on a malformed `control_dsn` or inline
+    /// `[vault] token` is the credential itself. Walking `source()` must not
+    /// become the way back to it.
+    #[test]
+    fn rendering_a_config_parse_failure_cannot_reach_the_line_it_choked_on() {
+        let dir = tempfile::tempdir().unwrap();
+        let broken = dir.path().join("broken.toml");
+        // A lost opening quote: the value runs to the end of the line, and the
+        // line is a DSN carrying the control user's password.
+        std::fs::write(&broken, "control_dsn = postgres://control:hunter2@db:5432/app\"\n")
+            .unwrap();
+
+        let Err(e) = Config::load(&broken) else { panic!("the file must not parse") };
+        assert!(matches!(e, Error::ConfigParse { .. }), "expected a parse failure, got: {e}");
+        assert!(std::error::Error::source(&e).is_none(), "ConfigParse must keep no source");
+
+        let rendered = diag::chain(&e).to_string();
+        assert!(!rendered.contains("hunter2"), "the credential must not reach the log: {rendered}");
+        assert_eq!(rendered, e.to_string(), "there is nothing under it to render");
     }
 }

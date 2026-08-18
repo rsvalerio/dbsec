@@ -23,6 +23,12 @@ const DEFAULT_LISTEN: &str = "127.0.0.1:6432";
 /// the binary as an operator does, so the flag is part of what it pins.
 const PLAIN_RELAY_FLAG: &str = "--plain-relay";
 
+/// The warning a startup that protects nothing has to carry, whichever way it
+/// got there: a config file with no `[[column]]` entries and `--plain-relay`
+/// leave the proxy in the same state, so an operator grepping for one finds
+/// the other (TASK-0131).
+const NO_PROTECTION_WARNING: &str = "no protected columns are configured";
+
 /// `max_sessions` for a config with no argument-passing ambiguity: the
 /// default is 256, so any of these values proves *which* file was read.
 const EXPLICIT_SESSIONS: usize = 7;
@@ -198,7 +204,55 @@ fn the_plain_relay_opt_in_falls_back_to_the_default_listen_address() {
 
     assert_eq!(output.status.code(), Some(1), "stderr: {stderr}");
     assert!(stderr.contains(&format!("binding listen address {DEFAULT_LISTEN}")), "{stderr}");
+    // The opt-in is not a quiet mode: running with no protection at all is
+    // still announced, in the same words the no-columns config uses.
+    assert!(stderr.contains(NO_PROTECTION_WARNING), "{stderr}");
+    assert!(stderr.contains(PLAIN_RELAY_FLAG), "the warning names how it got there: {stderr}");
     assert!(output.stdout.is_empty(), "stdout: {:?}", String::from_utf8_lossy(&output.stdout));
+}
+
+/// A config file that exists and declares no `[[column]]` reaches exactly the
+/// zero-protection state `--plain-relay` is an opt-in for, and by a likelier
+/// route: a `[[column]]` block lost to a bad merge or an environment overlay.
+/// It gets the same WARN rather than a `protected_columns=0` field buried in
+/// the INFO listening line (TASK-0131).
+#[test]
+fn a_config_with_no_columns_warns_that_nothing_is_protected() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("dbsec.toml"), config_toml(DISCOVERED_SESSIONS)).unwrap();
+
+    let mut proxy = Running::start(&mut dbsec(dir.path()));
+    let warning = proxy.wait_for(NO_PROTECTION_WARNING);
+    assert!(warning.contains("WARN"), "not a field on an INFO line: {warning}");
+    assert!(warning.contains("dbsec.toml"), "the warning names the config it read: {warning}");
+    // And it is a warning, not a refusal: a plain relay that was asked for is
+    // still allowed to serve.
+    proxy.wait_for("dbsec listening");
+    proxy.assert_still_serving();
+    assert_eq!(proxy.stop(), "", "diagnostics must not reach stdout");
+}
+
+/// `--help` is the first thing an operator tries, and it used to be reported
+/// as a startup failure: an ERROR record and exit 1 (TASK-0130). It is now the
+/// one thing this binary writes to stdout — the run never becomes a proxy, so
+/// there is no pipe to keep clean, and `dbsec --help | grep` works.
+#[test]
+fn help_prints_usage_to_stdout_and_exits_zero() {
+    let dir = tempfile::tempdir().unwrap();
+    for flag in ["--help", "-h"] {
+        let output =
+            dbsec(dir.path()).arg(flag).output().expect("the dbsec binary must be runnable");
+        let stdout = String::from_utf8(output.stdout).unwrap();
+        let stderr = String::from_utf8(output.stderr).unwrap();
+
+        assert_eq!(output.status.code(), Some(0), "{flag}: stderr: {stderr}");
+        assert!(stdout.contains("usage: dbsec"), "{flag}: stdout: {stdout}");
+        assert!(stdout.contains(PLAIN_RELAY_FLAG), "{flag}: stdout: {stdout}");
+        // Nothing is logged: help is an answer, not a diagnostic, and the
+        // empty working directory it ran in must not turn into a complaint
+        // about the missing config it never looked for.
+        assert!(stderr.is_empty(), "{flag}: stderr: {stderr}");
+    }
 }
 
 /// A mistyped option is refused with the usage line rather than treated as a

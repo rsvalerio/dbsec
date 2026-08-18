@@ -84,8 +84,8 @@ pub async fn refresh_loop(refresher: Refresher, mut shutdown: crate::session::Sh
             // Including a column that no longer exists: mid-migration the
             // table may be gone for a moment, and refusing to serve because
             // of it would turn a schema change into an outage.
-            Err(e) => tracing::warn!(error = %e, "could not re-resolve protected columns; \
-                 keeping the previous mapping"),
+            Err(e) => tracing::warn!(error = %crate::diag::chain(&e), "could not re-resolve \
+                 protected columns; keeping the previous mapping"),
         }
     }
 }
@@ -217,7 +217,7 @@ where
         .map_err(|source| Error::Control { host: control_host(dsn.as_str()), source })?;
     tokio::spawn(async move {
         if let Err(e) = connection.await {
-            tracing::warn!(error = %e, "control connection ended with error");
+            tracing::warn!(error = %crate::diag::chain(&e), "control connection ended with error");
         }
     });
     Ok(client)
@@ -397,6 +397,16 @@ mod tests {
             std::error::Error::source(&err).expect("the tokio_postgres cause stays reachable");
         let io = cause.source().expect("and its own io::Error under that");
         assert!(io.to_string().contains("No such file or directory"), "{io}");
+
+        // TASK-0138: keeping the cause is only half of it — the startup path
+        // logs this error, and what it logs has to include the `io::Error`.
+        // "control connection to …: error connecting to server" on its own is
+        // the same line for a refused connection, a missing socket and a
+        // failed certificate check.
+        let logged = crate::diag::chain(&err).to_string();
+        assert!(logged.contains("No such file or directory"), "{logged}");
+        assert!(logged.starts_with(&err.to_string()), "the proxy's context stays first: {logged}");
+        assert!(!logged.contains("hunter2"), "and the password still stays out: {logged}");
     }
 
     /// One `[[column]]` per read-path shape the filter has to tell apart.
