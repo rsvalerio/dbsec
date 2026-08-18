@@ -2,6 +2,46 @@
 All notable changes to this project will be documented in this file. See [conventional commits](https://www.conventionalcommits.org/) for commit guidelines.
 
 - - -
+## v0.2.0 - 2026-08-18
+#### Features
+- (**crypto**) bind a ciphertext to its column and tighten key handling - (8beb7c8) - Rodrigo Valerio
+- <span style="background-color: #d73a49; color: white; padding: 2px 6px; border-radius: 3px; font-weight: bold; font-size: 0.85em;">BREAKING</span>(**proxy**) fail closed at startup and stop the config leaking secrets - (313bac4) - Rodrigo Valerio
+#### Bug Fixes
+- (**config**) refuse a plaintext Vault address and a downgradeable control_dsn - (a3f8bfb) - Rodrigo Valerio, *Claude Opus 5 (1M context)*
+- (**core**) stop the process-wide key caches panicking on a poisoned lock - (14b4896) - Rodrigo Valerio
+- (**encrypt**) flag a query-source COPY TO STDOUT over a protected table - (7be5c2d) - Rodrigo Valerio
+- (**encrypt**) cover every relation a predicate can name, and stop refusing the canonical upsert - (e2cc928) - Rodrigo Valerio, *Claude Opus 5 (1M context)*
+- (**pgwire**) cap startup packets well below the 1 GiB frame limit - (8638775) - Rodrigo Valerio
+- (**proxy**) tie the TLS context to a validated config and keep control causes typed - (4af0f14) - Rodrigo Valerio
+- (**proxy**) track the session state and identifier folding the rewrite assumes - (aa3c94f) - Rodrigo Valerio
+- (**proxy**) stop a client desyncing, pinning or killing its own session - (0e1c796) - Rodrigo Valerio
+- (**rows**) close the fast-path and cached-statement read holes - (5207383) - Rodrigo Valerio
+- (**rows**) pass the cell context in the frame-ceiling test's envelope - (ecb36fe) - Rodrigo Valerio
+- (**rows**) bound what one DataRow can cost the decrypt path - (febff13) - Rodrigo Valerio
+- (**vault**) pin certificate verification instead of inheriting it from the environment - (310345c) - Rodrigo Valerio, *Claude Opus 5 (1M context)*
+#### Documentation
+- (**envelope**) warn that renaming a bound column invalidates its ciphertexts - (9fbb6c8) - Rodrigo Valerio
+- (**readme**) record that every outbound hop is refused in the clear - (e780591) - Rodrigo Valerio, *Claude Opus 5 (1M context)*
+- (**vault**) point the capture-guard reference at the helper, not its static - (76bc57c) - Rodrigo Valerio
+- record the session-state and identifier assumptions the rewrite relies on - (8520b92) - Rodrigo Valerio
+- record what auth passthrough costs in channel binding and GSSENC - (e45eebd) - Rodrigo Valerio
+- record the COPY query form and the function-call fast path as sites - (dabaec0) - Rodrigo Valerio
+- record the DBS2 migration, the fork constraint and revocation - (745b590) - Rodrigo Valerio
+- cover fail-closed startup, config permissions and process hardening - (c5a85b3) - Rodrigo Valerio
+#### Tests
+- (**core**) check in the proptest seed for the DBS1/DBS2 magic flip - (e325800) - Rodrigo Valerio, *Claude Opus 5 (1M context)*
+- (**core**) decide the tamper error by shape, not by byte position - (97756b3) - Rodrigo Valerio, *Claude Opus 5 (1M context)*
+- (**encrypt**) count the sealed literal in the escape-string form it now takes - (4a61ada) - Rodrigo Valerio
+- (**vault**) serialise the migration test that captures tracing events - (2a0dd08) - Rodrigo Valerio
+#### Build system
+- (**deps**) add url so a Vault address is parsed before vaultrs unwraps it - (8e9a88c) - Rodrigo Valerio, *Claude Opus 5 (1M context)*
+- (**deps**) pull aes with zeroize so the key schedule is wiped on drop - (e89b478) - Rodrigo Valerio
+#### Miscellaneous Chores
+- (**backlog**) close waves 13-21 and file what they surfaced - (c5232d6) - Rodrigo Valerio, *Claude Opus 5 (1M context)*
+- (**backlog**) triage the remaining 34 findings into waves 13-21 - (2bf3fe1) - Rodrigo Valerio
+
+- - -
+
 ## v0.1.8 - 2026-08-17
 #### Bug Fixes
 - close the computed-column read-path bypass - (8746ee2) - Rodrigo Valerio, *Claude Opus 5 (1M context)*
