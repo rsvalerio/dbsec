@@ -56,7 +56,9 @@ which a backslash in an ordinary string literal is just a backslash. Sealed
 values go out as `E'\\x…'` so they mean the same bytes either way, but a
 session that turns the setting off makes the server read the *client's* own
 literals differently from the proxy's parser, so the change is an
-`on_unprotected` site.
+`on_unprotected` site. Turning it off in the startup packet — as a parameter or
+through `options=-c standard_conforming_strings=off` — is watched the same way
+and reported on the session's first statement.
 
 **Identifier names** — a `[[column]]` name is the name the catalog holds. SQL
 identifiers are folded the way PostgreSQL folds them before they are compared

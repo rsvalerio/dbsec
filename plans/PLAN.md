@@ -181,6 +181,9 @@ TLS: `MaybeTls` stream enum both hops. Downstream handles `SSLRequest` from clie
   plain `'\x…'` that reads as `bytea` hex input only while it is on. The proxy still
   reports a session that turns it off as an `on_unprotected` site: from that point the
   server reads the *client's* own string literals differently from the proxy's parser.
+  Both halves of "turns it off" are watched — the startup packet's own parameter or
+  `options=-c` spelling, reported on the first statement because a refusal needs a frame
+  to answer, and every in-session spelling, reported where it is written.
 - **Identifiers are folded the way PostgreSQL folds them.** Unquoted names are downcased
   ASCII-only — Rust's `to_lowercase` would fold `Ä` and the Kelvin sign, where the server
   leaves every multibyte character alone — and every name is clipped to 63 bytes
