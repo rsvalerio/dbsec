@@ -3,7 +3,7 @@
 
 use std::sync::Arc;
 
-use dbsec_core::envelope::{self, CellContext, Ciphers, KeyId, KEY_ID_LEN, NONCE_LEN};
+use dbsec_core::envelope::{self, Binding, CellContext, Ciphers, KeyId, KEY_ID_LEN, NONCE_LEN};
 use dbsec_core::keys::{Key, KeySource};
 use dbsec_core::mask::MaskSpec;
 use dbsec_core::transform::{EncryptTransform, FieldTransform, FpeTransform, TokenTransform};
@@ -50,10 +50,10 @@ proptest! {
         key_id in any::<[u8; KEY_ID_LEN]>(),
         plaintext in proptest::collection::vec(any::<u8>(), 0..512),
     ) {
-        let ct = envelope::encrypt(&key, &key_id, &test_context(), &plaintext).unwrap();
+        let ct = envelope::encrypt(&key, &key_id, &Binding::cell(&test_context()), &plaintext).unwrap();
         prop_assert!(envelope::is_enveloped(&ct));
         prop_assert_eq!(envelope::key_id(&ct).unwrap(), key_id);
-        prop_assert_eq!(envelope::decrypt(&key, &test_context(), &ct).unwrap(), plaintext);
+        prop_assert_eq!(envelope::decrypt(&key, &Binding::cell(&test_context()), &ct).unwrap(), plaintext);
     }
 
     #[test]
@@ -63,7 +63,7 @@ proptest! {
         pos in any::<prop::sample::Index>(),
         flip in 1u8..,
     ) {
-        let mut ct = envelope::encrypt(&key, &[1u8; KEY_ID_LEN], &test_context(), &plaintext).unwrap();
+        let mut ct = envelope::encrypt(&key, &[1u8; KEY_ID_LEN], &Binding::cell(&test_context()), &plaintext).unwrap();
         let pos = pos.index(ct.len());
         ct[pos] ^= flip;
         // Which error comes back is decided by whether the corruption left
@@ -76,7 +76,7 @@ proptest! {
         // computed over the context AAD, so verifying it under the key id
         // alone cannot succeed, and the relabelling downgrades nothing.
         let still_an_envelope = envelope::is_enveloped(&ct);
-        match envelope::decrypt(&key, &test_context(), &ct) {
+        match envelope::decrypt(&key, &Binding::cell(&test_context()), &ct) {
             Err(Error::Malformed) => prop_assert!(!still_an_envelope),
             Err(Error::Decrypt) => prop_assert!(still_an_envelope),
             Ok(_) => prop_assert!(false, "tampered ciphertext decrypted"),
@@ -89,7 +89,7 @@ proptest! {
         key in any::<[u8; 32]>(),
         data in proptest::collection::vec(any::<u8>(), 0..256),
     ) {
-        let _ = envelope::decrypt(&key, &test_context(), &data);
+        let _ = envelope::decrypt(&key, &Binding::cell(&test_context()), &data);
         let _ = envelope::key_id(&data);
         let _ = envelope::is_enveloped(&data);
     }
@@ -99,8 +99,8 @@ proptest! {
         key in any::<[u8; 32]>(),
         plaintext in proptest::collection::vec(any::<u8>(), 0..64),
     ) {
-        let a = envelope::encrypt(&key, &[1u8; KEY_ID_LEN], &test_context(), &plaintext).unwrap();
-        let b = envelope::encrypt(&key, &[1u8; KEY_ID_LEN], &test_context(), &plaintext).unwrap();
+        let a = envelope::encrypt(&key, &[1u8; KEY_ID_LEN], &Binding::cell(&test_context()), &plaintext).unwrap();
+        let b = envelope::encrypt(&key, &[1u8; KEY_ID_LEN], &Binding::cell(&test_context()), &plaintext).unwrap();
         let nonce = |ct: &[u8]| ct[4 + KEY_ID_LEN..4 + KEY_ID_LEN + NONCE_LEN].to_vec();
         prop_assert_ne!(nonce(&a), nonce(&b));
     }
@@ -113,10 +113,10 @@ proptest! {
         plaintext in proptest::collection::vec(any::<u8>(), 0..128),
     ) {
         let stored =
-            envelope::encrypt(&key, &[1u8; KEY_ID_LEN], &test_context(), &plaintext).unwrap();
+            envelope::encrypt(&key, &[1u8; KEY_ID_LEN], &Binding::cell(&test_context()), &plaintext).unwrap();
         let elsewhere = CellContext::new("public.users.ssn");
         prop_assert!(matches!(
-            envelope::decrypt(&key, &elsewhere, &stored),
+            envelope::decrypt(&key, &Binding::cell(&elsewhere), &stored),
             Err(Error::Decrypt)
         ));
     }
@@ -140,12 +140,12 @@ proptest! {
         index_key in any::<[u8; 32]>(),
         plaintext in proptest::collection::vec(any::<u8>(), 0..128),
     ) {
-        let ct = envelope::encrypt(&key, &[1u8; KEY_ID_LEN], &test_context(), &plaintext).unwrap();
+        let ct = envelope::encrypt(&key, &[1u8; KEY_ID_LEN], &Binding::cell(&test_context()), &plaintext).unwrap();
         let index = blind_index::compute(&index_key, &plaintext);
         let stored = blind_index::prepend(&index, &ct);
         let (idx, env) = blind_index::split(&stored).unwrap();
         prop_assert_eq!(idx, index);
-        prop_assert_eq!(envelope::decrypt(&key, &test_context(), env).unwrap(), plaintext);
+        prop_assert_eq!(envelope::decrypt(&key, &Binding::cell(&test_context()), env).unwrap(), plaintext);
     }
 
     #[test]
@@ -251,11 +251,11 @@ proptest! {
             // Bytes the fuzzer chose cannot pass GCM authentication under a key
             // it does not have, so an opened plaintext would mean the envelope
             // was read without being verified.
-            prop_assert!(!matches!(encrypt.open(&data), Ok(Some(_))));
+            prop_assert!(!matches!(encrypt.open(&data, None), Ok(Some(_))));
         }
 
         let fpe = FpeTransform::new(keys.clone(), "cards.pan".into(), true);
-        if let Some(opened) = fpe.open(&data)? {
+        if let Some(opened) = fpe.open(&data, None)? {
             // FPE is shape-preserving in both directions: same length, digits
             // stay digits, everything else is untouched.
             prop_assert_eq!(opened.len(), data.len());
@@ -268,7 +268,7 @@ proptest! {
         }
 
         // Tokens are irreversible and masking runs on the same untrusted bytes.
-        prop_assert_eq!(TokenTransform::new(keys, "users.ssn".into()).open(&data)?, None);
+        prop_assert_eq!(TokenTransform::new(keys, "users.ssn".into()).open(&data, None)?, None);
         let _ = MaskSpec { keep_first: 2, keep_last: 4, mask_with: '*' }.apply(&data);
     }
 
@@ -283,12 +283,12 @@ proptest! {
             EncryptTransform::new(ciphers.clone(), test_context(), Some("users.email".into()));
         let plain = EncryptTransform::new(ciphers, test_context(), None);
 
-        let indexed = searchable.seal(&plaintext)?;
-        let opened = plain.open(&indexed)?;
+        let indexed = searchable.seal(&plaintext, None)?;
+        let opened = plain.open(&indexed, None)?;
         prop_assert_eq!(opened.as_ref(), Some(&plaintext));
 
-        let bare = plain.seal(&plaintext)?;
-        let opened = searchable.open(&bare)?;
+        let bare = plain.seal(&plaintext, None)?;
+        let opened = searchable.open(&bare, None)?;
         prop_assert_eq!(opened.as_ref(), Some(&plaintext));
     }
 }

@@ -450,6 +450,42 @@ pub struct Config {
     pub on_unprotected: OnUnprotected,
     #[serde(default, rename = "column")]
     pub columns: Vec<ColumnConfig>,
+    /// Per-table row binding: `[[table]] table = "users", row_key = "id"`.
+    /// Optional and opt-in — a table with no entry keeps cell-only binding and
+    /// its stored values are untouched.
+    #[serde(default, rename = "table")]
+    pub tables: Vec<TableConfig>,
+}
+
+/// One table's declared row key, which binds each encrypted value to the row it
+/// was written in (see `dbsec_core::envelope::RowKey`).
+///
+/// Opt-in per table because it is not free: the proxy must be able to name the
+/// row at both ends, so a protected table with a row key accepts only
+/// client-supplied key values, only single-row updates of its protected
+/// columns, and only reads that project the key. Those are refusals, not silent
+/// degradations — see `README.md`.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TableConfig {
+    /// Table name, optionally schema-qualified; bare names mean `public`.
+    pub table: String,
+    /// The column whose value names a row. Must be unique per row — a primary
+    /// key, or a column with a unique constraint. The proxy cannot verify that
+    /// and does not try: a non-unique choice silently weakens the binding to
+    /// "some row in this group", which is why this is documented as the
+    /// operator's assertion.
+    pub row_key: String,
+}
+
+impl TableConfig {
+    /// Splits `schema.table`, defaulting the schema to `public`.
+    pub fn schema_and_table(&self) -> (&str, &str) {
+        match self.table.split_once('.') {
+            Some((schema, table)) => (schema, table),
+            None => ("public", &self.table),
+        }
+    }
 }
 
 /// What the proxy does when a statement touches a protected column but the
@@ -789,6 +825,7 @@ impl Default for Config {
             tls: TlsSection::default(),
             on_unprotected: OnUnprotected::default(),
             columns: Vec::new(),
+            tables: Vec::new(),
         }
     }
 }
@@ -978,7 +1015,70 @@ impl Config {
             }
             check_identifiers(&name, schema, table, &column.column)?;
         }
+        self.validate_row_keys()?;
         Ok(protected)
+    }
+
+    /// Checks every `[[table]]` row-key declaration against the columns it
+    /// would bind.
+    ///
+    /// Three of these refuse a configuration that would *look* like row
+    /// binding while providing none of it, which is the failure worth being
+    /// loud about: an operator who declares a row key believes cross-row
+    /// relocation is detected, and a silent no-op leaves them believing it.
+    fn validate_row_keys(&self) -> Result<(), Error> {
+        let mut seen = std::collections::HashSet::new();
+        for entry in &self.tables {
+            let (schema, table) = entry.schema_and_table();
+            let qualified = format!("{schema}.{table}");
+            if !seen.insert(qualified.clone()) {
+                return Err(Error::InvalidConfig(format!(
+                    "duplicate [[table]] entry for {qualified}"
+                )));
+            }
+            check_identifiers(&qualified, schema, table, &entry.row_key)?;
+
+            let columns: Vec<&ColumnConfig> = self
+                .columns
+                .iter()
+                .filter(|column| column.schema_and_table() == (schema, table))
+                .collect();
+            if columns.is_empty() {
+                return Err(Error::InvalidConfig(format!(
+                    "[[table]] {qualified} declares row_key = \"{}\" but the table has no \
+                     [[column]] entries, so there is nothing to bind",
+                    entry.row_key
+                )));
+            }
+            // Only authenticated encryption has associated data to bind a row
+            // into. FPE and tokenization map a plaintext to the same stored
+            // bytes in every row — that determinism is what makes them
+            // searchable and joinable — so a copy between rows of such a column
+            // is indistinguishable from a legitimate write, whatever is
+            // configured here.
+            if !columns.iter().any(|column| column.transform == TransformKind::Encrypt) {
+                return Err(Error::InvalidConfig(format!(
+                    "[[table]] {qualified} declares row_key = \"{}\", but none of its columns \
+                     use transform = \"encrypt\"; fpe and token values are identical in every \
+                     row by design, so a row key would bind nothing",
+                    entry.row_key
+                )));
+            }
+            // The key column may itself be protected — but then reading it
+            // back to verify a sibling would require opening a value that is
+            // bound to the key being recovered.
+            if columns.iter().any(|column| {
+                column.column == entry.row_key && column.transform != TransformKind::None
+            }) {
+                return Err(Error::InvalidConfig(format!(
+                    "[[table]] {qualified} declares row_key = \"{}\", which is itself a \
+                     transformed [[column]]; the row key must be readable to verify the row it \
+                     names",
+                    entry.row_key
+                )));
+            }
+        }
+        Ok(())
     }
 }
 
@@ -1093,6 +1193,72 @@ mod tests {
                 "max_protected_value_bytes = {invalid} must be refused"
             );
         }
+    }
+
+    /// A row key is opt-in and does not disturb anything else.
+    #[test]
+    fn a_row_key_parses_and_defaults_its_schema() {
+        let cfg: Config = toml::from_str(
+            "keys_file = \"k.toml\"\ncontrol_dsn = \"postgres://u@h/d\"\n\
+             [[column]]\ntable = \"users\"\ncolumn = \"ssn\"\ntransform = \"encrypt\"\n\
+             [[table]]\ntable = \"users\"\nrow_key = \"id\"\n",
+        )
+        .expect("parses");
+        assert_eq!(cfg.tables.len(), 1);
+        assert_eq!(cfg.tables[0].schema_and_table(), ("public", "users"));
+        assert_eq!(cfg.tables[0].row_key, "id");
+    }
+
+    /// Every one of these would leave an operator believing cross-row
+    /// relocation is detected when it is not, which is worse than not offering
+    /// the setting.
+    #[test]
+    fn a_row_key_that_would_bind_nothing_is_refused() {
+        let base = "keys_file = \"k.toml\"\ncontrol_dsn = \"postgres://u@h/d\"\n";
+        for (name, columns, tables) in [
+            (
+                "no columns on the table",
+                "[[column]]\ntable = \"other\"\ncolumn = \"ssn\"\ntransform = \"encrypt\"\n",
+                "[[table]]\ntable = \"users\"\nrow_key = \"id\"\n",
+            ),
+            (
+                "deterministic transforms only",
+                "[[column]]\ntable = \"users\"\ncolumn = \"pan\"\ntransform = \"fpe\"\n",
+                "[[table]]\ntable = \"users\"\nrow_key = \"id\"\n",
+            ),
+            (
+                "the row key is itself protected",
+                "[[column]]\ntable = \"users\"\ncolumn = \"ssn\"\ntransform = \"encrypt\"\n\
+                 [[column]]\ntable = \"users\"\ncolumn = \"id\"\ntransform = \"encrypt\"\n",
+                "[[table]]\ntable = \"users\"\nrow_key = \"id\"\n",
+            ),
+            (
+                "duplicate declarations",
+                "[[column]]\ntable = \"users\"\ncolumn = \"ssn\"\ntransform = \"encrypt\"\n",
+                "[[table]]\ntable = \"users\"\nrow_key = \"id\"\n\
+                 [[table]]\ntable = \"public.users\"\nrow_key = \"id\"\n",
+            ),
+        ] {
+            let cfg: Config = toml::from_str(&format!("{base}{columns}{tables}")).expect("parses");
+            assert!(
+                matches!(cfg.validate(), Err(Error::InvalidConfig(_))),
+                "{name}: must be refused"
+            );
+        }
+    }
+
+    /// A table whose encrypt column sits beside deterministic ones is fine —
+    /// the encrypt column is bound, the others are documented as not.
+    #[test]
+    fn a_row_key_is_accepted_when_any_column_can_bind_it() {
+        let cfg: Config = toml::from_str(
+            "keys_file = \"k.toml\"\ncontrol_dsn = \"postgres://u@h/d\"\n\
+             [[column]]\ntable = \"users\"\ncolumn = \"pan\"\ntransform = \"fpe\"\n\
+             [[column]]\ntable = \"users\"\ncolumn = \"ssn\"\ntransform = \"encrypt\"\n\
+             [[table]]\ntable = \"users\"\nrow_key = \"id\"\n",
+        )
+        .expect("parses");
+        cfg.validate().expect("accepted");
     }
 
     #[test]

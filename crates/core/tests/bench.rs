@@ -80,30 +80,31 @@ fn seal_open_throughput() {
     let fpe = FpeTransform::new(keys.clone(), "cards.pan".into(), true);
     let token = TokenTransform::new(keys.clone(), "users.ssn".into());
 
-    let sealed: Vec<Vec<u8>> = plaintexts.iter().map(|p| encrypt.seal(p).expect("seal")).collect();
+    let sealed: Vec<Vec<u8>> =
+        plaintexts.iter().map(|p| encrypt.seal(p, None).expect("seal")).collect();
     let sealed_searchable: Vec<Vec<u8>> =
-        plaintexts.iter().map(|p| searchable.seal(p).expect("seal")).collect();
-    let sealed_fpe: Vec<Vec<u8>> = pans.iter().map(|p| fpe.seal(p).expect("seal")).collect();
+        plaintexts.iter().map(|p| searchable.seal(p, None).expect("seal")).collect();
+    let sealed_fpe: Vec<Vec<u8>> = pans.iter().map(|p| fpe.seal(p, None).expect("seal")).collect();
 
     measure("encrypt seal", |i| {
-        encrypt.seal(&plaintexts[i % plaintexts.len()]).expect("seal");
+        encrypt.seal(&plaintexts[i % plaintexts.len()], None).expect("seal");
     });
     measure("encrypt open", |i| {
-        encrypt.open(&sealed[i % sealed.len()]).expect("open");
+        encrypt.open(&sealed[i % sealed.len()], None).expect("open");
     });
     measure("searchable seal", |i| {
-        searchable.seal(&plaintexts[i % plaintexts.len()]).expect("seal");
+        searchable.seal(&plaintexts[i % plaintexts.len()], None).expect("seal");
     });
     measure("searchable open", |i| {
-        searchable.open(&sealed_searchable[i % sealed_searchable.len()]).expect("open");
+        searchable.open(&sealed_searchable[i % sealed_searchable.len()], None).expect("open");
     });
     measure("fpe seal", |i| {
-        fpe.seal(&pans[i % pans.len()]).expect("seal");
+        fpe.seal(&pans[i % pans.len()], None).expect("seal");
     });
     measure("fpe open", |i| {
-        fpe.open(&sealed_fpe[i % sealed_fpe.len()]).expect("open");
+        fpe.open(&sealed_fpe[i % sealed_fpe.len()], None).expect("open");
     });
     measure("token seal", |i| {
-        token.seal(&plaintexts[i % plaintexts.len()]).expect("seal");
+        token.seal(&plaintexts[i % plaintexts.len()], None).expect("seal");
     });
 }

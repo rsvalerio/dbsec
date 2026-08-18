@@ -8,7 +8,7 @@ use std::sync::{Arc, OnceLock};
 use aes::Aes256;
 use fpe::ff1::{FlexibleNumeralString, FF1};
 
-use crate::envelope::{CellContext, Ciphers};
+use crate::envelope::{Binding, CellContext, Ciphers, RowKey};
 use crate::keys::{Key, KeySource};
 use crate::{blind_index, envelope, Error};
 
@@ -24,7 +24,14 @@ pub enum WireForm {
 
 pub trait FieldTransform: Send + Sync {
     /// Transforms a plaintext value into its stored form (write path).
-    fn seal(&self, plaintext: &[u8]) -> Result<Vec<u8>, Error>;
+    ///
+    /// `row` is the declared key of the row being written, when the column's
+    /// table declares one. It is a parameter rather than a second method
+    /// because omitting it must be a deliberate `None` at the call site: a
+    /// transform that silently ignored a row key it was given, or that accepted
+    /// one it could not bind, would report protection it is not providing.
+    /// [`Self::binds_row`] says which of those a transform is.
+    fn seal(&self, plaintext: &[u8], row: Option<&RowKey>) -> Result<Vec<u8>, Error>;
 
     /// Reverses `seal` (read path). `Ok(None)` is the passthrough contract: the
     /// value carries none of this transform's stored forms, so it is
@@ -35,10 +42,24 @@ pub trait FieldTransform: Send + Sync {
     /// cannot read it under the current config" — handing those bytes to the
     /// client would leak a stored form as if it were a value. Such a case is an
     /// error, or is opened anyway (see `EncryptTransform::open`).
-    fn open(&self, stored: &[u8]) -> Result<Option<Vec<u8>>, Error>;
+    fn open(&self, stored: &[u8], row: Option<&RowKey>) -> Result<Option<Vec<u8>>, Error>;
 
     fn wire(&self) -> WireForm {
         WireForm::Bytea
+    }
+
+    /// Whether this transform can bind a value to the row it was written in.
+    ///
+    /// Only authenticated encryption can: the row key rides in the AEAD
+    /// associated data, which has no counterpart in a deterministic transform.
+    /// FPE and tokenization map a plaintext to the *same* stored bytes in every
+    /// row by design — that determinism is what makes them searchable and
+    /// joinable — so a value copied between rows of such a column is
+    /// indistinguishable from one legitimately written there, whatever is
+    /// configured. Config validation uses this to refuse a `row_key` that would
+    /// protect nothing.
+    fn binds_row(&self) -> bool {
+        false
     }
 
     /// The deterministic equality token a plaintext is stored under, for
@@ -102,15 +123,20 @@ impl EncryptTransform {
 }
 
 impl FieldTransform for EncryptTransform {
-    fn seal(&self, plaintext: &[u8]) -> Result<Vec<u8>, Error> {
-        let sealed = self.ciphers.seal(&self.context, plaintext)?;
+    fn seal(&self, plaintext: &[u8], row: Option<&RowKey>) -> Result<Vec<u8>, Error> {
+        let binding = Binding { context: &self.context, row };
+        let sealed = self.ciphers.seal(&binding, plaintext)?;
         match self.blind_index(plaintext)? {
             Some(index) => Ok(blind_index::prepend(&index, &sealed)),
             None => Ok(sealed),
         }
     }
 
-    fn open(&self, stored: &[u8]) -> Result<Option<Vec<u8>>, Error> {
+    fn binds_row(&self) -> bool {
+        true
+    }
+
+    fn open(&self, stored: &[u8], row: Option<&RowKey>) -> Result<Option<Vec<u8>>, Error> {
         let enveloped = match blind_index::split(stored) {
             // An index prefix means the value was written while the column was
             // searchable. Open it whether or not the column is searchable now:
@@ -122,7 +148,7 @@ impl FieldTransform for EncryptTransform {
             // Neither stored form: pre-migration plaintext, passed through.
             None => return Ok(None),
         };
-        self.ciphers.open(&self.context, enveloped).map(Some)
+        self.ciphers.open(&Binding { context: &self.context, row }, enveloped).map(Some)
     }
 
     fn search_index(&self, plaintext: &[u8]) -> Result<Option<Vec<u8>>, Error> {
@@ -197,12 +223,14 @@ impl FpeTransform {
 }
 
 impl FieldTransform for FpeTransform {
-    fn seal(&self, plaintext: &[u8]) -> Result<Vec<u8>, Error> {
+    /// `row` is ignored, and [`FieldTransform::binds_row`] stays false: FPE is
+    /// deterministic, so the same PAN encrypts to the same digits in every row.
+    fn seal(&self, plaintext: &[u8], _row: Option<&RowKey>) -> Result<Vec<u8>, Error> {
         // Refusing to store a weakly-pseudonymized value beats a silent leak.
         self.transform_digits(plaintext, false)?.ok_or(Error::FpeDomain)
     }
 
-    fn open(&self, stored: &[u8]) -> Result<Option<Vec<u8>>, Error> {
+    fn open(&self, stored: &[u8], _row: Option<&RowKey>) -> Result<Option<Vec<u8>>, Error> {
         if !self.detokenize {
             return Ok(None);
         }
@@ -241,11 +269,12 @@ impl TokenTransform {
 }
 
 impl FieldTransform for TokenTransform {
-    fn seal(&self, plaintext: &[u8]) -> Result<Vec<u8>, Error> {
+    /// `row` is ignored: an HMAC token is the same in every row by design.
+    fn seal(&self, plaintext: &[u8], _row: Option<&RowKey>) -> Result<Vec<u8>, Error> {
         Ok(hex::encode(blind_index::compute(self.key()?, plaintext)).into_bytes())
     }
 
-    fn open(&self, _stored: &[u8]) -> Result<Option<Vec<u8>>, Error> {
+    fn open(&self, _stored: &[u8], _row: Option<&RowKey>) -> Result<Option<Vec<u8>>, Error> {
         Ok(None)
     }
 
@@ -293,33 +322,33 @@ mod tests {
     #[test]
     fn seal_open_roundtrip() {
         let t = EncryptTransform::new(ciphers(), email(), None);
-        let stored = t.seal(b"alice@example.com").unwrap();
+        let stored = t.seal(b"alice@example.com", None).unwrap();
         assert!(envelope::is_enveloped(&stored));
-        assert_eq!(t.open(&stored).unwrap().unwrap(), b"alice@example.com");
-        assert_eq!(t.open(b"plain old data").unwrap(), None);
+        assert_eq!(t.open(&stored, None).unwrap().unwrap(), b"alice@example.com");
+        assert_eq!(t.open(b"plain old data", None).unwrap(), None);
     }
 
     #[test]
     fn searchable_seal_carries_blind_index() {
         let t = EncryptTransform::new(ciphers(), email(), Some("users.email".into()));
-        let stored = t.seal(b"alice").unwrap();
+        let stored = t.seal(b"alice", None).unwrap();
         let (index, _) = blind_index::split(&stored).unwrap();
         assert_eq!(index, blind_index::compute(&INDEX_KEY, b"alice"));
-        assert_eq!(t.open(&stored).unwrap().unwrap(), b"alice");
+        assert_eq!(t.open(&stored, None).unwrap().unwrap(), b"alice");
     }
 
     #[test]
     fn disabling_searchable_still_opens_index_prefixed_rows() {
         let shared = ciphers();
         let searchable = EncryptTransform::new(shared.clone(), email(), Some("users.email".into()));
-        let stored = searchable.seal(b"alice@example.com").unwrap();
+        let stored = searchable.seal(b"alice@example.com", None).unwrap();
 
         // The same column after `searchable = false`: rows written under the
         // old config must still decrypt, never pass through as raw bytes.
         let plain = EncryptTransform::new(shared, email(), None);
-        assert_eq!(plain.open(&stored).unwrap().unwrap(), b"alice@example.com");
+        assert_eq!(plain.open(&stored, None).unwrap().unwrap(), b"alice@example.com");
         // The reverse direction (searchable turned on) keeps working too.
-        let bare = searchable.open(&plain.seal(b"bob@example.com").unwrap()).unwrap();
+        let bare = searchable.open(&plain.seal(b"bob@example.com", None).unwrap(), None).unwrap();
         assert_eq!(bare.unwrap(), b"bob@example.com");
     }
 
@@ -333,9 +362,9 @@ mod tests {
         let card =
             EncryptTransform::new(shared, CellContext::new("public.users.credit_card"), None);
 
-        let stored = ssn.seal(b"078-05-1120").unwrap();
-        assert!(matches!(card.open(&stored), Err(Error::Decrypt)));
-        assert_eq!(ssn.open(&stored).unwrap().unwrap(), b"078-05-1120");
+        let stored = ssn.seal(b"078-05-1120", None).unwrap();
+        assert!(matches!(card.open(&stored, None), Err(Error::Decrypt)));
+        assert_eq!(ssn.open(&stored, None).unwrap().unwrap(), b"078-05-1120");
     }
 
     /// The blind index travels with the envelope, so relocating a searchable
@@ -355,51 +384,51 @@ mod tests {
             Some("public.users.credit_card".into()),
         );
 
-        let stored = ssn.seal(b"078-05-1120").unwrap();
+        let stored = ssn.seal(b"078-05-1120", None).unwrap();
         assert!(blind_index::split(&stored).is_some(), "the stored form carries an index");
-        assert!(matches!(card.open(&stored), Err(Error::Decrypt)));
+        assert!(matches!(card.open(&stored, None), Err(Error::Decrypt)));
     }
 
     #[test]
     fn fpe_preserves_shape_and_roundtrips() {
         let t = FpeTransform::new(Arc::new(TestKeys), "cards.pan".into(), true);
-        let sealed = t.seal(b"4111-1111-1111-1111").unwrap();
+        let sealed = t.seal(b"4111-1111-1111-1111", None).unwrap();
         assert_ne!(sealed, b"4111-1111-1111-1111");
         assert_eq!(sealed.len(), 19);
         assert_eq!(sealed[4], b'-');
         assert!(sealed.iter().all(|b| b.is_ascii_digit() || *b == b'-'));
-        assert_eq!(t.open(&sealed).unwrap().unwrap(), b"4111-1111-1111-1111");
+        assert_eq!(t.open(&sealed, None).unwrap().unwrap(), b"4111-1111-1111-1111");
 
         // Deterministic: same plaintext, same pseudonym.
-        assert_eq!(t.seal(b"4111-1111-1111-1111").unwrap(), sealed);
+        assert_eq!(t.seal(b"4111-1111-1111-1111", None).unwrap(), sealed);
         assert_eq!(t.wire(), WireForm::Text);
     }
 
     #[test]
     fn fpe_refuses_tiny_domains() {
         let t = FpeTransform::new(Arc::new(TestKeys), "users.pin".into(), true);
-        assert!(matches!(t.seal(b"12345"), Err(Error::FpeDomain)));
-        assert!(matches!(t.seal(b"no digits here"), Err(Error::FpeDomain)));
+        assert!(matches!(t.seal(b"12345", None), Err(Error::FpeDomain)));
+        assert!(matches!(t.seal(b"no digits here", None), Err(Error::FpeDomain)));
         // Reads of too-short values pass through instead of erroring.
-        assert_eq!(t.open(b"12345").unwrap(), None);
+        assert_eq!(t.open(b"12345", None).unwrap(), None);
     }
 
     #[test]
     fn fpe_without_detokenize_passes_reads_through() {
         let t = FpeTransform::new(Arc::new(TestKeys), "cards.pan".into(), false);
-        let sealed = t.seal(b"123456789").unwrap();
-        assert_eq!(t.open(&sealed).unwrap(), None);
+        let sealed = t.seal(b"123456789", None).unwrap();
+        assert_eq!(t.open(&sealed, None).unwrap(), None);
     }
 
     #[test]
     fn token_is_deterministic_hex_and_irreversible() {
         let t = TokenTransform::new(Arc::new(TestKeys), "users.ssn".into());
-        let token = t.seal(b"078-05-1120").unwrap();
+        let token = t.seal(b"078-05-1120", None).unwrap();
         assert_eq!(token.len(), 64);
         assert!(token.iter().all(u8::is_ascii_hexdigit));
-        assert_eq!(t.seal(b"078-05-1120").unwrap(), token);
-        assert_ne!(t.seal(b"078-05-1121").unwrap(), token);
-        assert_eq!(t.open(&token).unwrap(), None);
+        assert_eq!(t.seal(b"078-05-1120", None).unwrap(), token);
+        assert_ne!(t.seal(b"078-05-1121", None).unwrap(), token);
+        assert_eq!(t.open(&token, None).unwrap(), None);
         assert_eq!(t.wire(), WireForm::Text);
     }
 }

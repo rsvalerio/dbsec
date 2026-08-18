@@ -68,6 +68,7 @@ use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
+use dbsec_core::envelope::RowKey;
 use dbsec_core::mask::MaskSpec;
 use dbsec_core::pgwire;
 use dbsec_core::sync::Unpoisoned as _;
@@ -147,6 +148,15 @@ pub struct Resolved {
     /// Where each configured column resolved to, by qualified name, so a
     /// re-resolution can name what moved instead of only which OID did.
     pub positions: HashMap<String, (u32, i16)>,
+    /// Each protected table's declared row key, by table OID. Absent means the
+    /// table has no `[[table]] row_key`, which is the default and keeps
+    /// cell-only binding.
+    pub row_keys: HashMap<u32, ResolvedRowKey>,
+    /// The same declarations keyed by `(schema, table)`, lowercased, for the
+    /// write path — which matches by name, not by OID, and so cannot use the
+    /// map above. Both are built from one resolution, so the two directions
+    /// cannot disagree about which column names a row.
+    pub row_key_by_table: HashMap<(String, String), ResolvedRowKey>,
     /// Which resolution this is, counting from the one built at startup.
     ///
     /// Assigned by [`RowContext::publish`] and ignored on the way in, so a
@@ -156,14 +166,66 @@ pub struct Resolved {
     pub generation: u64,
 }
 
+/// Where one protected field's row key sits in the *result set* it came back
+/// in, and how to read it.
+///
+/// Absent when the field's table declares no row key, and also when it declares
+/// one the query did not project. Those two are deliberately not
+/// distinguished here: the stored value decides whether a key was needed, so a
+/// `DBS2` value written before the table gained a key still opens, while a
+/// `DBS3` value reports [`dbsec_core::Error::RowKeyMissing`] from the envelope
+/// itself. Deciding it here instead would mean guessing at the version.
+#[derive(Debug, Clone)]
+pub struct RowKeySlot {
+    index: usize,
+    type_oid: u32,
+    format: i16,
+}
+
+/// Where a table's declared row key lives, once resolved against the catalog.
+///
+/// The type OID is carried because a row key has to be canonicalised before it
+/// can be bound, and the wire bytes alone do not say how (see
+/// [`crate::rowkey`]). The name is kept for messages: a refusal that says
+/// which column the client failed to project is actionable, one that says
+/// "attnum 1" is not.
+#[derive(Debug, Clone)]
+pub struct ResolvedRowKey {
+    pub attnum: i16,
+    pub type_oid: u32,
+    pub name: String,
+}
+
 impl Resolved {
     /// Which positions of a result set whose fields resolve to
     /// `(table_oid, attnum)` are protected, and what to do with each.
-    fn protected(&self, fields: impl Iterator<Item = (u32, i16)>) -> Vec<(usize, ReadColumn)> {
+    fn protected(
+        &self,
+        fields: &[(u32, i16, u32, i16)],
+    ) -> Vec<(usize, ReadColumn, Option<RowKeySlot>)> {
         fields
+            .iter()
             .enumerate()
-            .filter_map(|(index, key)| self.columns.get(&key).map(|column| (index, column.clone())))
+            .filter_map(|(index, (table_oid, attnum, _, _))| {
+                let column = self.columns.get(&(*table_oid, *attnum))?.clone();
+                Some((index, column, self.row_key_slot(*table_oid, fields)))
+            })
             .collect()
+    }
+
+    /// Which field of this result set carries the row key for `table_oid`.
+    ///
+    /// Matched on `(table_oid, attnum)` like everything else on this path, so a
+    /// same-named column of another table in a join cannot be mistaken for it.
+    fn row_key_slot(&self, table_oid: u32, fields: &[(u32, i16, u32, i16)]) -> Option<RowKeySlot> {
+        let declared = self.row_keys.get(&table_oid)?;
+        fields.iter().enumerate().find_map(|(index, (oid, attnum, type_oid, format))| {
+            (*oid == table_oid && *attnum == declared.attnum).then_some(RowKeySlot {
+                index,
+                type_oid: *type_oid,
+                format: *format,
+            })
+        })
     }
 }
 
@@ -192,19 +254,19 @@ pub struct Described {
     /// `(table_oid, attnum)` of every field of the RowDescription, in order —
     /// the only part of it a later re-derivation needs. Six bytes per result
     /// column, held once per described statement.
-    fields: Box<[(u32, i16)]>,
-    /// The protected positions of that result set.
-    columns: Vec<(usize, ReadColumn)>,
+    /// `(table_oid, attnum, type_oid, format)` of every field, in order. The
+    /// last two are carried for the row key alone — a value the proxy has to
+    /// *interpret* rather than relay, which its bytes do not describe.
+    fields: Box<[(u32, i16, u32, i16)]>,
+    /// The protected positions of that result set, each with where its row key
+    /// sits in the same row.
+    columns: Vec<(usize, ReadColumn, Option<RowKeySlot>)>,
 }
 
 impl Described {
-    fn new(resolved: &Resolved, fields: impl Iterator<Item = (u32, i16)>) -> Self {
-        let fields: Box<[(u32, i16)]> = fields.collect();
-        Self {
-            generation: resolved.generation,
-            columns: resolved.protected(fields.iter().copied()),
-            fields,
-        }
+    fn new(resolved: &Resolved, fields: impl Iterator<Item = (u32, i16, u32, i16)>) -> Self {
+        let fields: Box<[(u32, i16, u32, i16)]> = fields.collect();
+        Self { generation: resolved.generation, columns: resolved.protected(&fields), fields }
     }
 
     /// The same result set's positions against a newer resolution.
@@ -219,17 +281,17 @@ impl Described {
     /// where the frozen mapping decrypted them. Growing only is what makes
     /// re-derivation strictly safer than freezing.
     fn rederived(&self, resolved: &Resolved) -> Self {
-        let mut columns = resolved.protected(self.fields.iter().copied());
-        for (index, column) in &self.columns {
-            if !columns.iter().any(|(covered, _)| covered == index) {
-                columns.push((*index, column.clone()));
+        let mut columns = resolved.protected(&self.fields);
+        for (index, column, slot) in &self.columns {
+            if !columns.iter().any(|(covered, _, _)| covered == index) {
+                columns.push((*index, column.clone(), slot.clone()));
             }
         }
-        columns.sort_unstable_by_key(|(index, _)| *index);
+        columns.sort_unstable_by_key(|(index, _, _)| *index);
         Self { generation: resolved.generation, columns, fields: self.fields.clone() }
     }
 
-    pub fn columns(&self) -> &[(usize, ReadColumn)] {
+    pub fn columns(&self) -> &[(usize, ReadColumn, Option<RowKeySlot>)] {
         &self.columns
     }
 }
@@ -365,6 +427,12 @@ fn is_refusal(error: &Error) -> bool {
             | Error::ComputedProtectedColumn { .. }
             | Error::FunctionCallResult
             | Error::ProtectedValueTooLarge { .. }
+            // A row-bound value whose row key the query did not project. The
+            // client is answered rather than the session merely failing,
+            // because the fix is theirs: select the table's row key. Relaying
+            // the stored bytes instead is the disclosure this whole path
+            // exists to prevent.
+            | Error::Wire(dbsec_core::Error::RowKeyMissing)
     )
 }
 
@@ -429,7 +497,7 @@ impl RowDecryptor {
                 let resolved = self.ctx.resolved();
                 let positions: Positions = Arc::new(Described::new(
                     &resolved,
-                    fields.iter().map(|f| (f.table_oid, f.attnum)),
+                    fields.iter().map(|f| (f.table_oid, f.attnum, f.type_oid, f.format)),
                 ));
                 self.check_for_stale_mapping(&fields, &resolved, &positions)?;
                 // Whichever Describe asked for this keeps it, so every later
@@ -574,7 +642,8 @@ impl RowDecryptor {
         resolved: &Resolved,
         positions: &Positions,
     ) -> Result<(), Error> {
-        let covered: HashSet<usize> = positions.columns().iter().map(|(index, _)| *index).collect();
+        let covered: HashSet<usize> =
+            positions.columns().iter().map(|(index, _, _)| *index).collect();
         let named_like_protected = |field: &pgwire::RowField<'_>| {
             std::str::from_utf8(field.name)
                 .is_ok_and(|name| resolved.names.contains(&name.to_lowercase()))
@@ -656,7 +725,7 @@ impl RowDecryptor {
     /// production (the largest body a frame header can express) but is passed
     /// so the bound stays testable without a gigabyte-sized fixture.
     fn decrypt_row(
-        positions: &[(usize, ReadColumn)],
+        positions: &[(usize, ReadColumn, Option<RowKeySlot>)],
         body: &[u8],
         bounds: Bounds,
     ) -> Result<Option<Vec<u8>>, Error> {
@@ -666,7 +735,20 @@ impl RowDecryptor {
         // starting point for what the rewritten row will encode to.
         let mut projected = body.len();
         let mut changed = false;
-        for (position, column) in positions {
+        // Read before the row is mutated: a row key is a plain column of the
+        // same row, and sealing never rewrites it (config refuses a row key
+        // that is itself protected), but taking it first keeps that
+        // independent of ordering.
+        let row_keys: Vec<Option<RowKey>> = positions
+            .iter()
+            .map(|(_, _, slot)| {
+                let slot = slot.as_ref()?;
+                let raw = values.get(slot.index)?.as_deref();
+                let format = crate::rowkey::Format::from_code(slot.format).ok()?;
+                crate::rowkey::canonical(slot.type_oid, format, raw).ok()
+            })
+            .collect();
+        for ((position, column, _), row_key) in positions.iter().zip(&row_keys) {
             let Some(Some(value)) = values.get_mut(*position) else { continue };
             if value.len() > bounds.max_value {
                 return Err(Error::ProtectedValueTooLarge {
@@ -681,7 +763,7 @@ impl RowDecryptor {
                     None => (Cow::Borrowed(&**value), false),
                 };
                 let opened = match &column.transform {
-                    Some(transform) => transform.open(&stored)?,
+                    Some(transform) => transform.open(&stored, row_key.as_ref())?,
                     None => None,
                 };
                 // Mask what the client would otherwise see: the opened
@@ -749,7 +831,7 @@ fn hex_text_form(value: &[u8]) -> Vec<u8> {
 #[cfg(test)]
 pub mod tests {
     use super::*;
-    use dbsec_core::envelope::{self, CellContext, KeyId, KEY_ID_LEN};
+    use dbsec_core::envelope::{self, Binding, CellContext, KeyId, KEY_ID_LEN};
     use dbsec_core::keys::{Key, KeySource};
     use dbsec_core::{blind_index, Error as CoreError};
 
@@ -792,7 +874,10 @@ pub mod tests {
             .map(|key| (*key, ReadColumn { transform: Some(transform(false)), mask: None }))
             .collect();
         let resolved = Resolved { columns, ..Default::default() };
-        Arc::new(Described::new(&resolved, fields.into_iter()))
+        Arc::new(Described::new(
+            &resolved,
+            fields.into_iter().map(|(oid, attnum)| (oid, attnum, crate::rowkey::oid::TEXT, 0)),
+        ))
     }
 
     pub fn transform(searchable: bool) -> Arc<dyn FieldTransform> {
@@ -876,10 +961,156 @@ pub mod tests {
         let rewriter = crate::encrypt::QueryRewriter::new(
             catalog,
             portals.clone(),
+            None,
             Arc::new(std::sync::atomic::AtomicU8::new(b'I')),
             crate::encrypt::StartupSettings::default(),
         );
         (rewriter, ctx.decryptor(portals))
+    }
+
+    /// A simple-protocol Query frame body.
+    fn query_frame(sql: &str) -> Vec<u8> {
+        let mut body = sql.as_bytes().to_vec();
+        body.push(0);
+        body
+    }
+
+    /// A session whose `users` table declares `id` as its row key, wired on
+    /// both directions from one resolution — which is the point: the write path
+    /// finds the key by name and the read path by OID, and they have to agree.
+    fn row_bound_session() -> (Arc<RowContext>, crate::encrypt::QueryRewriter, RowDecryptor) {
+        use crate::columns::ProtectedColumn;
+
+        const TABLE: u32 = 1234;
+        let spec =
+            ResolvedRowKey { attnum: 1, type_oid: crate::rowkey::oid::INT4, name: "id".into() };
+        let mut columns = ColumnMap::new();
+        columns.insert((TABLE, 2), ReadColumn { transform: Some(transform(false)), mask: None });
+        let ctx = Arc::new(RowContext::new(
+            Resolved {
+                columns,
+                names: HashSet::from(["email".to_owned()]),
+                row_keys: HashMap::from([(TABLE, spec.clone())]),
+                row_key_by_table: HashMap::from([(
+                    ("public".to_owned(), "users".to_owned()),
+                    spec,
+                )]),
+                ..Default::default()
+            },
+            OnUnprotected::Reject,
+            DEFAULT_MAX_PROTECTED_VALUE_LEN,
+        ));
+        let catalog = Arc::new(crate::encrypt::WriteCatalog::new(
+            &[ProtectedColumn {
+                schema: "public".into(),
+                table: "users".into(),
+                column: "email".into(),
+                transform: Some(transform(false)),
+                searchable: false,
+                readable: true,
+                mask: None,
+            }],
+            OnUnprotected::Reject,
+        ));
+        let portals = SessionPortals::new();
+        let rewriter = crate::encrypt::QueryRewriter::new(
+            catalog,
+            portals.clone(),
+            Some(ctx.clone()),
+            Arc::new(std::sync::atomic::AtomicU8::new(b'I')),
+            crate::encrypt::StartupSettings::default(),
+        );
+        let decryptor = ctx.decryptor(portals);
+        (ctx, rewriter, decryptor)
+    }
+
+    /// A RowDescription for `SELECT id, email FROM users`, with `id` typed and
+    /// formatted the way the row key resolution expects.
+    fn row_bound_description(id_format: i16) -> Vec<u8> {
+        let mut body = 2i16.to_be_bytes().to_vec();
+        for (name, attnum, type_oid, format) in [
+            (&b"id"[..], 1i16, crate::rowkey::oid::INT4, id_format),
+            (&b"email"[..], 2i16, crate::rowkey::oid::TEXT, 0i16),
+        ] {
+            body.extend_from_slice(name);
+            body.push(0);
+            body.extend_from_slice(&1234u32.to_be_bytes());
+            body.extend_from_slice(&attnum.to_be_bytes());
+            body.extend_from_slice(&type_oid.to_be_bytes());
+            body.extend_from_slice(&(-1i16).to_be_bytes());
+            body.extend_from_slice(&(-1i32).to_be_bytes());
+            body.extend_from_slice(&format.to_be_bytes());
+        }
+        body
+    }
+
+    /// The finding, end to end: seal through the write path, read back through
+    /// the read path, and prove the stored bytes do not open in another row.
+    #[test]
+    fn a_row_bound_value_does_not_open_in_another_row() {
+        let (_ctx, mut rewriter, _decryptor) = row_bound_session();
+
+        let sql = "INSERT INTO users (id, email) VALUES (7, 'alice@secret.test')";
+        let rewritten = match rewriter.on_frame(b'Q', &query_frame(sql)).unwrap() {
+            FrameAction::Replace(body) => String::from_utf8_lossy(&body).into_owned(),
+            other => panic!("the insert must be rewritten, got {other:?}"),
+        };
+        assert!(!rewritten.contains("alice@secret.test"), "plaintext on the wire: {rewritten}");
+
+        let start = rewritten.find("\\x").expect("sealed literal") + 2;
+        let end = rewritten[start..].find('\'').unwrap() + start;
+        let stored = hex::decode(&rewritten[start..end]).unwrap();
+        assert!(stored.starts_with(envelope::MAGIC_V3), "the write is row-bound");
+
+        // Read it back in its own row, on a fresh session: the write left a
+        // pending Query response on the shared portal queue, and reusing it
+        // here would test that interplay rather than the binding.
+        let (_ctx, _r, mut decryptor) = row_bound_session();
+        decryptor.on_frame(b'T', &row_bound_description(0)).unwrap();
+        let own = data_row(&[Some(b"7"), Some(&stored)]);
+        let opened = decryptor.on_frame(b'D', &own).unwrap().body().expect("rewritten");
+        let values = pgwire::parse_data_row(&opened).unwrap();
+        assert_eq!(values[1], Some(&b"alice@secret.test"[..]));
+
+        // The same stored bytes pasted into another row. This fails the
+        // session rather than answering the client, which is this module's
+        // existing contract for a crypto failure and is right here: a value
+        // that does not authenticate against the row it was read from is
+        // tampering, not a query the client can fix by rewriting it.
+        let (_ctx, _rewriter, mut decryptor) = row_bound_session();
+        decryptor.on_frame(b'T', &row_bound_description(0)).unwrap();
+        let moved = data_row(&[Some(b"8"), Some(&stored)]);
+        assert!(
+            matches!(
+                decryptor.on_frame(b'D', &moved),
+                Err(Error::Wire(dbsec_core::Error::Decrypt))
+            ),
+            "a relocated value must not reach the client"
+        );
+    }
+
+    /// The same row, described in binary format: a row written through a
+    /// text-binding driver has to read back through a binary-binding one, or
+    /// the canonicalisation is not doing its job.
+    #[test]
+    fn a_row_bound_value_opens_whichever_format_the_client_chose() {
+        let (_ctx, mut rewriter, _d) = row_bound_session();
+        let rewritten = match rewriter
+            .on_frame(b'Q', &query_frame("INSERT INTO users (id, email) VALUES (7, 'alice@x.io')"))
+            .unwrap()
+        {
+            FrameAction::Replace(body) => String::from_utf8_lossy(&body).into_owned(),
+            other => panic!("expected a rewrite, got {other:?}"),
+        };
+        let start = rewritten.find("\\x").expect("sealed literal") + 2;
+        let end = rewritten[start..].find('\'').unwrap() + start;
+        let stored = hex::decode(&rewritten[start..end]).unwrap();
+
+        let (_ctx, _r, mut decryptor) = row_bound_session();
+        decryptor.on_frame(b'T', &row_bound_description(1)).unwrap();
+        let row = data_row(&[Some(&7i32.to_be_bytes()), Some(&stored)]);
+        let opened = decryptor.on_frame(b'D', &row).unwrap().body().expect("rewritten");
+        assert_eq!(pgwire::parse_data_row(&opened).unwrap()[1], Some(&b"alice@x.io"[..]));
     }
 
     /// Parse + Describe(statement) + Sync: what a driver sends the first time
@@ -922,7 +1153,9 @@ pub mod tests {
         let desc = row_description(&[(1234, 1), (1234, 2)]);
         assert!(decryptor.on_frame(b'T', &desc).unwrap().body().is_none());
 
-        let ct = envelope::encrypt(&KEY, &KEY_ID, &cell_context(), b"alice@example.com").unwrap();
+        let ct =
+            envelope::encrypt(&KEY, &KEY_ID, &Binding::cell(&cell_context()), b"alice@example.com")
+                .unwrap();
         let row = data_row(&[Some(b"42"), Some(&ct)]);
         let rewritten = decryptor.on_frame(b'D', &row).unwrap().body().unwrap();
         assert_eq!(
@@ -952,7 +1185,8 @@ pub mod tests {
         let mut decryptor = ctx.decryptor(SessionPortals::new());
         decryptor.on_frame(b'T', &row_description(&[(1234, 1), (1234, 2)])).unwrap();
 
-        let ct = envelope::encrypt(&KEY, &KEY_ID, &cell_context(), b"alice").unwrap();
+        let ct =
+            envelope::encrypt(&KEY, &KEY_ID, &Binding::cell(&cell_context()), b"alice").unwrap();
         let index = blind_index::compute(&INDEX_KEY, b"alice");
         let stored = blind_index::prepend(&index, &ct);
         let row = data_row(&[Some(b"42"), Some(&stored)]);
@@ -966,7 +1200,8 @@ pub mod tests {
         let mut decryptor = ctx.decryptor(SessionPortals::new());
         decryptor.on_frame(b'T', &row_description(&[(9999, 1)])).unwrap();
 
-        let ct = envelope::encrypt(&KEY, &KEY_ID, &cell_context(), b"secret").unwrap();
+        let ct =
+            envelope::encrypt(&KEY, &KEY_ID, &Binding::cell(&cell_context()), b"secret").unwrap();
         let row = data_row(&[Some(&ct)]);
         assert!(decryptor.on_frame(b'D', &row).unwrap().body().is_none());
     }
@@ -977,7 +1212,9 @@ pub mod tests {
         let mut decryptor = ctx.decryptor(SessionPortals::new());
         decryptor.on_frame(b'T', &row_description(&[(1234, 2)])).unwrap();
 
-        let ct = envelope::encrypt(&KEY, &[9u8; KEY_ID_LEN], &cell_context(), b"secret").unwrap();
+        let ct =
+            envelope::encrypt(&KEY, &[9u8; KEY_ID_LEN], &Binding::cell(&cell_context()), b"secret")
+                .unwrap();
         let row = data_row(&[Some(&ct)]);
         assert!(decryptor.on_frame(b'D', &row).is_err());
     }
@@ -990,7 +1227,9 @@ pub mod tests {
         decryptor.on_frame(b'T', &row_description(&[(1234, 1), (1234, 2)])).unwrap();
 
         // Decrypted value is masked before it reaches the client.
-        let ct = envelope::encrypt(&KEY, &KEY_ID, &cell_context(), b"4111111111111111").unwrap();
+        let ct =
+            envelope::encrypt(&KEY, &KEY_ID, &Binding::cell(&cell_context()), b"4111111111111111")
+                .unwrap();
         let row = data_row(&[Some(b"42"), Some(&ct)]);
         let rewritten = decryptor.on_frame(b'D', &row).unwrap().body().unwrap();
         assert_eq!(
@@ -1014,7 +1253,9 @@ pub mod tests {
         let mut decryptor = ctx.decryptor(SessionPortals::new());
         decryptor.on_frame(b'T', &row_description(&[(1234, 2)])).unwrap();
 
-        let ct = envelope::encrypt(&KEY, &KEY_ID, &cell_context(), b"4111111111111111").unwrap();
+        let ct =
+            envelope::encrypt(&KEY, &KEY_ID, &Binding::cell(&cell_context()), b"4111111111111111")
+                .unwrap();
         let row = data_row(&[Some(format!("\\x{}", hex::encode(&ct)).as_bytes())]);
         let rewritten = decryptor.on_frame(b'D', &row).unwrap().body().unwrap();
         assert_eq!(
@@ -1058,7 +1299,9 @@ pub mod tests {
 
         // Re-executing A out of the driver's cache sends no Describe at all.
         execute(&mut rewriter, b"a");
-        let ct = envelope::encrypt(&KEY, &KEY_ID, &cell_context(), b"alice@example.com").unwrap();
+        let ct =
+            envelope::encrypt(&KEY, &KEY_ID, &Binding::cell(&cell_context()), b"alice@example.com")
+                .unwrap();
         let rewritten = decryptor
             .on_frame(b'D', &data_row(&[Some(b"42"), Some(&ct)]))
             .unwrap()
@@ -1102,7 +1345,9 @@ pub mod tests {
 
         // Nothing is protected yet, so the column relays. That is the state
         // the window opens in, and where it used to stay.
-        let ct = envelope::encrypt(&KEY, &KEY_ID, &cell_context(), b"alice@example.com").unwrap();
+        let ct =
+            envelope::encrypt(&KEY, &KEY_ID, &Binding::cell(&cell_context()), b"alice@example.com")
+                .unwrap();
         execute(&mut rewriter, b"a");
         let row = data_row(&[Some(b"42"), Some(&ct)]);
         assert!(decryptor.on_frame(b'D', &row).unwrap().body().is_none());
@@ -1156,7 +1401,9 @@ pub mod tests {
         });
 
         execute(&mut rewriter, b"a");
-        let ct = envelope::encrypt(&KEY, &KEY_ID, &cell_context(), b"alice@example.com").unwrap();
+        let ct =
+            envelope::encrypt(&KEY, &KEY_ID, &Binding::cell(&cell_context()), b"alice@example.com")
+                .unwrap();
         let rewritten = decryptor
             .on_frame(b'D', &data_row(&[Some(b"42"), Some(&ct)]))
             .unwrap()
@@ -1191,7 +1438,9 @@ pub mod tests {
             )
             .unwrap();
         execute(&mut rewriter, b"a");
-        let ct = envelope::encrypt(&KEY, &KEY_ID, &cell_context(), b"alice@example.com").unwrap();
+        let ct =
+            envelope::encrypt(&KEY, &KEY_ID, &Binding::cell(&cell_context()), b"alice@example.com")
+                .unwrap();
         let row = data_row(&[Some(&ct)]);
         let error = refused(decryptor.on_frame(b'D', &row).unwrap());
         let text = String::from_utf8_lossy(&error);
@@ -1223,7 +1472,9 @@ pub mod tests {
             .unwrap();
         execute(&mut rewriter, b"a");
 
-        let ct = envelope::encrypt(&KEY, &KEY_ID, &cell_context(), b"alice@example.com").unwrap();
+        let ct =
+            envelope::encrypt(&KEY, &KEY_ID, &Binding::cell(&cell_context()), b"alice@example.com")
+                .unwrap();
         let row = data_row(&[Some(&ct)]);
         let action = decryptor.on_frame(b'D', &row).unwrap();
 
@@ -1365,7 +1616,8 @@ pub mod tests {
 
         // Before: nothing is protected at the new position.
         decryptor.on_frame(b'T', &row_description(&[(5678, 2)])).unwrap();
-        let ct = envelope::encrypt(&KEY, &KEY_ID, &cell_context(), b"alice").unwrap();
+        let ct =
+            envelope::encrypt(&KEY, &KEY_ID, &Binding::cell(&cell_context()), b"alice").unwrap();
         assert!(decryptor.on_frame(b'D', &data_row(&[Some(&ct)])).unwrap().body().is_none());
 
         // The refresher re-resolves the column to where it moved to.
@@ -1392,7 +1644,8 @@ pub mod tests {
         let mut decryptor = ctx.decryptor(SessionPortals::new());
         decryptor.on_frame(b'T', &row_description(&[(1234, 2)])).unwrap();
 
-        let mut ct = envelope::encrypt(&KEY, &KEY_ID, &cell_context(), b"secret").unwrap();
+        let mut ct =
+            envelope::encrypt(&KEY, &KEY_ID, &Binding::cell(&cell_context()), b"secret").unwrap();
         let last = ct.len() - 1;
         ct[last] ^= 0xff;
         let row = data_row(&[Some(&ct)]);
@@ -1452,7 +1705,8 @@ pub mod tests {
         assert!(decryptor.on_frame(b'D', &row).unwrap().body().is_none());
 
         let plaintext = vec![b'x'; 64 * 1024];
-        let ct = envelope::encrypt(&KEY, &KEY_ID, &cell_context(), &plaintext).unwrap();
+        let ct =
+            envelope::encrypt(&KEY, &KEY_ID, &Binding::cell(&cell_context()), &plaintext).unwrap();
         let row = data_row(&[Some(&ct)]);
         let rewritten = decryptor.on_frame(b'D', &row).unwrap().body().unwrap();
         assert_eq!(pgwire::parse_data_row(&rewritten).unwrap()[0], Some(plaintext.as_slice()));
@@ -1467,7 +1721,7 @@ pub mod tests {
         // bigger than what arrived: every masked byte becomes three.
         let mask = MaskSpec { keep_first: 0, keep_last: 0, mask_with: '☃' };
         let column = ReadColumn { transform: None, mask: Some(mask) };
-        let positions = vec![(0, column.clone()), (1, column)];
+        let positions = vec![(0, column.clone(), None), (1, column, None)];
         let row = data_row(&[Some(b"aaaaaaaa"), Some(b"aaaaaaaa")]);
 
         // Room for the row that arrived and for the first replacement, but not
@@ -1499,7 +1753,7 @@ pub mod tests {
     #[test]
     fn the_configured_ceiling_is_what_the_read_path_enforces() {
         let mask = MaskSpec { keep_first: 0, keep_last: 4, mask_with: '*' };
-        let positions = vec![(0, ReadColumn { transform: None, mask: Some(mask) })];
+        let positions = vec![(0, ReadColumn { transform: None, mask: Some(mask) }, None)];
         let row = data_row(&[Some(&vec![b'v'; 4096])]);
         let bounds = |max_value| Bounds { max_value, max_body: pgwire::MAX_MESSAGE_LEN - 4 };
 

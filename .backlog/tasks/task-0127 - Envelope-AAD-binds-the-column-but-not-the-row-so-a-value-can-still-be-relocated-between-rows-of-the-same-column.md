@@ -3,11 +3,11 @@ id: TASK-0127
 title: >-
   Envelope AAD binds the column but not the row, so a value can still be
   relocated between rows of the same column
-status: In Progress
+status: Done
 assignee:
   - TASK-0141
 created_date: '2026-08-17 20:22'
-updated_date: '2026-08-18 10:19'
+updated_date: '2026-08-18 19:52'
 labels:
   - code-review-rust
   - security
@@ -36,7 +36,7 @@ Row binding was not implemented because neither data path knows a row's identity
 
 ## Acceptance Criteria
 <!-- AC:BEGIN -->
-- [ ] #1 A ciphertext moved into the same column of a different row fails authentication on read
+- [x] #1 A ciphertext moved into the same column of a different row fails authentication on read
 - [x] #2 The chosen row identity is available on both the write and the read path, or the design note records why the deployment must supply it
 <!-- AC:END -->
 
@@ -136,4 +136,6 @@ transactional consistency with the user's own writes. Strictly worse; not viable
 
 Design A is a product decision (it changes what SQL a protected deployment may issue), not
 a code-review fix. That is why this stays open rather than being forced.
+
+Implemented on feat/task-0127-row-binding. AC #1 met: a DBS3 value does not authenticate in another row, proven end to end (rows::tests::a_row_bound_value_does_not_open_in_another_row) rather than only at the envelope layer. Opt-in per table via [[table]] row_key, so no migration is forced and existing DBS2 values keep opening. Scope limits recorded in README and PLAN "Binding a value to its row": encrypt columns only (deterministic transforms cannot bind a row at all), client-supplied keys, single-row UPDATE, reads must project the key.
 <!-- SECTION:NOTES:END -->

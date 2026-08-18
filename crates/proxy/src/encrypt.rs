@@ -134,7 +134,9 @@ use sqlparser::tokenizer::{Token, TokenWithSpan, Tokenizer};
 
 use crate::columns::ProtectedColumn;
 use crate::config::{fold_identifier, OnUnprotected};
-use crate::portal::{ParamAction, ParamTransforms, SessionPortals, Target};
+use crate::portal::{ParamAction, ParamTransforms, RowKeySource, SessionPortals, Target};
+use crate::rowkey;
+use crate::rows::{ResolvedRowKey, RowContext};
 use crate::session::FrameAction;
 use crate::Error;
 
@@ -314,9 +316,26 @@ struct SealedValues {
     columns: HashSet<String>,
 }
 
+/// One cell a value is being sealed into: which transform, which column, and —
+/// when the table declares a row key — which row.
+///
+/// A struct rather than three parameters because the repo caps a function at
+/// five, and because the three travel together everywhere: a caller that had
+/// the transform but forgot the row would seal a row-bound column with
+/// cell-only binding, which is exactly the silent under-protection this
+/// feature exists to remove.
+struct SealTarget<'a> {
+    transform: &'a Arc<dyn FieldTransform>,
+    column: &'a str,
+    row: &'a RowKeySource,
+}
+
 /// What an assignment list may write into: the target table's protected
 /// columns, and what the rest of the same statement already sealed.
 struct AssignmentScope<'a> {
+    /// Which row this assignment list writes, when the target table declares a
+    /// row key. `None` is the ordinary cell-only case.
+    row: RowKeySource,
     columns: &'a Columns,
     sealed: SealedValues,
 }
@@ -324,8 +343,8 @@ struct AssignmentScope<'a> {
 impl AssignmentScope<'_> {
     /// A plain `UPDATE`: no `EXCLUDED` relation exists, so no value in this
     /// statement is one the proxy sealed a clause earlier.
-    fn of(columns: &Columns) -> AssignmentScope<'_> {
-        AssignmentScope { columns, sealed: SealedValues::default() }
+    fn of(columns: &Columns, row: RowKeySource) -> AssignmentScope<'_> {
+        AssignmentScope { row, columns, sealed: SealedValues::default() }
     }
 
     /// Whether `value` is `EXCLUDED.<column>` naming a column this `INSERT`'s
@@ -373,6 +392,15 @@ pub struct QueryRewriter {
     /// ReadyForQuery, so a relaxed load of a possibly stale value is exactly
     /// as good as a synchronized one.
     tx_status: Arc<AtomicU8>,
+    /// The live read-path resolution, consulted only for declared row keys.
+    ///
+    /// The write path matches by name and the read path by OID, and a row key
+    /// needs both: the name to find it in the statement, the catalog type to
+    /// canonicalise its value. Taking the shared context rather than a startup
+    /// snapshot means a migration that changes the key column is picked up by
+    /// the same refresh that fixes the columns — the drift this proxy already
+    /// has machinery for.
+    rows: Option<Arc<RowContext>>,
     /// Whether unqualified table names still resolve to `public`.
     search_path_trusted: bool,
     /// Whether the session turned `standard_conforming_strings` off. With it
@@ -422,6 +450,7 @@ impl QueryRewriter {
     pub fn new(
         catalog: Arc<WriteCatalog>,
         portals: Arc<SessionPortals>,
+        rows: Option<Arc<RowContext>>,
         tx_status: Arc<AtomicU8>,
         startup: StartupSettings,
     ) -> Self {
@@ -436,6 +465,7 @@ impl QueryRewriter {
         Self {
             catalog,
             portals,
+            rows,
             tx_status,
             search_path_trusted: startup.search_path_trusted,
             escape_strings: startup.escape_strings,
@@ -565,8 +595,19 @@ impl QueryRewriter {
             let binary = bind.param_format(*index) == 1;
             let Some(Some(value)) = values.get_mut(*index) else { continue };
             let replacement = match action {
-                ParamAction::Seal(transform) => {
-                    encode_param(transform.seal(value)?, transform.wire(), binary)
+                ParamAction::Seal { transform, row } => {
+                    let key = match row {
+                        RowKeySource::None => None,
+                        RowKeySource::Literal(key) => Some(key.clone()),
+                        // The key is another parameter of this same Bind, so
+                        // its bytes exist only now.
+                        RowKeySource::Param { index, type_oid } => {
+                            let format = rowkey::Format::from_code(bind.param_format(*index))?;
+                            let raw = bind.params.get(*index).copied().flatten();
+                            Some(rowkey::canonical(*type_oid, format, raw)?)
+                        }
+                    };
+                    encode_param(transform.seal(value, key.as_ref())?, transform.wire(), binary)
                 }
                 ParamAction::SearchIndex(transform) => {
                     let Some(token) = transform.search_index(value)? else {
@@ -821,7 +862,31 @@ impl QueryRewriter {
                 let mut changed = false;
                 if let TableFactor::Table { name, .. } = &table.relation {
                     if let Some(columns) = self.table(name)? {
-                        let target = AssignmentScope::of(columns);
+                        let spec = resolved_name(name)
+                            .and_then(|(schema, table)| self.row_key_spec(&schema, &table));
+                        let row = match spec.as_ref() {
+                            None => RowKeySource::None,
+                            Some(spec) => {
+                                let found = selection
+                                    .as_ref()
+                                    .and_then(|where_| self.row_key_in_predicate(where_, spec));
+                                match found {
+                                    Some(source) => source,
+                                    None => {
+                                        let (schema, table_name) =
+                                            resolved_name(name).unwrap_or_default();
+                                        self.unprotected(&Unprotected::RowKeyMissing {
+                                            table: format!("{schema}.{table_name}"),
+                                            column: spec.name.clone(),
+                                            shape: "UPDATE whose WHERE does not pin one row by \
+                                                    its row key",
+                                        })?;
+                                        RowKeySource::None
+                                    }
+                                }
+                            }
+                        };
+                        let target = AssignmentScope::of(columns, row);
                         changed |= self.seal_assignments(assignments, &target, params)?;
                     }
                 }
@@ -1009,7 +1074,7 @@ impl QueryRewriter {
                 columns,
             }],
         };
-        let target = AssignmentScope { columns, sealed };
+        let target = AssignmentScope { row: RowKeySource::None, columns, sealed };
         // The conflict action writes the same columns on every existing row,
         // and it is a plain assignment list — the UPDATE path handles it.
         match insert.on.as_mut() {
@@ -1028,6 +1093,73 @@ impl QueryRewriter {
             _ => {}
         }
         Ok(changed)
+    }
+
+    /// The row an `UPDATE` writes, read out of its `WHERE`.
+    ///
+    /// Only `row_key = <literal|parameter>`, and only reachable through a chain
+    /// of `AND`s. That is not conservatism for its own sake: a Bind carries one
+    /// byte string per placeholder, so `UPDATE users SET ssn = $1 WHERE dept =
+    /// 'x'` would need a *different* ciphertext for every matching row and
+    /// there is nowhere to put them. An `OR`, an `IN`, or a range names a set
+    /// of rows, and a set has no single key to bind. Those are refusals rather
+    /// than silent cell-only writes, because a value stored bound to the wrong
+    /// row — or to none — never opens again.
+    fn row_key_in_predicate(&self, expr: &Expr, spec: &ResolvedRowKey) -> Option<RowKeySource> {
+        use sqlparser::ast::BinaryOperator;
+        match expr {
+            Expr::BinaryOp { left, op: BinaryOperator::And, right } => self
+                .row_key_in_predicate(left, spec)
+                .or_else(|| self.row_key_in_predicate(right, spec)),
+            Expr::Nested(inner) => self.row_key_in_predicate(inner, spec),
+            Expr::BinaryOp { left, op: BinaryOperator::Eq, right } => {
+                let wanted = spec.name.to_lowercase();
+                let names = |e: &Expr| column_name(e).is_some_and(|name| name == wanted);
+                if names(left) {
+                    self.row_key_source(right, spec)
+                } else if names(right) {
+                    self.row_key_source(left, spec)
+                } else {
+                    None
+                }
+            }
+            _ => None,
+        }
+    }
+
+    /// The declared row key for a table, if it has one.
+    ///
+    /// `None` covers both "no `[[table]]` entry" and "no read context", and
+    /// both mean cell-only binding — the behaviour before row keys existed.
+    fn row_key_spec(&self, schema: &str, table: &str) -> Option<ResolvedRowKey> {
+        let rows = self.rows.as_ref()?;
+        let key = (schema.to_lowercase(), table.to_lowercase());
+        rows.resolved().row_key_by_table.get(&key).cloned()
+    }
+
+    /// Turns the expression that supplies a row key into the source a sealed
+    /// value will read it from.
+    ///
+    /// A literal is canonicalised now, because the statement text is all it
+    /// depends on. A placeholder cannot be: its bytes arrive at Bind, so only
+    /// the *index* and the type cross Parse→Bind. Anything else — a function
+    /// call, a column reference, `DEFAULT` — is refused by the caller, because
+    /// a row key the proxy cannot evaluate is a row it cannot name.
+    fn row_key_source(&self, expr: &Expr, spec: &ResolvedRowKey) -> Option<RowKeySource> {
+        match unwrap_casts(expr) {
+            Expr::Value(Value::Placeholder(placeholder)) => placeholder_index(placeholder)
+                .map(|index| RowKeySource::Param { index, type_oid: spec.type_oid }),
+            other => {
+                // The literal's own text is what the server will store, so it
+                // is canonicalised through the same type as the value that
+                // comes back on read: `WHERE id = 0042` and a returned `42`
+                // have to agree, or the row would not open.
+                let text = literal_plaintext(other, WireForm::Text)?;
+                rowkey::canonical(spec.type_oid, rowkey::Format::Text, Some(&text))
+                    .ok()
+                    .map(RowKeySource::Literal)
+            }
+        }
     }
 
     fn rewrite_insert_values(
@@ -1053,11 +1185,49 @@ impl QueryRewriter {
             self.unprotected(&Unprotected::InsertFromSelect(&table))?;
             return Ok(SealedValues::default());
         };
+        // A row-bound table needs its key in the column list of every INSERT:
+        // the value has to be sealed against the row it lands in, and a
+        // server-generated key does not exist until after this statement runs.
+        let Some((schema, table_name)) = resolved_name(&table) else {
+            return Ok(SealedValues::default());
+        };
+        let spec = self.row_key_spec(&schema, &table_name);
+        let key_position = spec.as_ref().and_then(|spec| {
+            insert.columns.iter().position(|ident| normalize(ident) == spec.name.to_lowercase())
+        });
+        if let (Some(spec), None) = (spec.as_ref(), key_position) {
+            self.unprotected(&Unprotected::RowKeyMissing {
+                table: format!("{schema}.{table_name}"),
+                column: spec.name.clone(),
+                shape: "INSERT without the row key in its column list",
+            })?;
+            return Ok(SealedValues::default());
+        }
+
         let mut sealed = SealedValues::default();
         for row in &mut values.rows {
+            // Read before the mutable borrows below: every protected value in
+            // this row binds to this row's key.
+            let row_source = match (spec.as_ref(), key_position) {
+                (Some(spec), Some(position)) => {
+                    let Some(source) =
+                        row.get(position).and_then(|expr| self.row_key_source(expr, spec))
+                    else {
+                        self.unprotected(&Unprotected::RowKeyMissing {
+                            table: format!("{schema}.{table_name}"),
+                            column: spec.name.clone(),
+                            shape: "INSERT whose row key is not a literal or a parameter",
+                        })?;
+                        return Ok(SealedValues::default());
+                    };
+                    source
+                }
+                _ => RowKeySource::None,
+            };
             for (position, ident, transform) in &protected {
                 if let Some(expr) = row.get_mut(*position) {
-                    sealed.changed |= self.seal_expr(expr, transform, &ident.value, params)?;
+                    let target = SealTarget { transform, column: &ident.value, row: &row_source };
+                    sealed.changed |= self.seal_expr(expr, &target, params)?;
                 }
             }
         }
@@ -1085,7 +1255,9 @@ impl QueryRewriter {
                     }
                     let transform = transform.clone();
                     let name = ident.value.clone();
-                    changed |= self.seal_expr(value, &transform, &name, params)?;
+                    let seal_target =
+                        SealTarget { transform: &transform, column: &name, row: &target.row };
+                    changed |= self.seal_expr(value, &seal_target, params)?;
                 }
                 AssignmentTarget::Tuple(names) => {
                     changed |= self.seal_tuple_assignment(names, value, target, params)?;
@@ -1175,7 +1347,8 @@ impl QueryRewriter {
             if target.re_stores_a_sealed_value(&elements[*position], &normalize(ident)) {
                 continue;
             }
-            changed |= self.seal_expr(&mut elements[*position], transform, &ident.value, params)?;
+            let seal_target = SealTarget { transform, column: &ident.value, row: &target.row };
+            changed |= self.seal_expr(&mut elements[*position], &seal_target, params)?;
         }
         Ok(changed)
     }
@@ -1823,14 +1996,18 @@ impl QueryRewriter {
     fn seal_expr(
         &self,
         expr: &mut Expr,
-        transform: &Arc<dyn FieldTransform>,
-        column: &str,
+        target: &SealTarget<'_>,
         params: &mut ParamTransforms,
     ) -> Result<bool, Rejection> {
+        let SealTarget { transform, column, row } = target;
         match unwrap_casts(expr) {
             Expr::Value(Value::Placeholder(placeholder)) => {
                 if let Some(index) = placeholder_index(placeholder) {
-                    record_param(params, index, ParamAction::Seal(transform.clone()))?;
+                    record_param(
+                        params,
+                        index,
+                        ParamAction::Seal { transform: (*transform).clone(), row: (*row).clone() },
+                    )?;
                 }
                 return Ok(false);
             }
@@ -1845,7 +2022,23 @@ impl QueryRewriter {
             self.unprotected(&Unprotected::UnsupportedValue { column, shape: expr_shape(expr) })?;
             return Ok(false);
         };
-        let sealed = transform.seal(&plaintext).map_err(Error::Wire)?;
+        // The literal's row key is known now — it came out of the same
+        // statement — so unlike a placeholder there is nothing to defer.
+        let row_key = match row {
+            RowKeySource::Literal(key) => Some(key.clone()),
+            // A literal value in a row whose *key* is a parameter cannot be
+            // sealed here: the key does not exist until Bind, and this value
+            // is being written now. Refused rather than sealed unbound.
+            RowKeySource::Param { .. } => {
+                self.unprotected(&Unprotected::UnsupportedValue {
+                    column,
+                    shape: "literal in a row whose key is a bound parameter",
+                })?;
+                return Ok(false);
+            }
+            RowKeySource::None => None,
+        };
+        let sealed = transform.seal(&plaintext, row_key.as_ref()).map_err(Error::Wire)?;
         *expr = match transform.wire() {
             WireForm::Bytea => bytea_literal(&sealed),
             // FPE digits and HMAC hex carry no backslash, so an ordinary
@@ -3134,6 +3327,15 @@ enum Unprotected<'a> {
     /// cannot recognise it and relays the stored form — or, for a mask-only
     /// column, the plaintext the mask exists to hide.
     ComputedColumn { column: String, shape: &'static str },
+    /// A statement writing a row-bound table that does not say which row it
+    /// writes, so the value could not be sealed against one.
+    ///
+    /// Its own variant rather than [`Self::UnsupportedValue`] because the
+    /// remedy is different in kind: that one is a value to express
+    /// differently, this one is a statement that must carry the table's row
+    /// key — often meaning the application has to stop relying on a
+    /// server-generated one.
+    RowKeyMissing { table: String, column: String, shape: &'static str },
     /// A predicate over a searchable column that no index match can express.
     Predicate { column: String, shape: &'static str },
     /// An unqualified name matching a protected column in more than one
@@ -3218,6 +3420,13 @@ impl Unprotected<'_> {
                 "protected column projected through an expression; the result has no table OID, \
                  so the read path cannot decrypt or mask it and will relay the stored value"
             ),
+            Self::RowKeyMissing { table, column, shape } => tracing::warn!(
+                table = %table,
+                row_key = %column,
+                shape,
+                "row-bound table written without its row key; the value is stored bound to no \
+                 row and will not open"
+            ),
             Self::Predicate { column, shape } => tracing::warn!(
                 column,
                 shape,
@@ -3294,6 +3503,10 @@ impl Unprotected<'_> {
                 "protected column {column} was projected through a {shape}; the result carries no \
                  table identity, so it cannot be decrypted or masked and would be returned in its \
                  stored form; select the column directly instead"
+            ),
+            Self::RowKeyMissing { table, column, shape } => format!(
+                "{table} binds its encrypted values to the row key {column}, but this is a \
+                 {shape}; the statement must supply {column} as a literal or a parameter"
             ),
             Self::Predicate { column, shape } => format!(
                 "searchable column {column} was used in a {shape}, which cannot be matched \
@@ -3484,6 +3697,7 @@ mod tests {
         QueryRewriter::new(
             catalog,
             SessionPortals::new(),
+            None,
             Arc::new(AtomicU8::new(b'I')),
             StartupSettings::default(),
         )
@@ -3528,7 +3742,7 @@ mod tests {
     /// opens it.
     fn open_hex_literal(sql: &str, searchable: bool) -> Vec<u8> {
         let stored = hex::decode(sealed_hex(sql).expect("hex literal")).unwrap();
-        transform(searchable).open(&stored).unwrap().expect("opens")
+        transform(searchable).open(&stored, None).unwrap().expect("opens")
     }
 
     /// The hex digits of the first sealed literal in a rewritten statement.
@@ -3696,7 +3910,7 @@ mod tests {
         assert_eq!(bound.params[0], Some(b"1".as_slice()));
         let sealed_hex = bound.params[1].unwrap();
         let stored = hex::decode(sealed_hex.strip_prefix(b"\\x").unwrap()).unwrap();
-        assert_eq!(transform(false).open(&stored).unwrap().unwrap(), b"carol@example.com");
+        assert_eq!(transform(false).open(&stored, None).unwrap().unwrap(), b"carol@example.com");
 
         // Binary-format params stay raw bytes.
         let bind = pgwire::encode_bind(
@@ -3715,7 +3929,7 @@ mod tests {
         };
         let bound = pgwire::parse_bind(&rewritten).unwrap();
         assert_eq!(
-            transform(false).open(bound.params[1].unwrap()).unwrap().unwrap(),
+            transform(false).open(bound.params[1].unwrap(), None).unwrap().unwrap(),
             b"dave@example.com"
         );
 
@@ -3768,11 +3982,11 @@ mod tests {
         let pseudonym = sql.split('\'').nth(1).expect("first literal");
         assert_eq!(pseudonym.len(), 12);
         assert_eq!(&pseudonym[3..4], "-");
-        assert_eq!(fpe.open(pseudonym.as_bytes()).unwrap().unwrap(), b"555-867-5309");
+        assert_eq!(fpe.open(pseudonym.as_bytes(), None).unwrap().unwrap(), b"555-867-5309");
         // Token literal is the 64-char hex HMAC.
         let token_literal = sql.split('\'').nth(3).expect("second literal");
         assert_eq!(token_literal.len(), 64);
-        assert_eq!(token_literal.as_bytes(), token.seal(b"abc").unwrap().as_slice());
+        assert_eq!(token_literal.as_bytes(), token.seal(b"abc", None).unwrap().as_slice());
 
         // Bound text-format param for an FPE column stays digit-shaped.
         let parse = pgwire::encode_parse(
@@ -3798,7 +4012,7 @@ mod tests {
         let bound = pgwire::parse_bind(&rewritten).unwrap();
         let sealed = bound.params[0].unwrap();
         assert!(!sealed.starts_with(b"\\x"));
-        assert_eq!(fpe.open(sealed).unwrap().unwrap(), b"555-867-5309");
+        assert_eq!(fpe.open(sealed, None).unwrap().unwrap(), b"555-867-5309");
         assert_eq!(bound.params[1], Some(b"7".as_slice()));
     }
 
@@ -4064,7 +4278,7 @@ mod tests {
         let bound = pgwire::parse_bind(&rewritten).unwrap();
         let stored = hex::decode(bound.params[0].unwrap().strip_prefix(b"\\x").unwrap()).unwrap();
         // A double seal would open to the inner ciphertext, not the plaintext.
-        assert_eq!(transform(false).open(&stored).unwrap().unwrap(), b"alice@example.com");
+        assert_eq!(transform(false).open(&stored, None).unwrap().unwrap(), b"alice@example.com");
 
         // The simple protocol seals each literal from the plaintext already.
         let mut simple = rewriter(catalog(false));
@@ -4075,7 +4289,7 @@ mod tests {
         .expect("rewritten");
         for literal in sql.split(SEALED_PREFIX).skip(1) {
             let stored = hex::decode(&literal[..literal.find('\'').unwrap()]).unwrap();
-            assert_eq!(transform(false).open(&stored).unwrap().unwrap(), b"bob@x.io");
+            assert_eq!(transform(false).open(&stored, None).unwrap().unwrap(), b"bob@x.io");
         }
     }
 
@@ -4713,6 +4927,7 @@ mod tests {
         let mut strict = QueryRewriter::new(
             strict_catalog(false),
             SessionPortals::new(),
+            None,
             status.clone(),
             StartupSettings::default(),
         );
@@ -4791,7 +5006,7 @@ mod tests {
         for (index, expected) in [(1, b"a@b.io".as_slice()), (2, b"c@d.io".as_slice())] {
             let stored =
                 hex::decode(bound.params[index].unwrap().strip_prefix(b"\\x").unwrap()).unwrap();
-            assert_eq!(transform(false).open(&stored).unwrap().unwrap(), expected);
+            assert_eq!(transform(false).open(&stored, None).unwrap().unwrap(), expected);
         }
     }
 
@@ -5225,6 +5440,7 @@ mod tests {
         let mut rewriter = QueryRewriter::new(
             catalog(false),
             SessionPortals::new(),
+            None,
             Arc::new(AtomicU8::new(b'I')),
             StartupSettings { search_path_trusted: false, ..StartupSettings::default() },
         );
@@ -5244,6 +5460,7 @@ mod tests {
             QueryRewriter::new(
                 catalog,
                 SessionPortals::new(),
+                None,
                 Arc::new(AtomicU8::new(b'I')),
                 StartupSettings { escape_strings: true, ..StartupSettings::default() },
             )

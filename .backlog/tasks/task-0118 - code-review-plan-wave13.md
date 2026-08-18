@@ -1,11 +1,11 @@
 ---
 id: TASK-0118
 title: code-review-plan-wave13
-status: In Progress
+status: Done
 assignee:
   - code-review-wave
 created_date: '2026-08-17 20:02'
-updated_date: '2026-08-17 20:47'
+updated_date: '2026-08-18 19:52'
 labels:
   - code-review-wave
 dependencies:
@@ -46,4 +46,6 @@ Pre-merge `ops verify`: clean. Integration `ops verify`: failed once on the mid-
 Also filed: TASK-0133 (Triage) — the GHASH authentication subkey inside `Aes256Gcm` is still freed intact when a `Cipher` drops, since `ghash`/`polyval` would need to be added as direct dependencies purely for feature unification.
 
 The worktree ../.wave-TASK-0118 and branch code-review/TASK-0118 are left in place per the parked-wave rule; both are clean and fully merged into main.
+
+Closed once TASK-0082 landed its row half via TASK-0127 (feat/task-0127-row-binding). Every member Done; the wave code merged long before, so this closes the bookkeeping only.
 <!-- SECTION:NOTES:END -->

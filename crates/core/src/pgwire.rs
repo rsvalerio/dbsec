@@ -124,6 +124,14 @@ pub struct RowField<'a> {
     pub table_oid: u32,
     /// Attribute number within the table; 0 for computed columns.
     pub attnum: i16,
+    /// The field's data type. Needed to canonicalise a value the proxy has to
+    /// interpret rather than relay — today only a declared row key, whose
+    /// bytes cannot be read without it.
+    pub type_oid: u32,
+    /// The wire format the server will send this field in: 0 text, 1 binary.
+    /// A per-query client choice, so the same column arrives differently from
+    /// different drivers.
+    pub format: i16,
 }
 
 /// Parses a RowDescription ('T') body.
@@ -135,9 +143,12 @@ pub fn parse_row_description(body: &[u8]) -> Result<Vec<RowField<'_>>, Error> {
         let name = take_cstr(&mut body)?;
         let table_oid = u32::from_be_bytes(take(&mut body, 4)?.try_into().expect("4 bytes"));
         let attnum = take_i16(&mut body)?;
-        // Type OID (4), type length (2), type modifier (4), format code (2).
-        take(&mut body, 12)?;
-        fields.push(RowField { name, table_oid, attnum });
+        let type_oid = u32::from_be_bytes(take(&mut body, 4)?.try_into().expect("4 bytes"));
+        // Type length (2) and type modifier (4) are still skipped: nothing here
+        // needs a column's storage width or its declared precision.
+        take(&mut body, 6)?;
+        let format = take_i16(&mut body)?;
+        fields.push(RowField { name, table_oid, attnum, type_oid, format });
     }
     if !body.is_empty() {
         return Err(Error::MalformedBackend);
@@ -397,8 +408,8 @@ mod tests {
         assert_eq!(
             parse_row_description(&body).unwrap(),
             vec![
-                RowField { name: b"id", table_oid: 1234, attnum: 1 },
-                RowField { name: b"email", table_oid: 1234, attnum: 2 }
+                RowField { name: b"id", table_oid: 1234, attnum: 1, type_oid: 25, format: 0 },
+                RowField { name: b"email", table_oid: 1234, attnum: 2, type_oid: 25, format: 0 }
             ]
         );
 

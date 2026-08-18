@@ -209,10 +209,9 @@ pub async fn run(
     let copy_state = portals.clone();
     let tx_status = Arc::new(AtomicU8::new(TX_IDLE));
     let seen_status = tx_status.clone();
-    let mut rewriter = ctx
-        .writes
-        .as_ref()
-        .map(|writes| QueryRewriter::new(writes.clone(), portals, tx_status, settings));
+    let mut rewriter = ctx.writes.as_ref().map(|writes| {
+        QueryRewriter::new(writes.clone(), portals, ctx.rows.clone(), tx_status, settings)
+    });
     // The startup packet is forwarded by now, so `MAX_STARTUP_MESSAGE_LEN` is
     // behind us — but the client is still anonymous until the backend says
     // otherwise, and this is what says so (SEC-33).

@@ -35,6 +35,32 @@ impl ProtectedColumn {
 /// Builds one spec per `[[column]]`. Deterministic keys (blind index, FPE,
 /// token HMAC) are named `schema.table.column` — the keyfile's `[index_keys]`
 /// table (or the KMS) must carry that name.
+/// One table's declared row key, resolved against the catalog by
+/// [`crate::resolve`]. Split out of [`Config`] so the resolver takes only what
+/// it needs and the two do not share a config type.
+#[derive(Debug, Clone)]
+pub struct RowKeyDecl {
+    pub schema: String,
+    pub table: String,
+    pub column: String,
+}
+
+/// The declared row keys, in config order.
+pub fn row_keys(config: &Config) -> Vec<RowKeyDecl> {
+    config
+        .tables
+        .iter()
+        .map(|entry| {
+            let (schema, table) = entry.schema_and_table();
+            RowKeyDecl {
+                schema: schema.to_owned(),
+                table: table.to_owned(),
+                column: entry.row_key.clone(),
+            }
+        })
+        .collect()
+}
+
 pub fn build(config: &Config, keys: &Arc<dyn KeySource>) -> Vec<ProtectedColumn> {
     // One DEK cipher cache for the whole process: every encrypted column shares
     // the active key's schedule and, more importantly, its single AES-GCM
@@ -139,11 +165,11 @@ mod tests {
         let ssn = columns[0].transform.as_ref().expect("encrypt column has a transform");
         let card = columns[1].transform.as_ref().expect("encrypt column has a transform");
 
-        let stored = ssn.seal(b"078-05-1120").unwrap();
+        let stored = ssn.seal(b"078-05-1120", None).unwrap();
         assert!(
-            matches!(card.open(&stored), Err(dbsec_core::Error::Decrypt)),
+            matches!(card.open(&stored, None), Err(dbsec_core::Error::Decrypt)),
             "an ssn value pasted into credit_card must not authenticate"
         );
-        assert_eq!(ssn.open(&stored).unwrap().unwrap(), b"078-05-1120");
+        assert_eq!(ssn.open(&stored, None).unwrap().unwrap(), b"078-05-1120");
     }
 }
