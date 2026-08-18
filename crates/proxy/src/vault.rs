@@ -86,7 +86,7 @@ use dbsec_core::Error as CoreError;
 use rand::RngCore;
 use serde::{Deserialize, Serialize};
 use tokio::runtime::RuntimeFlavor;
-use vaultrs::client::{VaultClient, VaultClientSettingsBuilder};
+use vaultrs::client::{VaultClient, VaultClientSettings, VaultClientSettingsBuilder};
 use vaultrs::error::ClientError;
 use zeroize::{Zeroize, Zeroizing};
 
@@ -120,6 +120,10 @@ const TOKEN_CHECK_INTERVAL: Duration = Duration::from_mins(1);
 /// fails still leaves several attempts (and several warnings) before the lease
 /// actually runs out.
 const TOKEN_RENEW_THRESHOLD: Duration = Duration::from_mins(10);
+
+/// The environment variable `vaultrs` would otherwise let decide whether the
+/// Vault server's certificate is verified. See [`client_settings`].
+const SKIP_VERIFY_ENV: &str = "VAULT_SKIP_VERIFY";
 
 /// Wrapped-DEK record stored at `{path}/deks/{key_id_hex}`.
 #[derive(Serialize, Deserialize)]
@@ -413,6 +417,63 @@ fn is_cas_conflict(e: &ClientError) -> bool {
     }
 }
 
+/// Builds the HTTP client settings for one `[vault]` section.
+///
+/// Two things are pinned here rather than left to `vaultrs`' environment-driven
+/// defaults:
+///
+/// - **`verify`.** vaultrs 0.7's `default_verify` reads [`SKIP_VERIFY_ENV`]
+///   with the sense *inverted* from the Vault CLI: the values `0`, `f` and
+///   `false` all yield `verify = false`, which becomes
+///   `reqwest::ClientBuilder::danger_accept_invalid_certs(true)`. An operator
+///   hardening a deployment with the natural CLI idiom
+///   `VAULT_SKIP_VERIFY=false` ("do verify") would therefore switch
+///   certificate verification *off* on the one channel that carries the Vault
+///   token, every DEK plaintext and every deterministic index key. This proxy
+///   verifies, full stop, so the setting is explicit (SEC-29, SEC-31) and an
+///   environment that tried to say otherwise is reported rather than silently
+///   overruled. `skip_verify_env` is that variable's value, taken as an
+///   argument so the report is testable without mutating the process
+///   environment (TEST-18).
+/// - **`address`.** `VaultClientSettingsBuilder::address` is documented
+///   "# Panics" and parses with `Url::parse(..).unwrap()`, so a malformed
+///   `addr` would abort the process from inside the async connect path.
+///   `VaultConfig::validate_addr` already refused everything
+///   this parse rejects; parsing again here is what makes the panic
+///   unreachable by construction rather than by convention (ERR-11).
+///
+/// `ca_certs` is deliberately *not* pinned: the builder fills it from
+/// `VAULT_CACERT`/`VAULT_CAPATH` exactly as the Vault CLI does, and those only
+/// ever *add* trust roots — an internal CA stays configurable without any
+/// environment variable being able to switch verification off.
+fn client_settings(
+    config: &VaultConfig,
+    token: &str,
+    timeout: Duration,
+    skip_verify_env: Option<&str>,
+) -> Result<VaultClientSettings, CoreError> {
+    if let Some(value) = skip_verify_env {
+        tracing::warn!(
+            value,
+            "{SKIP_VERIFY_ENV} is set and is being ignored: dbsec always verifies the Vault \
+             server certificate. Note that vaultrs reads this variable with the sense inverted \
+             from the Vault CLI, so it is \"false\" that would have disabled verification"
+        );
+    }
+    let addr = url::Url::parse(&config.addr)
+        .map_err(|e| backend_error(format!("[vault] addr {} is not a URL", config.addr), e))?;
+    VaultClientSettingsBuilder::default()
+        .address(addr.as_str())
+        .token(token)
+        .verify(true)
+        // vaultrs 0.7 only calls `reqwest::ClientBuilder::timeout` when this is
+        // `Some`, and reqwest's own default is no timeout at all, so leaving it
+        // unset means every roundtrip is unbounded.
+        .timeout(Some(timeout))
+        .build()
+        .map_err(|e| backend_error("building the vault client settings".to_owned(), e))
+}
+
 pub(crate) struct VaultKeySource<S = VaultStore> {
     store: S,
     handle: tokio::runtime::Handle,
@@ -432,16 +493,10 @@ impl VaultKeySource<VaultStore> {
     pub(crate) async fn connect(setup: &VaultSetup) -> Result<Self, Error> {
         let config = &setup.config;
         let timeout = Duration::from_secs(config.timeout_secs);
-        let settings = VaultClientSettingsBuilder::default()
-            .address(&config.addr)
-            // Resolved by validation, so no file is read from this async path.
-            .token(setup.token.expose())
-            // vaultrs 0.7 only calls `reqwest::ClientBuilder::timeout` when
-            // this is `Some`, and reqwest's own default is no timeout at all,
-            // so leaving it unset means every roundtrip below is unbounded.
-            .timeout(Some(timeout))
-            .build()
-            .map_err(|e| backend_error("building the vault client settings".to_owned(), e))?;
+        let skip_verify = std::env::var(SKIP_VERIFY_ENV).ok();
+        // Resolved by validation, so no file is read from this async path.
+        let settings =
+            client_settings(config, setup.token.expose(), timeout, skip_verify.as_deref())?;
         let client = VaultClient::new(settings)
             .map_err(|e| backend_error("connecting to vault".to_owned(), e))?;
 
@@ -1147,6 +1202,68 @@ mod tests {
 
         assert_eq!(keys.check_token().await, TokenCheck::Unknown);
         assert_eq!(*keys.store.renewals.lock().expect("lock"), 0);
+    }
+
+    fn vault_config(addr: &str) -> VaultConfig {
+        toml::from_str(&format!("addr = {addr:?}\ntoken = \"t\"\n")).expect("test config parses")
+    }
+
+    /// The channel that carries the Vault token, every DEK plaintext and every
+    /// deterministic index key verifies its peer — explicitly, not by
+    /// inheriting whatever `vaultrs` reads out of the environment.
+    #[test]
+    fn the_vault_client_verifies_the_server_certificate() {
+        let settings = client_settings(
+            &vault_config("https://bao.internal:8200"),
+            "t",
+            Duration::from_secs(5),
+            None,
+        )
+        .expect("settings build");
+
+        assert!(settings.verify, "the Vault server certificate must be verified");
+        assert_eq!(settings.address.as_str(), "https://bao.internal:8200/");
+        assert_eq!(settings.timeout, Some(Duration::from_secs(5)), "every roundtrip is bounded");
+    }
+
+    /// `vaultrs` reads `VAULT_SKIP_VERIFY` with the sense inverted from the
+    /// Vault CLI, so the hardening idiom `VAULT_SKIP_VERIFY=false` ("do
+    /// verify") is exactly what would have disabled verification. It must not
+    /// — and it must not be ignored quietly either, since an operator who set
+    /// it believed it did something.
+    #[test]
+    fn vault_skip_verify_can_neither_disable_verification_nor_pass_unreported() {
+        use tracing_subscriber::layer::SubscriberExt as _;
+
+        let logs = CapturedLogs::default();
+        let guard =
+            tracing::subscriber::set_default(tracing_subscriber::registry().with(logs.clone()));
+        let settings = client_settings(
+            &vault_config("https://bao.internal:8200"),
+            "t",
+            Duration::from_secs(5),
+            Some("false"),
+        )
+        .expect("settings build");
+        drop(guard);
+
+        assert!(settings.verify, "no environment variable may switch verification off");
+        let captured = logs.0.lock().expect("lock");
+        let (level, fields) = captured
+            .iter()
+            .find(|(_, f)| f.contains(SKIP_VERIFY_ENV))
+            .unwrap_or_else(|| panic!("the ignored override must be reported: {captured:?}"));
+        assert_eq!(*level, tracing::Level::WARN, "a defeated hardening attempt is a warning");
+        assert!(fields.contains("false"), "the value it was given is named: {fields}");
+    }
+
+    /// `VaultClientSettingsBuilder::address` is documented "# Panics". Nothing
+    /// malformed may reach it.
+    #[test]
+    fn a_malformed_vault_addr_is_an_error_rather_than_a_panic() {
+        let error = client_settings(&vault_config("a"), "t", Duration::from_secs(5), None)
+            .expect_err("a relative URL is not a Vault address");
+        assert!(error.to_string().contains("is not a URL"), "got {error}");
     }
 
     #[test]

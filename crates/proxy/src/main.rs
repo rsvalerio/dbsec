@@ -74,6 +74,12 @@ const REFUSAL_LOG_INTERVAL: Duration = Duration::from_secs(5);
 /// `#[source]` rather than formatted away, the library's view of it is still
 /// reachable through the error chain. An operator who sets `RUST_LOG` owns the
 /// filter completely and can put `vaultrs=debug` back in.
+///
+/// The one security-relevant line `vaultrs` emits — the WARN it logs when it is
+/// about to accept invalid certificates — is unreachable from this proxy:
+/// `vault::client_settings` pins `verify = true`, so the branch that emits it
+/// is never taken. Silencing the target therefore hides nothing that matters;
+/// if that pin is ever relaxed, this filter has to be revisited with it.
 const DEFAULT_LOG_FILTER: &str = "info,vaultrs=off,rustify=off";
 
 /// Config file loaded when no path is given on the command line.
