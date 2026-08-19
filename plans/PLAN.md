@@ -474,9 +474,14 @@ unrecoverable without a full re-index.
   `make forge-sync`) diffs each one against the forge tag the workflows pin. Deliberate
   divergence is recorded as a waiver patch under `.forge-sync/waivers/` with a reason,
   so the exemption is the diff itself and a later forge-side change still fails.
-- `e2e.yml` is repo-local rather than a forge wrapper: the forge gates run `cargo test`,
-  which skips both e2e suites (they are `#[ignore]`d without a database). It supplies
-  Postgres and a dev-mode OpenBao as job services and points the suites at them with
+- Tests run under cargo-nextest (`.ops.toml` `next`/`next-doc`, `make test`, the `test`
+  job in `ci.yml`); the forge workflow's own `cargo test` job is turned off with
+  `run-tests: false` so the two do not duplicate. Doctests stay on `cargo test --doc` —
+  nextest does not run them.
+- `e2e.yml` is repo-local rather than a forge wrapper: the QA gates run without
+  `--run-ignored`, which skips both e2e suites (they are `#[ignore]`d without a
+  database). It supplies Postgres and a dev-mode OpenBao as job services and points
+  the suites at them with
   `DBSEC_E2E_DSN` / `DBSEC_E2E_VAULT_ADDR`, so no containers are started by the build.
 - Build commands via `ops` (`make check` → `ops verify qa`).
 - Conventional commits + cocogitto (`cog.toml`, signed mode: no push hooks).
