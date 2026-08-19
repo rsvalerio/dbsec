@@ -22,6 +22,10 @@ jobs:
       contents: read
     steps:
       - uses: actions/checkout@v4
+        with:
+          # `cargo doc` runs build scripts and proc macros, and a checkout
+          # leaves GITHUB_TOKEN in .git/config unless told not to.
+          persist-credentials: false
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - name: cargo doc
@@ -38,4 +42,6 @@ jobs:
       contents: read
     steps:
       - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
       - run: ./scripts/forge-sync-check.sh

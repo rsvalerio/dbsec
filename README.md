@@ -72,11 +72,13 @@ row_key = "id"      # unique per row: a primary key, or a unique column
 
 With that, a value copied from one row's `users.ssn` into another row's
 `users.ssn` no longer decrypts. It is opt-in because it constrains the SQL the
-table can take. **Every write-path constraint below is an `on_unprotected`
-site**, so it follows that setting rather than being an unconditional refusal:
-on the default `warn` the statement is logged — one warning naming the table
-and the row key — and relayed, and only `reject` answers the client with an
-ErrorResponse. Read-path verification is the exception and is never relaxed.
+table can take. **Almost every write-path constraint below is an
+`on_unprotected` site**, so it follows that setting rather than being an
+unconditional refusal: on the default `warn` the statement is logged — one
+warning naming the table and the row key — and relayed, and only `reject`
+answers the client with an ErrorResponse. Two are not, and both say so where
+they are described: a row key bound as an unusable parameter refuses that one
+statement under either setting, and read-path verification is never relaxed.
 
 - **Client-generated keys only.** `INSERT` must carry `id` in its column list,
   and its value must be a literal or a bound parameter. A `serial` key does not

@@ -31,7 +31,7 @@
 //!
 //! # Refusals
 //!
-//! This path has eight of them. Five concern a column whose protection the
+//! This path has eleven of them. Five concern a column whose protection the
 //! proxy cannot vouch for: a DataRow no described statement covers
 //! ([`Error::UndescribedRow`]), a result column a stale mapping would
 //! under-match ([`Error::StaleColumnMap`]), a result column named like a
@@ -47,7 +47,7 @@
 //! The middle three are gated on `on_unprotected = "reject"`; the size ceiling,
 //! like the undescribed row, is not.
 //!
-//! Five more come from row binding and from the size ceiling's sibling: a row
+//! Six more come from row binding and from the size ceiling's sibling: a row
 //! whose rewrite outgrows what a frame header can express
 //! ([`Error::FrameTooLarge`], the other half of the same memory policy), a
 //! row-bound value whose row key the query never projected
@@ -60,9 +60,13 @@
 //! another row's key; and one projecting the key once and a protected column
 //! more than once ([`Error::AmbiguousRowInstance`]), which is indistinguishable
 //! from `SELECT ssn, ssn FROM users` until a value fails to authenticate, and
-//! so is refused only then. All five are the client's to fix, which is what
-//! makes them refusals rather than session failures; [`is_refusal`] is the
-//! single list. They hand the
+//! so is refused only then; and a cell-only value in a column whose table has
+//! closed its row-binding migration window
+//! ([`dbsec_core::Error::RowBindingDowngraded`]), where the bytes are intact
+//! but bound to less than the configuration promises. All six are the client's
+//! or the operator's to fix, which is what makes them refusals rather than
+//! session failures; [`is_refusal`] is the single list, and the count above is
+//! the length of it. They hand the
 //! client a PostgreSQL
 //! ErrorResponse (SQLSTATE 42501, the same one a refused write carries) and
 //! then end the session — see [`RowDecryptor::on_frame`] for why the read path

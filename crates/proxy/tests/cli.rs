@@ -291,13 +291,14 @@ fn help_prints_usage_to_stdout_and_exits_zero() {
 #[test]
 fn help_survives_a_reader_that_closes_the_pipe() {
     let dir = tempfile::tempdir().unwrap();
+    // The path goes through the environment rather than into the shell source:
+    // a Cargo target directory may contain a space or a shell metacharacter,
+    // and interpolating it would break the pipeline rather than the pipe.
     let output = Command::new("sh")
         .current_dir(dir.path())
+        .env("DBSEC_BIN", env!("CARGO_BIN_EXE_dbsec"))
         .arg("-c")
-        .arg(format!(
-            "{{ {} --help; echo \"dbsec exit $?\" >&2; }} | head -1",
-            env!("CARGO_BIN_EXE_dbsec")
-        ))
+        .arg(r#"{ "$DBSEC_BIN" --help; echo "dbsec exit $?" >&2; } | head -1"#)
         .output()
         .expect("sh must be runnable");
 

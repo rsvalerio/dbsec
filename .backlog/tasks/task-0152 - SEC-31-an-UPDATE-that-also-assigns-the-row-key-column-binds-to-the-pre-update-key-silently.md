@@ -7,7 +7,7 @@ status: Done
 assignee:
   - TASK-0173
 created_date: '2026-08-19 08:28'
-updated_date: '2026-08-19 09:43'
+updated_date: '2026-08-19 14:25'
 labels:
   - code-review-rust
   - security
@@ -81,4 +81,6 @@ binding, the protection the table had before it declared a row key. Dropping to 
 would be a downgrade dressed as a fix. Under `reject` the report is the answer and nothing
 is written. The `INSERT ... VALUES` path still returns unsealed in the same situation;
 that asymmetry is filed as TASK-0184.
+
+The INSERT asymmetry noted above was filed as TASK-0184 and is now fixed: both INSERT row-key-missing sites seal cell-only under warn, matching this task's assignment path, so the two write paths no longer disagree about what warn means.
 <!-- SECTION:NOTES:END -->

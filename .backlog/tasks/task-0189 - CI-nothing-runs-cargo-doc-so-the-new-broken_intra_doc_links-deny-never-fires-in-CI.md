@@ -6,7 +6,7 @@ title: >-
 status: Done
 assignee: []
 created_date: '2026-08-19 10:40'
-updated_date: '2026-08-19 13:06'
+updated_date: '2026-08-19 14:25'
 labels:
   - code-review-rust
   - architecture
@@ -50,4 +50,6 @@ Resolved by the first branch of AC#1, not the second: the forge `rust-ci` workfl
 Added a `docs` job to `.github/workflows/ci.yml` running `cargo doc --no-deps --document-private-items --all-features`, and a matching `make docs` target so the local gate and CI agree. `ops verify` was not extended because `ops` is a compiled binary whose gates are derived from the detected stack, not configured from this repo.
 
 Verified the gate actually fires: a deliberate `[\`does::not::Exist\`]` link added to `crates/core/src/lib.rs` fails the build with `error: unresolved link to \`does::not::Exist\`` / `error: could not document \`dbsec-core\``, and passes once removed.
+
+Caveat found after the fact, on PR #17: cargo doc does not compile #[cfg(test)] items, so intra-doc links inside test-only modules are never checked by this gate. crates/proxy/src/encrypt/test_support.rs had a broken [`bytea_literal`] link that the deny could not have caught; it was qualified by hand. The gate covers the crate's real documentation, which is what it was added for, but it is not a guarantee about test-module prose.
 <!-- SECTION:NOTES:END -->

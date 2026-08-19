@@ -121,12 +121,18 @@ pub(in crate::encrypt) fn rewriter(catalog: Arc<WriteCatalog>) -> QueryRewriter 
 /// declarations out of that context — so without one every table is
 /// cell-bound and the row-key sites cannot fire at all.
 pub(in crate::encrypt) fn row_bound_rewriter() -> QueryRewriter {
+    row_bound_rewriter_named("id")
+}
+
+/// [`row_bound_rewriter`] with the row-key column named something other than
+/// the all-lowercase ASCII `id`, for the identifier-folding cases.
+pub(in crate::encrypt) fn row_bound_rewriter_named(row_key: &str) -> QueryRewriter {
     use crate::rows::{Resolved, ResolvedRowKey, RowContext, DEFAULT_MAX_PROTECTED_VALUE_LEN};
 
     let spec = ResolvedRowKey {
         attnum: 1,
         type_oid: rowkey::oid::INT4,
-        name: "id".into(),
+        name: row_key.into(),
         table: "public.users".into(),
     };
     let rows = Arc::new(RowContext::new(
@@ -180,7 +186,8 @@ pub(in crate::encrypt) fn refusal(action: &FrameAction) -> String {
 }
 
 /// How a sealed BYTEA value appears in rewritten SQL: the escape-string
-/// literal [`bytea_literal`] emits, with its backslash doubled.
+/// literal [`bytea_literal`](super::seal::bytea_literal) emits, with its
+/// backslash doubled.
 pub(in crate::encrypt) const SEALED_PREFIX: &str = r"E'\\x";
 
 pub(in crate::encrypt) fn sealed_literal(value: &[u8]) -> String {

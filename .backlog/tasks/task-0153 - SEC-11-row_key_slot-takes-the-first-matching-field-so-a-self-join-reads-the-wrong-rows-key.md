@@ -7,7 +7,7 @@ status: Done
 assignee:
   - TASK-0176
 created_date: '2026-08-19 08:28'
-updated_date: '2026-08-19 09:43'
+updated_date: '2026-08-19 14:25'
 labels:
   - code-review-rust
   - security
@@ -64,4 +64,6 @@ column twice while projecting the key once (`SELECT a.id, a.ssn, b.ssn`) is
 still resolved to the single key field and still fails as `Error::Decrypt`.
 Detecting it would mean refusing `SELECT ssn, ssn FROM users`, which is
 legitimate, so it is a separate decision from this one.
+
+The protected-column duplication noted above was filed as TASK-0185 and is now resolved. The chosen behaviour is not to refuse on the description — a self-join projecting the key once describes identically to SELECT ssn, ssn FROM users, which is valid and must keep working — but to reclassify the authentication failure as Error::AmbiguousRowInstance, a client-visible refusal naming the table rather than a session-killing fatal. Pinned by rows::tests::a_self_join_projecting_the_row_key_once_is_refused_when_a_value_belongs_elsewhere, which asserts both cases against the same RowDescription.
 <!-- SECTION:NOTES:END -->

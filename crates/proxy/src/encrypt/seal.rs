@@ -43,6 +43,29 @@ pub(super) struct UpdateTarget<'a> {
     pub(super) assignments: &'a [Assignment],
 }
 
+/// The configured row-key column name, as a SQL reference must fold to in order
+/// to name it.
+///
+/// The catalog holds configured names *raw* and matches them against
+/// [`normalize`], which folds an identifier the way PostgreSQL does: ASCII-only
+/// downcasing for an unquoted name, no folding at all for a quoted one. So the
+/// raw name is already the right side of the comparison, and folding it again
+/// here would be wrong in both directions.
+///
+/// This used to be `spec.name.to_lowercase()`, which is Rust's *Unicode* case
+/// folding and disagrees with the server twice over: a `row_key` of `Ämail`
+/// became `ämail` while `normalize` leaves it `Ämail`, and a `row_key` of
+/// `rowKey` became `rowkey` while the `"rowKey"` reference that
+/// [`Config::validate`](crate::config::Config::validate) tells the operator to
+/// use folds to `rowKey`. Either way a valid reference to the row key resolved
+/// to nothing: refused under `reject`, and silently sealed cell-only under
+/// `warn` — the protection quietly weaker than the configuration promises. The
+/// same divergence on protected *column* names is what
+/// [`crate::config::fold_identifier`] was written for.
+fn row_key_name(spec: &ResolvedRowKey) -> &str {
+    &spec.name
+}
+
 /// Whether an assignment list writes `wanted`, on either target shape: `SET id
 /// = …` and the row-wise `SET (id, ssn) = (…)`.
 fn assigns_column(assignments: &[Assignment], wanted: &str) -> bool {
@@ -104,8 +127,8 @@ impl QueryRewriter {
                 .or_else(|| self.row_key_in_predicate(right, spec, target, joined)),
             Expr::Nested(inner) => self.row_key_in_predicate(inner, spec, target, joined),
             Expr::BinaryOp { left, op: BinaryOperator::Eq, right } => {
-                let wanted = spec.name.to_lowercase();
-                let names = |e: &Expr| names_row_key(e, &wanted, target, joined);
+                let wanted = row_key_name(spec);
+                let names = |e: &Expr| names_row_key(e, wanted, target, joined);
                 if names(left) {
                     self.row_key_source(right, spec)
                 } else if names(right) {
@@ -134,8 +157,8 @@ impl QueryRewriter {
             return AssignmentRow::Known(RowKeySource::None);
         };
         let qualified = format!("{schema}.{table_name}");
-        let wanted = spec.name.to_lowercase();
-        if assigns_column(target.assignments, &wanted) {
+        let wanted = row_key_name(&spec);
+        if assigns_column(target.assignments, wanted) {
             return AssignmentRow::Reassigned { table: qualified, column: spec.name };
         }
         let scoped = ScopedTable {
@@ -182,8 +205,8 @@ impl QueryRewriter {
             return AssignmentRow::Known(RowKeySource::None);
         };
         let qualified = format!("{schema}.{table_name}");
-        let wanted = spec.name.to_lowercase();
-        if assigns_column(assignments, &wanted) {
+        let wanted = row_key_name(&spec);
+        if assigns_column(assignments, wanted) {
             return AssignmentRow::Reassigned { table: qualified, column: spec.name };
         }
         let missing = |shape| AssignmentRow::Missing {
@@ -341,7 +364,8 @@ impl QueryRewriter {
         let qualified = format!("{schema}.{table_name}");
         let spec = self.row_key_spec(&schema, &table_name);
         let key_position = spec.as_ref().and_then(|spec| {
-            insert.columns.iter().position(|ident| normalize(ident) == spec.name.to_lowercase())
+            let wanted = row_key_name(spec);
+            insert.columns.iter().position(|ident| normalize(ident) == wanted)
         });
         // Reported, then sealed cell-only — never returned unsealed. See
         // [`Self::row_of`] for why `warn` falls back to the weaker binding

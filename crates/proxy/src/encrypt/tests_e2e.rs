@@ -1374,3 +1374,55 @@ fn no_event_from_the_write_path_carries_a_plaintext_value() {
         );
     }
 }
+/// A row-key column whose name is not already all-lowercase ASCII must
+/// still be recognised when a statement names it the way PostgreSQL folds
+/// it.
+///
+/// The row-key sites used to compare a folded SQL identifier against
+/// `spec.name.to_lowercase()`, and Rust's `to_lowercase` is full Unicode
+/// folding where the server's is ASCII-only. `Ämail` became `ämail` on one
+/// side and stayed `Ämail` on the other, and a quoted `"rowKey"` — the
+/// reference config validation tells the operator is the only one that will
+/// match a mixed-case configured name — folded to `rowKey` against a
+/// `rowkey` that nothing produces. Either way the row key resolved to
+/// nothing: `RowKeyMissing`, which refuses valid SQL under `reject` and
+/// under `warn` seals cell-only, quietly weaker than the configuration
+/// promises. `crates/proxy/src/encrypt/catalog.rs` pins the same rule for
+/// protected column names.
+#[test]
+fn a_row_key_named_outside_lowercase_ascii_is_still_recognised() {
+    // (configured row_key, how a statement names it)
+    for (configured, reference) in [
+        ("id", "id"),
+        // Non-ASCII: the server folds the ASCII half and leaves `Ä` alone.
+        ("Ämail", "Ämail"),
+        ("Ämail", "ÄMAIL"),
+        // Mixed case reachable only through a quoted reference.
+        ("rowKey", "\"rowKey\""),
+    ] {
+        let mut rewriter = row_bound_rewriter_named(configured);
+        let sql = format!("UPDATE users SET email = 'alice@secret.test' WHERE {reference} = 7");
+        let rewritten = rewritten_query(&mut rewriter, &sql).expect("rewritten");
+        let stored = hex::decode(sealed_hex(&rewritten).expect("a sealed literal")).unwrap();
+        let (_, envelope) = blind_index::split(&stored).expect("searchable column");
+        assert!(
+            envelope.starts_with(dbsec_core::envelope::MAGIC_V3),
+            "{configured} named as {reference} must seal row-bound, not cell-only"
+        );
+    }
+
+    // The other direction, so the comparison is not simply case-blind: an
+    // unquoted reference cannot name a row key that only a quoted one can.
+    let mut rewriter = row_bound_rewriter_named("rowKey");
+    let rewritten = rewritten_query(
+        &mut rewriter,
+        "UPDATE users SET email = 'alice@secret.test' WHERE rowKey = 7",
+    )
+    .expect("rewritten");
+    let stored = hex::decode(sealed_hex(&rewritten).expect("a sealed literal")).unwrap();
+    let (_, envelope) = blind_index::split(&stored).expect("searchable column");
+    assert!(
+        envelope.starts_with(dbsec_core::envelope::MAGIC),
+        "an unquoted rowKey folds to rowkey, which names no configured row key"
+    );
+}

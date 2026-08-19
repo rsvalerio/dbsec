@@ -113,7 +113,10 @@ while read -r local_path forge_path; do
         # whitespace repo-wide, so the blank context lines inside a stored patch
         # arrive empty rather than as a single space; patch reads them the same
         # way, which is why the recorded diff survives that rewriting.
-        if ! patch -s --fuzz=0 -r "$tmp/reject" "$expected" <"$waiver" >"$tmp/patch.err" 2>&1; then
+        # `-f` as well as `-s`: `-s` silences output, not questions, and stdin
+        # here is the waiver itself — a reversed or stale patch would prompt
+        # ("Assume -R?") and read the answer out of its own body.
+        if ! patch -s -f --fuzz=0 -r "$tmp/reject" "$expected" <"$waiver" >"$tmp/patch.err" 2>&1; then
             drifted+=("$local_path")
             echo
             echo "=== the recorded divergence for $local_path no longer applies to forge/$forge_path@$ref ==="

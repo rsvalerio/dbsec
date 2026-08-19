@@ -165,10 +165,12 @@ pub(super) fn column_ref<'a>(
 /// The direct sub-expressions of `expr`, for read-only walks.
 ///
 /// The mutable twin of this lives in
-/// [`QueryRewriter::rewrite_nested_queries`](super::QueryRewriter::rewrite_nested_queries);
-/// it stops at query boundaries because it hands them to `rewrite_query`,
-/// whereas this one descends into them, since a protected column referenced
-/// inside a subquery is still projected out of it.
+/// [`QueryRewriter::rewrite_nested_queries`](super::QueryRewriter::rewrite_nested_queries),
+/// which stops at query boundaries because it hands them to `rewrite_query`.
+/// This one stops there too — it has no `Expr::Subquery`, `Expr::InSubquery` or
+/// `Expr::Exists` arm — for the same reason: a predicate inside a subquery is
+/// resolved against *that* query's scope, which is the only scope its column
+/// references are meaningful in, and `rewrite_query` walks it with one.
 fn expr_operands(expr: &Expr) -> Vec<&Expr> {
     match expr {
         Expr::BinaryOp { left, right, .. }

@@ -6,7 +6,7 @@ title: >-
 status: Done
 assignee: []
 created_date: '2026-08-19 13:06'
-updated_date: '2026-08-19 13:17'
+updated_date: '2026-08-19 13:18'
 labels:
   - code-review-rust
   - ci
@@ -61,4 +61,10 @@ What differed was the *patch text*. The check compared the stored waiver against
 Fixed by comparing the waiver's *effect* rather than its text: the canonical file plus the recorded patch (`patch --fuzz=0`) must reproduce this repo's copy byte for byte. That is implementation-independent and keeps the detection the check exists for — a forge-side edit inside a waived region makes the patch fail to apply, and one outside it makes the result differ from the local copy. Both paths were exercised, and the drift report now shows only what differs beyond the recorded divergence instead of dumping the whole patch.
 
 No re-record was needed, so the waiver still carries its original reason.
+
+Correction to this task's own description: the `forge config drift` **CI job was never failing**. It has passed on every recent `main` run, and it passed on this branch too. The task was filed from a local `./scripts/forge-sync-check.sh` exit code without checking the CI job, and the description's "the forge-sync job in .github/workflows/ci.yml fails" and "a permanently red CI job" are wrong.
+
+The real scope: the check failed only where the local `diff` differs from the one that recorded the waiver — macOS/BSD here, GNU in CI. So `make forge-sync` was red for anyone on macOS and green in CI, for the same tree.
+
+The fix and the reasoning below are unaffected, and it is still worth having: a check that is permanently red locally stops being run before a push, and it is the only thing that notices a forge-side edit to a shared section.
 <!-- SECTION:NOTES:END -->
