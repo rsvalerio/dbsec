@@ -44,7 +44,7 @@ const INDEXABLE_ELEMENT_OIDS: [i32; 6] = [
 const MAX_ARRAY_ELEMENTS: usize = 65_536;
 
 /// One decoded `= ANY($n)` array parameter.
-pub(super) struct BoundArray {
+struct BoundArray {
     /// Element plaintexts, `None` for a NULL element.
     elements: Vec<Option<Vec<u8>>>,
     /// The array's lower bound, preserved so the re-encoded array is the same
@@ -59,10 +59,11 @@ pub(super) struct BoundArray {
 /// `Ok(None)` is the fallback for anything this cannot do faithfully — a
 /// parameter that is not a one-dimensional array, an element type that is not
 /// a plaintext the proxy seals, an array over [`MAX_ARRAY_ELEMENTS`] — and the
-/// caller turns it into the same [`Unprotected::Predicate`] signal the SQL
-/// rewrite raises. Nothing partially indexed is ever produced: half the
-/// elements matching the index and half the stored form is a *valid* query
-/// that silently returns the wrong rows.
+/// caller turns it into the same
+/// [`Unprotected::Predicate`](super::unprotected::Unprotected::Predicate)
+/// signal the SQL rewrite raises. Nothing partially indexed is ever produced:
+/// half the elements matching the index and half the stored form is a *valid*
+/// query that silently returns the wrong rows.
 ///
 /// A NULL element stays NULL: `x = ANY(...)` is never true for one, so it
 /// changes no row either way.
@@ -98,7 +99,7 @@ pub(super) fn index_array(
 /// `length | bytes` with `-1` for NULL. Every field is checked against what is
 /// actually there — this is client-supplied and the only thing that has
 /// validated it so far is nothing (SEC-11).
-pub(super) fn decode_binary_array(mut raw: &[u8]) -> Option<BoundArray> {
+fn decode_binary_array(mut raw: &[u8]) -> Option<BoundArray> {
     let ndim = take_i32(&mut raw)?;
     let _flags = take_i32(&mut raw)?;
     let element_oid = take_i32(&mut raw)?;
@@ -156,7 +157,7 @@ fn take_i32(buf: &mut &[u8]) -> Option<i32> {
 /// returns the wrong rows. That is the outcome [`index_array`] exists to make
 /// impossible, so anything this cannot decode faithfully returns `None` and
 /// takes the `on_unprotected` path instead of guessing.
-pub(super) fn decode_text_array(raw: &[u8], wire: WireForm) -> Option<BoundArray> {
+fn decode_text_array(raw: &[u8], wire: WireForm) -> Option<BoundArray> {
     let text = std::str::from_utf8(raw).ok()?.trim();
     let body = text.strip_prefix('{')?.strip_suffix('}')?;
     let mut elements: Vec<Option<Vec<u8>>> = Vec::new();
@@ -166,76 +167,17 @@ pub(super) fn decode_text_array(raw: &[u8], wire: WireForm) -> Option<BoundArray
     let bytes = body.as_bytes();
     let mut at = 0;
     loop {
-        while bytes.get(at).is_some_and(u8::is_ascii_whitespace) {
-            at += 1;
-        }
+        skip_whitespace(bytes, &mut at);
         let element = if bytes.get(at) == Some(&b'"') {
-            at += 1;
-            let mut value = Vec::new();
-            loop {
-                match *bytes.get(at)? {
-                    b'\\' => {
-                        value.push(*bytes.get(at + 1)?);
-                        at += 2;
-                    }
-                    b'"' => {
-                        at += 1;
-                        break;
-                    }
-                    byte => {
-                        value.push(byte);
-                        at += 1;
-                    }
-                }
-            }
-            Some(String::from_utf8(value).ok()?)
+            Some(quoted_element(bytes, &mut at)?)
         } else {
-            // An unquoted element escapes with a backslash exactly as a quoted
-            // one does — `array_in` does not restrict escaping to quotes — so
-            // `{a\,b}` is the single element `a,b` and not two elements. Scanning
-            // to the next raw comma instead would split it there and hand both
-            // halves to the blind index, which matches nothing anyone stored.
-            let mut value = Vec::new();
-            let mut escaped = false;
-            // Only *unescaped* trailing whitespace is insignificant; `a\ ` ends
-            // in a space that is part of the value.
-            let mut trailing_space = 0;
-            loop {
-                match bytes.get(at) {
-                    None | Some(b',') => break,
-                    Some(b'\\') => {
-                        value.push(*bytes.get(at + 1)?);
-                        at += 2;
-                        escaped = true;
-                        trailing_space = 0;
-                    }
-                    // An unescaped brace is a nested array, which this does not
-                    // handle; an escaped one is just a character.
-                    Some(b'{' | b'}') => return None,
-                    Some(&byte) => {
-                        value.push(byte);
-                        at += 1;
-                        if byte.is_ascii_whitespace() {
-                            trailing_space += 1;
-                        } else {
-                            trailing_space = 0;
-                        }
-                    }
-                }
-            }
-            value.truncate(value.len() - trailing_space);
-            let unquoted = String::from_utf8(value).ok()?;
-            // `NULL` is the null element only unquoted and unescaped: `\N ULL`
-            // and `"NULL"` are both the four-character string.
-            (escaped || !unquoted.eq_ignore_ascii_case("null")).then_some(unquoted)
+            unquoted_element(bytes, &mut at)?
         };
         elements.push(element.map(|text| text_plaintext(&text, wire)));
         if elements.len() > MAX_ARRAY_ELEMENTS {
             return None;
         }
-        while bytes.get(at).is_some_and(u8::is_ascii_whitespace) {
-            at += 1;
-        }
+        skip_whitespace(bytes, &mut at);
         match bytes.get(at) {
             None => break,
             Some(b',') => at += 1,
@@ -245,14 +187,90 @@ pub(super) fn decode_text_array(raw: &[u8], wire: WireForm) -> Option<BoundArray
     Some(BoundArray { elements, lower_bound: 1 })
 }
 
+/// Advances `at` past the whitespace between the delimiters of the text array
+/// format, which `array_in` does not count as part of an element.
+fn skip_whitespace(bytes: &[u8], at: &mut usize) {
+    while bytes.get(*at).is_some_and(u8::is_ascii_whitespace) {
+        *at += 1;
+    }
+}
+
+/// Reads one double-quoted element, `at` on its opening quote, and leaves `at`
+/// just past the closing one.
+///
+/// A backslash escapes the character after it, so the quote that ends the
+/// element is the first unescaped one. `None` — the whole parameter falls back
+/// — for an element that never closes, or whose bytes are not UTF-8: both are
+/// input this cannot re-encode faithfully.
+fn quoted_element(bytes: &[u8], at: &mut usize) -> Option<String> {
+    *at += 1;
+    let mut value = Vec::new();
+    loop {
+        match *bytes.get(*at)? {
+            b'\\' => {
+                value.push(*bytes.get(*at + 1)?);
+                *at += 2;
+            }
+            b'"' => {
+                *at += 1;
+                break;
+            }
+            byte => {
+                value.push(byte);
+                *at += 1;
+            }
+        }
+    }
+    String::from_utf8(value).ok()
+}
+
+/// Reads one unquoted element, leaving `at` on the comma or the end that
+/// terminated it. `Some(None)` is the unquoted `NULL` keyword; the outer
+/// `None` is a shape this cannot decode.
+///
+/// An unquoted element escapes with a backslash exactly as a quoted one does —
+/// `array_in` does not restrict escaping to quotes — so `{a\,b}` is the single
+/// element `a,b` and not two elements. Scanning to the next raw comma instead
+/// would split it there and hand both halves to the blind index, which matches
+/// nothing anyone stored.
+fn unquoted_element(bytes: &[u8], at: &mut usize) -> Option<Option<String>> {
+    let mut value = Vec::new();
+    let mut escaped = false;
+    // Only *unescaped* trailing whitespace is insignificant; `a\ ` ends in a
+    // space that is part of the value. `kept` is the length through the last
+    // escaped byte, which the trim may not cross.
+    let mut kept = 0;
+    loop {
+        match bytes.get(*at) {
+            None | Some(b',') => break,
+            Some(b'\\') => {
+                value.push(*bytes.get(*at + 1)?);
+                *at += 2;
+                escaped = true;
+                kept = value.len();
+            }
+            // An unescaped brace is a nested array, which this does not
+            // handle; an escaped one is just a character.
+            Some(b'{' | b'}') => return None,
+            Some(&byte) => {
+                value.push(byte);
+                *at += 1;
+            }
+        }
+    }
+    let trailing = value[kept..].iter().rev().take_while(|byte| byte.is_ascii_whitespace()).count();
+    value.truncate(value.len() - trailing);
+    let unquoted = String::from_utf8(value).ok()?;
+    // `NULL` is the null element only unquoted and unescaped: `\N ULL` and
+    // `"NULL"` are both the four-character string.
+    Some((escaped || !unquoted.eq_ignore_ascii_case("null")).then_some(unquoted))
+}
+
 /// Re-encodes indexed elements in the binary array format. `None` only when
 /// the element count does not fit the protocol's `i32` — impossible under
 /// [`MAX_ARRAY_ELEMENTS`], and checked rather than cast so it stays impossible
 /// if that cap ever moves (SEC-15).
-pub(super) fn encode_binary_array(
-    elements: &[Option<Vec<u8>>],
-    lower_bound: i32,
-) -> Option<Vec<u8>> {
+fn encode_binary_array(elements: &[Option<Vec<u8>>], lower_bound: i32) -> Option<Vec<u8>> {
     let count = i32::try_from(elements.len()).ok()?;
     let has_null = elements.iter().any(Option::is_none);
     let payload: usize = elements.iter().flatten().map(Vec::len).sum();
@@ -281,7 +299,7 @@ pub(super) fn encode_binary_array(
 /// Re-encodes indexed elements as an array literal. Each element is bytea's
 /// `\x` hex input syntax, quoted — and inside a quoted array element the
 /// backslash itself has to be escaped, or the array parser eats it.
-pub(super) fn encode_text_array(elements: &[Option<Vec<u8>>]) -> Vec<u8> {
+fn encode_text_array(elements: &[Option<Vec<u8>>]) -> Vec<u8> {
     let mut out = String::from("{");
     for (position, element) in elements.iter().enumerate() {
         if position > 0 {

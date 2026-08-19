@@ -1,6 +1,6 @@
 # Developer entrypoint for dbsec. `make help` lists targets.
 SHELL := /bin/bash
-.PHONY: help build release run test e2e e2e-vault fuzz fmt clippy check deny forge-sync cog-check pre-release clean
+.PHONY: help build release run test e2e e2e-vault fuzz fmt clippy check deny docs forge-sync cog-check pre-release clean
 
 E2E_PG := dbsec-e2e-pg
 E2E_BAO := dbsec-e2e-bao
@@ -97,6 +97,15 @@ check: ## All QA gates via ops
 
 deny: ## Dependency audit: licenses, advisories, bans (deny.toml)
 	cargo deny check
+
+# `broken_intra_doc_links = "deny"` in Cargo.toml is a *rustdoc* lint, so it
+# only fires during a documentation build. Nothing else here runs one: `ops
+# verify` is fmt/clippy/build/whitespace/json/yaml, and the forge `rust-ci`
+# workflow runs fmt, check, clippy, build, test and deny. Without this target
+# and the CI job beside it the deny is enforced by whoever happens to run
+# `cargo doc` locally, which is how the links it was added to fix accumulated.
+docs: ## Build the docs, failing on a broken intra-doc link
+	cargo doc --no-deps --document-private-items --all-features
 
 # Deliberate divergence is recorded as a waiver rather than exempting the file:
 # `FORGE_SYNC_REASON='...' ./scripts/forge-sync-check.sh --update`.

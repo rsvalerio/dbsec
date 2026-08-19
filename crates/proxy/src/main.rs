@@ -137,6 +137,82 @@ pub fn log_capture() -> std::sync::MutexGuard<'static, ()> {
     dbsec_core::sync::Unpoisoned::unpoisoned(LOG_CAPTURE.lock())
 }
 
+/// Everything emitted while it is the active subscriber, one string per event.
+///
+/// Lives here next to [`log_capture`], which every user of it has to hold:
+/// the two are one mechanism, and the write path, the read path and the vault
+/// client all assert on what reaches the log. Asserting on the code's *shape*
+/// is not enough for those claims — the claim is about the log, so the test
+/// reads the log.
+#[cfg(test)]
+#[derive(Clone, Default)]
+pub struct CapturedEvents(Arc<std::sync::Mutex<Vec<String>>>);
+
+#[cfg(test)]
+impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for CapturedEvents {
+    fn on_event(
+        &self,
+        event: &tracing::Event<'_>,
+        _ctx: tracing_subscriber::layer::Context<'_, S>,
+    ) {
+        struct Fields<'a>(&'a mut String);
+        impl tracing::field::Visit for Fields<'_> {
+            fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+                use std::fmt::Write as _;
+                let _ = write!(self.0, " {}={value:?}", field.name());
+            }
+        }
+        // The level leads the line so a test can assert on it with the same
+        // `contains` every other assertion here uses. The fields follow, each
+        // already space-prefixed, so nothing that reads only fields changes.
+        let mut line = event.metadata().level().to_string();
+        event.record(&mut Fields(&mut line));
+        self.0.lock().expect("captured events").push(line);
+    }
+}
+
+#[cfg(test)]
+impl CapturedEvents {
+    /// The events captured so far, as one string per event.
+    pub fn events(&self) -> Vec<String> {
+        self.0.lock().expect("captured events").clone()
+    }
+}
+
+/// Runs `drive` under a capturing subscriber and hands back what it returned
+/// and every event it emitted.
+///
+/// `drive` is called **twice**, and the first pass is thrown away. `tracing`
+/// decides whether a callsite has any listener the first time it is hit, using
+/// whatever subscriber *that thread* has — so a site another test's thread
+/// reached first, having none, is cached as "nobody is listening" and its
+/// events never reach a capture installed later, however the suite is ordered.
+/// The discarded pass puts every site `drive` touches on the register, and
+/// `rebuild_interest_cache` then recomputes them all against the subscriber
+/// installed here.
+///
+/// That makes `drive` run twice, so it has to build its own state each time
+/// rather than closing over a rewriter or a session it mutates.
+///
+/// This is the only place the priming trick lives. Open-coded per test it was
+/// silently absent from three of the four capture tests, and a capture test
+/// that quietly stops capturing still passes every `contains` it makes — the
+/// assertions are all "an event said this", and no event says nothing.
+#[cfg(test)]
+pub fn captured_events<T>(mut drive: impl FnMut() -> T) -> (T, Vec<String>) {
+    use tracing_subscriber::layer::SubscriberExt as _;
+
+    let _capture = log_capture();
+    drop(drive());
+    let captured = CapturedEvents::default();
+    let subscriber = tracing_subscriber::registry().with(captured.clone());
+    let value = tracing::subscriber::with_default(subscriber, || {
+        tracing::callsite::rebuild_interest_cache();
+        drive()
+    });
+    (value, captured.events())
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
     #[error("{message}; {USAGE}")]
@@ -269,6 +345,52 @@ pub enum Error {
          column, so it cannot be decrypted or masked; use SQL instead of the FunctionCall message"
     )]
     FunctionCallResult,
+    /// A row-bound value that did not authenticate against the row it was
+    /// returned in — the detection row binding exists for.
+    ///
+    /// Kept apart from the bare [`dbsec_core::Error::Decrypt`] it is built
+    /// from so the one log line the relay emits can say *which* cell fired: an
+    /// alarm reading only "decryption failed (wrong key or tampered data)" is
+    /// indistinguishable from a key-rotation mishap or a stale column map, and
+    /// is therefore an alarm an operator learns to filter (READ-8). Both
+    /// fields are non-secret — the column name is configuration, the row key
+    /// is a primary key the client itself selected and `dbsec_core::envelope`
+    /// documents as not a secret — and the plaintext is not among them
+    /// (SEC-21).
+    ///
+    /// Still fatal to the session, like every other crypto failure: the client
+    /// cannot fix this by rewriting its query.
+    #[error(
+        "protected column {column} at result position {position} did not authenticate against \
+         row key {row_key}; the stored value belongs to another row, or its key material has \
+         changed"
+    )]
+    RowBindingFailed { column: String, row_key: String, position: usize },
+    #[error(
+        "this result set projects the row key {table}.{column} more than once, so the proxy \
+         cannot tell which instance of {table} a protected column belongs to; project the row key \
+         once, or query each instance of the table separately"
+    )]
+    AmbiguousRowKey { table: String, column: String },
+    /// The complement of [`Self::AmbiguousRowKey`]: the row key is projected
+    /// *once* and a protected column of the same table more than once, which is
+    /// what a self-join that selects one instance's key looks like. Nothing in
+    /// RowDescription tells two instances of one relation apart, so this is not
+    /// detectable from the description — only from a value that then fails to
+    /// authenticate against the one key on offer.
+    ///
+    /// Reported instead of [`Self::RowBindingFailed`] for that shape, and as a
+    /// refusal rather than a fatal error, because here the client *can* fix it
+    /// by rewriting the query. The message keeps the relocation reading too:
+    /// the two are genuinely indistinguishable at this point, and saying so is
+    /// better than picking one and being confidently wrong.
+    #[error(
+        "protected column {column} came back at more than one position and did not authenticate \
+         against the single row key this result set projects for {table}; a self-join cannot say \
+         which instance a value came from, so query each instance of {table} separately — or, if \
+         this is not a self-join, the stored value belongs to another row"
+    )]
+    AmbiguousRowInstance { table: String, column: String },
     #[error(transparent)]
     Wire(#[from] dbsec_core::Error),
     #[error(transparent)]
@@ -841,10 +963,6 @@ mod tests {
         );
     }
 
-    /// TASK-0130: asking what the flags are is not a usage *error*. Both
-    /// spellings are recognised, and the answer is a `Startup::Help` rather
-    /// than an `Error::Usage` — which is what keeps the exit code at 0 and the
-    /// text out of a `tracing` ERROR record.
     /// A reader that hangs up mid-help — `dbsec --help | head -1` — must not
     /// turn a successful help into a panic and a non-zero exit. Deterministic
     /// here in a way a real pipe is not: the help text is far smaller than a
@@ -883,6 +1001,10 @@ mod tests {
         assert!(text.contains("usage: dbsec") && text.contains(PLAIN_RELAY_FLAG), "{text}");
     }
 
+    /// TASK-0130: asking what the flags are is not a usage *error*. Both
+    /// spellings are recognised, and the answer is a `Startup::Help` rather
+    /// than an `Error::Usage` — which is what keeps the exit code at 0 and the
+    /// text out of a `tracing` ERROR record.
     #[test]
     fn help_is_a_startup_outcome_rather_than_a_usage_error() {
         for flag in HELP_FLAGS {

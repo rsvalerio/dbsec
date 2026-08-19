@@ -62,6 +62,15 @@
 //! Rewriting a `DBS2` header to `DBS1` does not downgrade anything: the tag
 //! was computed over the context, so the shortened AAD fails authentication.
 //!
+//! The reachable downgrade is the other one: getting the *proxy* to write the
+//! older version into a row-bound column. Accepting a `DBS2` value there is
+//! what makes adoption migration-free — the stored value decides which AAD
+//! verifies it — but the opener cannot tell such a value from one a degraded
+//! write path produced (an upsert branch, an `UPDATE` that could not name one
+//! row), and either way the result is relocatable between rows under the
+//! current DEK. [`Binding::row_strict`] is the operator's statement that the
+//! migration window is closed, which turns that acceptance back into an error.
+//!
 //! # Key lifetime
 //!
 //! Nonces are random per invocation, so every DEK has a finite safe lifetime.
@@ -168,16 +177,32 @@ impl CellContext {
     /// differently. The row key is very often attacker-chosen (it is their own
     /// row's id), which turns that from a curiosity into a way to defeat
     /// exactly the binding this version adds.
-    fn aad_with_row(&self, key_id: &[u8], row: &RowKey) -> Vec<u8> {
+    ///
+    /// The prefixes are `u32`, so the framing is injective only while both
+    /// lengths stay below 2^32 — two fields differing by exactly 2^32 bytes
+    /// would frame identically. Nothing in this crate bounds them (the row key
+    /// is not covered by the proxy's `max_protected_value_bytes`, and
+    /// `pgwire::MAX_MESSAGE_LEN` is a different layer's limit), so the bound is
+    /// *checked* here rather than assumed: `u32::try_from` turns what would be
+    /// a silent wrapping narrowing into [`Error::RowBindingFieldTooLong`]. The
+    /// width stays `u32` because it is part of the stored `DBS3` AAD —
+    /// widening it would fail authentication on every value already written.
+    fn aad_with_row(&self, key_id: &[u8], row: &RowKey) -> Result<Vec<u8>, Error> {
+        fn prefix(field: &'static str, bytes: &[u8]) -> Result<[u8; 4], Error> {
+            u32::try_from(bytes.len())
+                .map(u32::to_be_bytes)
+                .map_err(|_| Error::RowBindingFieldTooLong { field, len: bytes.len() })
+        }
+
         let column = self.0.as_bytes();
         let key = row.as_bytes();
         let mut aad = Vec::with_capacity(key_id.len() + 8 + column.len() + key.len());
         aad.extend_from_slice(key_id);
-        aad.extend_from_slice(&(column.len() as u32).to_be_bytes());
+        aad.extend_from_slice(&prefix("column context", column)?);
         aad.extend_from_slice(column);
-        aad.extend_from_slice(&(key.len() as u32).to_be_bytes());
+        aad.extend_from_slice(&prefix("row key", key)?);
         aad.extend_from_slice(key);
-        aad
+        Ok(aad)
     }
 }
 
@@ -220,17 +245,46 @@ impl RowKey {
 pub struct Binding<'a> {
     pub context: &'a CellContext,
     pub row: Option<&'a RowKey>,
+    /// Whether a cell-only envelope found in a row-bound column is a downgrade
+    /// rather than back-compat. See [`Binding::row_strict`]; ignored when
+    /// `row` is `None`, and never consulted on the write path — the version
+    /// written is decided by `row` alone.
+    pub strict: bool,
 }
 
 impl<'a> Binding<'a> {
     /// A column with no configured row key: cell-bound only.
     pub fn cell(context: &'a CellContext) -> Self {
-        Self { context, row: None }
+        Self { context, row: None, strict: false }
     }
 
-    /// A column whose table declares a row key.
+    /// A column whose table declares a row key, opening older cell-only
+    /// ([`MAGIC`]/[`MAGIC_V1`]) values written before the key was declared.
+    ///
+    /// This is the permissive default: adopting a `row_key` needs no
+    /// migration. It is also a permanent hole if it is never closed — see
+    /// [`Self::row_strict`].
     pub fn row(context: &'a CellContext, row: &'a RowKey) -> Self {
-        Self { context, row: Some(row) }
+        Self { context, row: Some(row), strict: false }
+    }
+
+    /// A row-bound column past its migration window: only [`MAGIC_V3`] opens.
+    ///
+    /// The permissive [`Self::row`] accepts a cell-only envelope in a
+    /// row-bound column, and the row key it was handed is then simply not
+    /// bound. That makes every *write*-path degradation invisible on read: an
+    /// upsert branch or an `UPDATE` whose `WHERE` does not pin one row seals
+    /// cell-only, and the resulting value is a ciphertext that can be moved
+    /// between rows of this column for as long as the DEK lives. Nothing in
+    /// the stored bytes distinguishes it from a pre-migration value, so the
+    /// opener cannot tell them apart — only the operator can, by declaring
+    /// that the migration window is over.
+    ///
+    /// Strict mode is that declaration: a cell-only envelope here is reported
+    /// as [`Error::RowBindingDowngraded`] instead of opening. Enable it once
+    /// the column's pre-`row_key` values have been re-encrypted.
+    pub fn row_strict(context: &'a CellContext, row: &'a RowKey) -> Self {
+        Self { context, row: Some(row), strict: true }
     }
 }
 
@@ -334,7 +388,7 @@ impl Cipher {
         // The version is the binding's shape, not a separate flag, so a
         // row-bound value can never be written under a cell-only AAD.
         let (magic, aad) = match binding.row {
-            Some(row) => (MAGIC_V3, binding.context.aad_with_row(key_id, row)),
+            Some(row) => (MAGIC_V3, binding.context.aad_with_row(key_id, row)?),
             None => (MAGIC, binding.context.aad(key_id)),
         };
         let ciphertext = self
@@ -368,11 +422,23 @@ impl Cipher {
         // A `DBS3` value with no row key in hand is reported as such rather
         // than as a decryption failure — it is a query that did not project the
         // key, not a tampered value.
+        //
+        // The converse — a cell-only value in a column the caller says is
+        // row-bound — is back-compat while the migration window is open and a
+        // downgrade once it is closed, and only the caller knows which. Strict
+        // mode is that answer; see `Binding::row_strict` for what it buys.
+        let downgraded = || binding.row.is_some() && binding.strict;
         let aad = if data.starts_with(MAGIC_V1) {
+            if downgraded() {
+                return Err(Error::RowBindingDowngraded);
+            }
             id.to_vec()
         } else if data.starts_with(MAGIC_V3) {
-            binding.context.aad_with_row(id, binding.row.ok_or(Error::RowKeyMissing)?)
+            binding.context.aad_with_row(id, binding.row.ok_or(Error::RowKeyMissing)?)?
         } else {
+            if downgraded() {
+                return Err(Error::RowBindingDowngraded);
+            }
             binding.context.aad(id)
         };
         self.gcm
@@ -617,6 +683,54 @@ mod tests {
         assert!(matches!(decrypt(&KEY, &Binding::cell(&ssn()), &ct), Err(Error::RowKeyMissing)));
     }
 
+    /// The permissive default is what makes adopting a `row_key` migration-free,
+    /// and is also why a degraded write is invisible: a cell-only envelope in a
+    /// row-bound column opens, and the row key handed to the opener is simply
+    /// not bound. Strict mode is the operator saying the migration window is
+    /// closed, so such a value is a downgrade rather than an old value.
+    #[test]
+    fn a_cell_only_value_in_a_row_bound_column_is_a_downgrade_in_strict_mode() {
+        let stored = encrypt(&KEY, &KEY_ID, &Binding::cell(&ssn()), b"secret").unwrap();
+
+        // Permissive: it opens, and the row key proves nothing.
+        assert_eq!(decrypt(&KEY, &Binding::row(&ssn(), &row("42")), &stored).unwrap(), b"secret");
+        assert_eq!(decrypt(&KEY, &Binding::row(&ssn(), &row("43")), &stored).unwrap(), b"secret");
+
+        // Strict: refused, and distinguishably so — not as tampering, and not
+        // as a missing row key.
+        assert!(matches!(
+            decrypt(&KEY, &Binding::row_strict(&ssn(), &row("42")), &stored),
+            Err(Error::RowBindingDowngraded)
+        ));
+
+        // A DBS1 value is the same downgrade, one version further back.
+        let mut legacy = stored.clone();
+        legacy[..MAGIC.len()].copy_from_slice(MAGIC_V1);
+        assert!(matches!(
+            decrypt(&KEY, &Binding::row_strict(&ssn(), &row("42")), &legacy),
+            Err(Error::RowBindingDowngraded)
+        ));
+    }
+
+    /// Strict mode narrows which *stored* values are accepted; it does not
+    /// change what a properly row-bound value does, nor apply to a column with
+    /// no row key in hand.
+    #[test]
+    fn strict_mode_leaves_row_bound_values_alone() {
+        let bound = encrypt(&KEY, &KEY_ID, &Binding::row(&ssn(), &row("42")), b"secret").unwrap();
+        assert_eq!(
+            decrypt(&KEY, &Binding::row_strict(&ssn(), &row("42")), &bound).unwrap(),
+            b"secret"
+        );
+        assert!(matches!(
+            decrypt(&KEY, &Binding::row_strict(&ssn(), &row("43")), &bound),
+            Err(Error::Decrypt)
+        ));
+        // No row key in hand is still RowKeyMissing, not a downgrade: strictness
+        // is only meaningful for a column that declares a key.
+        assert!(matches!(decrypt(&KEY, &Binding::cell(&ssn()), &bound), Err(Error::RowKeyMissing)));
+    }
+
     /// Length-prefixing the AAD's variable fields is load-bearing, not tidiness.
     /// Concatenated, `column="a.b.c" + row="42"` and `column="a.b.c4" + row="2"`
     /// are the same bytes — and the row key is usually the attacker's own row
@@ -631,6 +745,23 @@ mod tests {
             matches!(decrypt(&KEY, &Binding::row(&long, &row("2")), &ct), Err(Error::Decrypt)),
             "column and row must not be re-splittable across the seam"
         );
+    }
+
+    /// The `DBS3` AAD layout is part of the stored format: every row-bound value
+    /// ever written authenticates against these exact bytes, so a change to the
+    /// prefix width or byte order would silently fail to open all of them. That
+    /// is why the length bound is enforced by `u32::try_from` — refusing an
+    /// unframeable field — rather than by widening the prefix.
+    #[test]
+    fn the_row_bound_aad_layout_is_fixed_by_the_stored_format() {
+        let context = CellContext::new("a.b.c");
+        let aad = context.aad_with_row(&[0xAA; KEY_ID_LEN], &row("42")).unwrap();
+        let mut expected = vec![0xAA; KEY_ID_LEN];
+        expected.extend_from_slice(&[0, 0, 0, 5]);
+        expected.extend_from_slice(b"a.b.c");
+        expected.extend_from_slice(&[0, 0, 0, 2]);
+        expected.extend_from_slice(b"42");
+        assert_eq!(aad, expected, "big-endian u32 prefixes, column before row");
     }
 
     /// Older values keep opening after a table gains a row key, and relabelling

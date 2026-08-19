@@ -61,6 +61,17 @@ pub fn row_keys(config: &Config) -> Vec<RowKeyDecl> {
         .collect()
 }
 
+/// Whether `schema.table` declares a row key whose migration window is closed.
+/// Config validation refuses duplicate `[[table]]` entries, so the first match
+/// is the only one.
+fn strict_row_binding(config: &Config, schema: &str, table: &str) -> bool {
+    config
+        .tables
+        .iter()
+        .find(|entry| entry.schema_and_table() == (schema, table))
+        .is_some_and(|entry| entry.strict_row_binding)
+}
+
 pub fn build(config: &Config, keys: &Arc<dyn KeySource>) -> Vec<ProtectedColumn> {
     // One DEK cipher cache for the whole process: every encrypted column shares
     // the active key's schedule and, more importantly, its single AES-GCM
@@ -84,10 +95,14 @@ pub fn build(config: &Config, keys: &Arc<dyn KeySource>) -> Vec<ProtectedColumn>
                     // Both data paths reach this one transform for the column,
                     // so write and read always agree on the binding.
                     let context = CellContext::new(key_name);
-                    (
-                        Some(Arc::new(EncryptTransform::new(ciphers.clone(), context, index_key))),
-                        true,
-                    )
+                    // A closed migration window is the table's property, not
+                    // the column's: it says every value in this table's
+                    // encrypted columns is already row-bound, so one that is
+                    // not is a degraded write rather than an old value.
+                    let strict = strict_row_binding(config, schema, table);
+                    let transform = EncryptTransform::new(ciphers.clone(), context, index_key)
+                        .strict_row_binding(strict);
+                    (Some(Arc::new(transform)), true)
                 }
                 TransformKind::Fpe => (
                     Some(Arc::new(FpeTransform::new(keys.clone(), key_name, column.detokenize))),
@@ -115,6 +130,7 @@ pub fn build(config: &Config, keys: &Arc<dyn KeySource>) -> Vec<ProtectedColumn>
 mod tests {
     use super::*;
     use crate::rows::tests::OneKey;
+    use dbsec_core::envelope::RowKey;
     use dbsec_core::transform::WireForm;
 
     #[test]
@@ -171,5 +187,40 @@ mod tests {
             "an ssn value pasted into credit_card must not authenticate"
         );
         assert_eq!(ssn.open(&stored, None).unwrap().unwrap(), b"078-05-1120");
+    }
+
+    /// `strict_row_binding` is declared on the `[[table]]` but enforced by the
+    /// per-column transform, so the wiring between the two is what makes the
+    /// setting mean anything. Only the strict table's columns get it.
+    #[test]
+    fn strict_row_binding_reaches_only_its_own_tables_transforms() {
+        let config: Config = toml::from_str(
+            "keys_file = \"k\"\ncontrol_dsn = \"d\"\n\
+             \n[[column]]\ntable = \"users\"\ncolumn = \"ssn\"\n\
+             \n[[column]]\ntable = \"orders\"\ncolumn = \"note\"\n\
+             \n[[table]]\ntable = \"users\"\nrow_key = \"id\"\nstrict_row_binding = true\n\
+             \n[[table]]\ntable = \"orders\"\nrow_key = \"id\"\n",
+        )
+        .unwrap();
+        let keys: Arc<dyn KeySource> = Arc::new(OneKey);
+        let columns = build(&config, &keys);
+        let row = RowKey::new(b"42".to_vec());
+
+        let ssn = columns[0].transform.as_ref().expect("encrypt column has a transform");
+        let note = columns[1].transform.as_ref().expect("encrypt column has a transform");
+
+        // A cell-only value is what a degraded write leaves behind.
+        let degraded_ssn = ssn.seal(b"078-05-1120", None).unwrap();
+        assert!(
+            matches!(
+                ssn.open(&degraded_ssn, Some(&row)),
+                Err(dbsec_core::Error::RowBindingDowngraded)
+            ),
+            "the strict table's column must refuse an unbound value"
+        );
+
+        // The other table's window is still open, so the same shape opens.
+        let degraded_note = note.seal(b"gift", None).unwrap();
+        assert_eq!(note.open(&degraded_note, Some(&row)).unwrap().unwrap(), b"gift");
     }
 }

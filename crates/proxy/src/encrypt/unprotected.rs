@@ -34,8 +34,8 @@ pub(super) enum Unprotected<'a> {
     ///
     /// The `to` direction fires for anything the read path protects, the
     /// `from` direction only for what the write path would have sealed — see
-    /// [`WriteCatalog::protects_reads`] for why a mask-only table belongs in
-    /// the first set and not the second.
+    /// [`WriteCatalog::protects_reads`](super::catalog::WriteCatalog::protects_reads)
+    /// for why a mask-only table belongs in the first set and not the second.
     Copy { table: &'a ObjectName, to: bool },
     /// `COPY (query) TO STDOUT` over a protected table. Kept apart from
     /// [`Self::Copy`] because the remedy differs — there is no table to bulk
@@ -64,6 +64,16 @@ pub(super) enum Unprotected<'a> {
     /// key — often meaning the application has to stop relying on a
     /// server-generated one.
     RowKeyMissing { table: String, column: String, shape: &'static str },
+    /// An assignment list on a row-bound table that writes the row key column
+    /// itself — `UPDATE users SET ssn = 'x', id = 99 WHERE id = 7`, or the
+    /// same shape in a conflict action.
+    ///
+    /// Kept apart from [`Self::RowKeyMissing`] because the statement *does*
+    /// name a row: it names the row the values are being moved out of. Sealing
+    /// against that key stores bytes the row they land in can never open, so
+    /// the remedy is to move the row and write the protected column in
+    /// separate statements, not to supply a key.
+    RowKeyReassigned { table: String, column: String },
     /// A predicate over a searchable column that no index match can express.
     Predicate { column: String, shape: &'static str },
     /// An unqualified name matching a protected column in more than one
@@ -79,10 +89,11 @@ pub(super) enum Unprotected<'a> {
     /// `search_path` moved off the schema the catalog resolves against.
     SearchPathChanged,
     /// `standard_conforming_strings` was turned off. Sealed values are emitted
-    /// in a form that does not depend on it ([`bytea_literal`]), but the
-    /// client's own literals are now read one way by PostgreSQL and another by
-    /// the proxy's parser — reported here once, and again per literal that the
-    /// difference actually reaches ([`Self::AmbiguousLiteral`]).
+    /// in a form that does not depend on it
+    /// ([`bytea_literal`](super::seal::bytea_literal)), but the client's own
+    /// literals are now read one way by PostgreSQL and another by the proxy's
+    /// parser — reported here once, and again per literal that the difference
+    /// actually reaches ([`Self::AmbiguousLiteral`]).
     EscapeStringsChanged,
     /// An unqualified name that may be a protected table, in a session whose
     /// `search_path` no longer says which schema it resolves to.
@@ -152,8 +163,17 @@ impl Unprotected<'_> {
                 table = %table,
                 row_key = %column,
                 shape,
-                "row-bound table written without its row key; the value is stored bound to no \
-                 row and will not open"
+                "row-bound table written without its row key; the value is sealed against its \
+                 column only. It still decrypts — what is lost is relocation detection: it can \
+                 be copied into another row of this column undetected until it is re-encrypted. \
+                 Set strict_row_binding on this [[table]] to have such a value refused on read \
+                 instead of opening"
+            ),
+            Self::RowKeyReassigned { table, column } => tracing::warn!(
+                table = %table,
+                row_key = %column,
+                "assignment list on a row-bound table writes its row key; a value sealed here \
+                 would be bound to the row the statement moves it out of and will not open"
             ),
             Self::Predicate { column, shape } => tracing::warn!(
                 column,
@@ -236,6 +256,12 @@ impl Unprotected<'_> {
                 "{table} binds its encrypted values to the row key {column}, but this is a \
                  {shape}; the statement must supply {column} as a literal or a parameter"
             ),
+            Self::RowKeyReassigned { table, column } => format!(
+                "{table} binds its encrypted values to the row key {column}, and this statement \
+                 assigns {column} itself, so the value would be sealed against a row it does not \
+                 land in; change {column} in a statement that writes no protected column of \
+                 {table}"
+            ),
             Self::Predicate { column, shape } => format!(
                 "searchable column {column} was used in a {shape}, which cannot be matched \
                  against its blind index"
@@ -271,7 +297,12 @@ impl Unprotected<'_> {
 
 /// The parser error's variant. Never its message: sqlparser embeds the
 /// offending token in the text, which for a literal is the plaintext itself.
-fn parser_error_kind(error: &ParserError) -> &'static str {
+///
+/// `pub(super)` with no caller outside this file on purpose: the module docs
+/// in `encrypt/mod.rs` name it as the thing that makes the audited `error_kind`
+/// field safe to log, and a link the reader can follow is worth more than one
+/// less name in the sibling scope.
+pub(super) fn parser_error_kind(error: &ParserError) -> &'static str {
     match error {
         ParserError::TokenizerError(_) => "tokenizer",
         ParserError::ParserError(_) => "parser",
@@ -327,7 +358,7 @@ pub(super) fn frame(msg_type: u8, body: &[u8]) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::encrypt::parse_sql;
+    use crate::encrypt::lexer::parse_sql;
 
     /// The parser's own message embeds the token it choked on — which for a
     /// literal is the plaintext — so only the variant is logged.
@@ -349,9 +380,39 @@ mod tests {
         assert_eq!(*bytes.last().unwrap(), 0, "field list is terminated");
         let body = String::from_utf8_lossy(&bytes[5..]);
         assert!(body.contains("ERROR") && body.contains(REFUSED_SQLSTATE) && body.contains("nope"));
+        assert_eq!(message_field(&bytes), "nope");
+    }
 
-        // A message longer than the cap is truncated, not dropped.
-        let long = error_response(&"x".repeat(4096));
-        assert!(long.len() < 4096);
+    /// The 'M' field as the client reads it: the bytes between the field
+    /// marker and its terminator, decoded strictly — a truncation that split a
+    /// character would fail here rather than be papered over.
+    fn message_field(bytes: &[u8]) -> String {
+        let field = bytes[pgwire::FRAME_HEADER_LEN..]
+            .split(|byte| *byte == 0)
+            .find(|field| field.first() == Some(&b'M'))
+            .expect("an M field");
+        String::from_utf8(field[1..].to_vec()).expect("the message is valid UTF-8")
+    }
+
+    /// The cap and the boundary walk are both security properties, so both are
+    /// pinned. The cap bounds attacker-influenced text on the wire — the
+    /// message embeds client-chosen identifiers — and the walk is what stops a
+    /// multi-byte identifier truncated mid-character from panicking on the
+    /// slice, which a client could trigger at will.
+    #[test]
+    fn a_long_message_is_truncated_at_the_cap_and_on_a_char_boundary() {
+        // Pinned, not merely bounded: raising the cap puts more of a
+        // client-chosen identifier on the wire, so the number is part of the
+        // contract rather than an implementation detail.
+        assert_eq!(MAX_ERROR_MESSAGE, 512);
+        let long = message_field(&error_response(&"x".repeat(4096)));
+        assert_eq!(long, "x".repeat(MAX_ERROR_MESSAGE));
+
+        // A message whose byte `MAX_ERROR_MESSAGE` falls inside a multi-byte
+        // character: an ASCII prefix one byte short of the cap, then a
+        // three-byte character straddling it. Slicing at the cap would panic,
+        // so the walk has to step back to the boundary before it.
+        let straddling = format!("{}\u{20ac}{}", "x".repeat(MAX_ERROR_MESSAGE - 1), "y".repeat(8));
+        assert_eq!(message_field(&error_response(&straddling)), "x".repeat(MAX_ERROR_MESSAGE - 1));
     }
 }

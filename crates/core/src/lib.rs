@@ -27,6 +27,26 @@ pub enum Error {
     /// carry the row key, not that a value was tampered with.
     #[error("row-bound value needs its table's row key, which this result does not carry")]
     RowKeyMissing,
+    /// A cell-only envelope was found in a column configured as row-bound with
+    /// strict binding on. Distinct from both [`Self::Decrypt`] and
+    /// [`Self::RowKeyMissing`]: the ciphertext is intact and the row key *was*
+    /// supplied — the stored value is simply bound to less than the column's
+    /// policy requires, so it can be relocated between rows of that column
+    /// undetected. Either it predates the table's `row_key` and needs
+    /// re-encrypting, or a write path degraded to a cell-only seal.
+    #[error(
+        "value is bound to its column only, but this column requires row binding; re-encrypt \
+         it, or turn strict_row_binding off for the duration of the migration"
+    )]
+    RowBindingDowngraded,
+    /// A column context or row key too long for the `u32` length prefix the
+    /// row-bound (`DBS3`) associated data frames it with. Beyond that the
+    /// framing stops being injective — two fields differing by exactly 2^32
+    /// bytes would produce the same AAD — which is the whole reason the prefix
+    /// exists, so it is refused rather than wrapped. Not reachable through the
+    /// proxy's wire limits today; this is the check that says so.
+    #[error("{field} is {len} bytes, over the 4 GiB a row-bound envelope's length prefix frames")]
+    RowBindingFieldTooLong { field: &'static str, len: usize },
     #[error("encryption failed")]
     Encrypt,
     /// The active DEK has spent its random-nonce invocation budget and the key

@@ -3,11 +3,11 @@ id: TASK-0149
 title: >-
   ERR-11: a bad row-key Bind parameter kills the session instead of refusing the
   statement
-status: To Do
+status: Done
 assignee:
   - TASK-0174
 created_date: '2026-08-19 08:27'
-updated_date: '2026-08-19 09:01'
+updated_date: '2026-08-19 09:55'
 labels:
   - code-review-rust
   - error-handling
@@ -45,7 +45,7 @@ refusal path.
 
 ## Acceptance Criteria
 <!-- AC:BEGIN -->
-- [ ] #1 Error::RowKeyType and Format::from_code failures raised while resolving a Bind row key become Rejection::Refused, not Err
-- [ ] #2 The refusal message names the placeholder and the row-key column
-- [ ] #3 A test binds NULL to the row-key parameter and asserts an ErrorResponse followed by a usable session
+- [x] #1 Error::RowKeyType and Format::from_code failures raised while resolving a Bind row key become Rejection::Refused, not Err
+- [x] #2 The refusal message names the placeholder and the row-key column
+- [x] #3 A test binds NULL to the row-key parameter and asserts an ErrorResponse followed by a usable session
 <!-- AC:END -->

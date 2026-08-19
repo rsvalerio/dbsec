@@ -75,6 +75,12 @@ pub fn port_recreate() -> u16 {
     port_at(6)
 }
 
+/// The row-binding case, whose proxy is the only one configured with a
+/// `[[table]] row_key`.
+pub fn port_row_key() -> u16 {
+    port_at(7)
+}
+
 pub fn dsn() -> String {
     std::env::var("DBSEC_E2E_DSN").unwrap_or_else(|_| DEFAULT_DSN.to_owned())
 }
@@ -139,15 +145,23 @@ pub struct ProxyOpts<'a> {
     /// `on_unprotected = "reject"`: refuse statements the rewrite cannot cover
     /// instead of relaying them with a warning.
     pub strict: bool,
+    /// `[[table]] row_key = "<column>"`: bind this table's protected values to
+    /// the row that column names, instead of to the cell alone.
+    pub row_key: Option<&'a str>,
 }
 
 impl<'a> ProxyOpts<'a> {
     pub fn file_keys(port: u16, table: &'a str) -> Self {
-        Self { port, table, keys: Keys::File, strict: false }
+        Self { port, table, keys: Keys::File, strict: false, row_key: None }
     }
 
     pub fn strict(mut self) -> Self {
         self.strict = true;
+        self
+    }
+
+    pub fn row_key(mut self, column: &'a str) -> Self {
+        self.row_key = Some(column);
         self
     }
 }
@@ -258,9 +272,17 @@ table = "{table}"
 column = "note"
 transform = "none"
 mask = {{ keep_first = 2 }}
+{row_key}
 "#,
         port = opts.port,
         table = opts.table,
+        row_key = match opts.row_key {
+            Some(column) => format!(
+                "\n[[table]]\ntable = \"{table}\"\nrow_key = \"{column}\"\n",
+                table = opts.table
+            ),
+            None => String::new(),
+        },
         on_unprotected =
             if opts.strict { "on_unprotected = \"reject\"" } else { "on_unprotected = \"warn\"" },
         upstream = upstream_addr(),

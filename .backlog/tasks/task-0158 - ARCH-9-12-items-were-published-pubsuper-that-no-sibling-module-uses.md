@@ -1,11 +1,11 @@
 ---
 id: TASK-0158
 title: 'ARCH-9: 12 items were published pub(super) that no sibling module uses'
-status: To Do
+status: Done
 assignee:
   - TASK-0180
 created_date: '2026-08-19 08:30'
-updated_date: '2026-08-19 09:01'
+updated_date: '2026-08-19 10:16'
 labels:
   - code-review-rust
   - architecture
@@ -41,6 +41,12 @@ the only way out.
 
 ## Acceptance Criteria
 <!-- AC:BEGIN -->
-- [ ] #1 All 12 items are module-private; cargo check --all-targets and clippy stay clean
-- [ ] #2 Each module's remaining pub(super) set is its documented interface only
+- [x] #1 All 12 items are module-private; cargo check --all-targets and clippy stay clean
+- [x] #2 Each module's remaining pub(super) set is its documented interface only
 <!-- AC:END -->
+
+## Implementation Notes
+
+<!-- SECTION:NOTES:BEGIN -->
+All 12 listed items dropped to module-private (array.rs: BoundArray, decode_binary_array, decode_text_array, encode_binary_array, encode_text_array; scope.rs: ColumnResolution, resolve_column, expr_operands, protected_reference, predicate_operands; seal.rs: row_key_source, seal_tuple_assignment). One more with no cross-file user was found and narrowed the same way: seal.rs row_key_spec. Remaining pub(super) items in the three files were each verified to have a caller in a sibling module. cargo check --all-targets, clippy and cargo doc clean.
+<!-- SECTION:NOTES:END -->

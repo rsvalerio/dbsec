@@ -73,6 +73,7 @@ async fn vault_key_source_survives_restarts() {
         table: TABLE,
         keys: common::Keys::Vault(vault_section()),
         strict: false,
+        row_key: None,
     };
 
     // ---- First run: keys minted, rows sealed with this run's DEK. ----

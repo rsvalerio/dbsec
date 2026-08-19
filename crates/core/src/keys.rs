@@ -23,8 +23,8 @@ use crate::Error;
 /// `IndexKeyRecord`, `TlsContext`) already hand-write a redacting `Debug`, and
 /// this is the same treatment for the one type that was missing it.
 ///
-/// [`Deref`] gives back the bytes, so the key is as usable as the alias was —
-/// the redaction covers formatting, not access.
+/// [`Deref`](std::ops::Deref) gives back the bytes, so the key is as usable as
+/// the alias was — the redaction covers formatting, not access.
 #[derive(Clone)]
 pub struct Key(Zeroizing<[u8; 32]>);
 

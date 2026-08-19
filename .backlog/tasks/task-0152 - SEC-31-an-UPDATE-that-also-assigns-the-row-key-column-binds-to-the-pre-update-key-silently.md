@@ -3,11 +3,11 @@ id: TASK-0152
 title: >-
   SEC-31: an UPDATE that also assigns the row key column binds to the pre-update
   key, silently
-status: To Do
+status: Done
 assignee:
   - TASK-0173
 created_date: '2026-08-19 08:28'
-updated_date: '2026-08-19 09:01'
+updated_date: '2026-08-19 14:25'
 labels:
   - code-review-rust
   - security
@@ -40,7 +40,47 @@ siblings — is inherent to row binding, but is not stated in README or the enve
 
 ## Acceptance Criteria
 <!-- AC:BEGIN -->
-- [ ] #1 An assignment list on a row-bound table targeting the row key column routes through an Unprotected site; refused under reject
-- [ ] #2 Both the single-column and tuple assignment paths are covered
-- [ ] #3 README states that the row key of a row holding protected values must not be updated
+- [x] #1 An assignment list on a row-bound table targeting the row key column routes through an Unprotected site; refused under reject
+- [x] #2 Both the single-column and tuple assignment paths are covered
+- [x] #3 README states that the row key of a row holding protected values must not be updated
 <!-- AC:END -->
+
+## Implementation Notes
+
+<!-- SECTION:NOTES:BEGIN -->
+Fixed in code-review/TASK-0173.
+
+New `Unprotected::RowKeyReassigned { table, column }` site
+(crates/proxy/src/encrypt/unprotected.rs), kept apart from `RowKeyMissing`
+because the statement *does* name a row — the row the values are being moved
+out of — so the remedy differs: split the key change and the protected write
+into separate statements rather than supply a key.
+
+`assigns_column` (crates/proxy/src/encrypt/seal.rs) checks both
+`AssignmentTarget::ColumnName` and `AssignmentTarget::Tuple`, and both
+`update_row` (UPDATE) and `conflict_row` (ON CONFLICT DO UPDATE /
+ON DUPLICATE KEY UPDATE) return `AssignmentRow::Reassigned` when the list
+writes the row key. `row_of` turns that into the site, so it fires only where
+a protected value would actually have been sealed — refused under `reject`,
+warned and left unsealed under `warn`.
+
+README: the `row_key` constraint list gained "The row key is immutable once a
+row holds a protected value", which states both the enforced case and the
+neighbouring one the proxy cannot see (changing the key alone orphans values
+already stored in that row), plus an "Upserts conflict on the key" bullet and
+a note to qualify the key in `UPDATE ... FROM`.
+
+Test (crates/proxy/src/rows.rs):
+`an_update_that_also_assigns_the_row_key_is_refused` covers the single-column
+UPDATE, the row-wise `SET (id, email) = (...)` tuple, and the conflict-action
+form.
+
+Correction to the note above: `QueryRewriter::row_of` does not leave the value unsealed
+under `warn`. It reports the site and then falls back to `RowKeySource::None` — cell-only
+binding, the protection the table had before it declared a row key. Dropping to plaintext
+would be a downgrade dressed as a fix. Under `reject` the report is the answer and nothing
+is written. The `INSERT ... VALUES` path still returns unsealed in the same situation;
+that asymmetry is filed as TASK-0184.
+
+The INSERT asymmetry noted above was filed as TASK-0184 and is now fixed: both INSERT row-key-missing sites seal cell-only under warn, matching this task's assignment path, so the two write paths no longer disagree about what warn means.
+<!-- SECTION:NOTES:END -->

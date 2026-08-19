@@ -89,6 +89,41 @@ const COPY_DATA: u8 = b'd';
 /// against; see [`crate::rows::Described`].
 pub type Positions = Arc<Described>;
 
+/// The result format codes one Bind chose for the portal it created.
+///
+/// This — not the RowDescription — is what says how the values of that
+/// portal's DataRows are encoded. A Describe of a *statement* is answered
+/// before any Bind has happened, so the protocol specifies its RowDescription
+/// format codes "will always be zero"; the same [`Described`] then serves
+/// every Execute of that statement, and two portals of one statement may have
+/// chosen differently. The read path has to *interpret* one value rather than
+/// relay it — the row key, canonicalised through its type before it is bound
+/// ([`crate::rowkey`]) — so reading an `int4` `42` as the text `42` or as four
+/// big-endian bytes is the difference between a value that opens and a session
+/// torn down by a decrypt failure (SEC-31).
+///
+/// Shared behind an `Arc` because it is cloned into every Execute queued for
+/// the portal. `None` is the all-text default the simple protocol has, which
+/// sends no Bind at all.
+#[derive(Clone, Debug, Default)]
+pub struct ResultFormats(Option<Arc<[i16]>>);
+
+impl ResultFormats {
+    /// The codes of one Bind, in the protocol's shorthand: empty means every
+    /// column is text, and a single entry applies to every column.
+    pub fn new(codes: Vec<i16>) -> Self {
+        Self(Some(codes.into()))
+    }
+
+    /// The format code (0 = text, 1 = binary) of result column `index`.
+    pub fn for_column(&self, index: usize) -> i16 {
+        match &self.0 {
+            Some(codes) => dbsec_core::pgwire::format_code(codes, index),
+            None => 0,
+        }
+    }
+}
+
 /// What Bind must do to one parameter of a prepared statement.
 #[derive(Clone)]
 pub enum ParamAction {
@@ -122,8 +157,12 @@ pub enum RowKeySource {
     Literal(RowKey),
     /// The row key is another placeholder, canonicalised at Bind from that
     /// parameter's bytes. The type is carried because those bytes cannot be
-    /// interpreted without it (see `crate::rowkey`).
-    Param { index: usize, type_oid: u32 },
+    /// interpreted without it (see `crate::rowkey`), and the column name
+    /// because canonicalising the client's own bytes can fail — a NULL key,
+    /// non-UTF-8 text, a wrong-width integer — and the refusal that follows is
+    /// only actionable if it says which column the placeholder was supposed to
+    /// be naming a row with.
+    Param { index: usize, type_oid: u32, column: Arc<str> },
 }
 
 impl ParamAction {
@@ -155,7 +194,7 @@ impl ParamAction {
 /// irreversibly. [`Self::record`] therefore collapses a repeat of the same
 /// action and rejects a conflicting one, which refuses the statement rather
 /// than writing something no read path can undo (CL-3). The refusal is
-/// statement-level — see `encrypt::record_param`, which turns it into the
+/// statement-level — see `encrypt::frame::record_param`, which turns it into the
 /// ErrorResponse the client is told about.
 #[derive(Clone, Default)]
 pub struct ParamTransforms {
@@ -198,8 +237,10 @@ pub enum Target {
 
 /// Where the positions for the DataRow now arriving come from.
 pub enum RowSource {
-    /// The rows belong to a portal whose statement the server has described.
-    Portal(Positions),
+    /// The rows belong to a portal whose statement the server has described,
+    /// carrying the result formats that portal's Bind chose — the only
+    /// authority on how its values are encoded.
+    Portal(Positions, ResultFormats),
     /// No Execute is outstanding, so the rows follow their own RowDescription:
     /// the simple protocol, where the last `'T'` frame *is* the authority.
     LastDescription,
@@ -214,6 +255,26 @@ pub enum RowSource {
 /// Execute keeps pointing at the incarnation it was bound against even after
 /// the name is closed or re-parsed.
 type StatementId = u64;
+
+/// Identifies one queued Execute. Minted per Execute and never reused, so the
+/// Execute that started a copy stays identifiable however the queue moves
+/// around it.
+type ExecuteId = u64;
+
+/// Whether a copy is in progress, and which Execute started it.
+///
+/// Only the read path can answer the first half — the CopyInResponse travels
+/// upstream→client — and only the queue can answer the second, which is why
+/// both live here. See [`SessionPortals::copy_data`].
+#[derive(Clone, Copy, Default)]
+enum CopyIn {
+    /// No copy in progress: every `d`/`c`/`f` frame is a stray.
+    #[default]
+    Idle,
+    /// A copy started by the Execute with this id, or by a simple-protocol
+    /// `COPY ... FROM STDIN`, which has no Execute at all (`None`).
+    Started(Option<ExecuteId>),
+}
 
 /// The statement a queued Describe is about: its name, to find the map entry,
 /// and its id, to confirm the entry is still the same incarnation.
@@ -255,27 +316,53 @@ enum Pending {
     /// this queue when the description arrives after the Execute was queued —
     /// which is the usual case, since a pipelined batch is fully on the wire
     /// before its first response comes back.
-    Execute { statement: Option<StatementId>, positions: Option<Positions> },
+    ///
+    /// `result_formats` comes from the Bind that created the portal, and is
+    /// captured here for the same reason: the portal may be closed or rebound
+    /// before its rows come back.
+    Execute {
+        /// Identifies *this* Execute among the ones queued. A copy is started
+        /// by one particular Execute, and the batch marker that has to be
+        /// dropped is the one that Execute queued behind it — not whichever
+        /// Execute happens to be last in a pipelined queue. See
+        /// [`SessionPortals::copy_data`].
+        id: ExecuteId,
+        statement: Option<StatementId>,
+        positions: Option<Positions>,
+        result_formats: ResultFormats,
+    },
     /// A Sync (or a simple Query), answered by ReadyForQuery. Marks the batch
     /// boundary the read path resynchronises on.
     Batch,
 }
 
+/// One bound portal: the statement it names, and how its Bind asked for the
+/// results to be encoded.
+struct Portal {
+    statement: Vec<u8>,
+    result_formats: ResultFormats,
+}
+
 #[derive(Default)]
 struct Tracked {
     statements: HashMap<Vec<u8>, Statement>,
-    /// Portal name → the statement it was bound to.
-    portals: HashMap<Vec<u8>, Vec<u8>>,
+    /// Portal name → the statement it was bound to, with that Bind's result
+    /// formats.
+    portals: HashMap<Vec<u8>, Portal>,
     pending: VecDeque<Pending>,
     /// Source of [`StatementId`]s. Monotonic for the life of the session, so
     /// an id is never reused and a stale reference can only fail to match.
     next_statement_id: StatementId,
+    /// Source of [`ExecuteId`]s, monotonic for the life of the session for the
+    /// same reason.
+    next_execute_id: ExecuteId,
     /// Whether the backend has answered with a CopyInResponse (or a
     /// CopyBothResponse) that no CopyDone/CopyFail or ReadyForQuery has
-    /// finished yet. Only the read path can know this — the response travels
-    /// upstream→client — which is why it lives here rather than in the write
-    /// path that consumes it. See [`Self::copy_data`].
-    copy_in: bool,
+    /// finished yet, and which Execute it answered. Only the read path can know
+    /// this — the response travels upstream→client — which is why it lives here
+    /// rather than in the write path that consumes it. See
+    /// [`SessionPortals::copy_data`].
+    copy_in: CopyIn,
 }
 
 /// One session's extended-protocol state, shared by its two relay tasks.
@@ -322,14 +409,24 @@ impl SessionPortals {
     /// Binds a portal to a statement and returns what Bind must do to the
     /// parameters, or `None` for a statement this session never parsed (the
     /// server will reject the Bind itself).
-    pub fn bind(&self, portal: &[u8], statement: &[u8]) -> Result<Option<ParamTransforms>, Error> {
+    ///
+    /// `result_formats` is recorded even in that case: it is what the read
+    /// path decodes this portal's row keys with, and it is knowable only here.
+    pub fn bind(
+        &self,
+        portal: &[u8],
+        statement: &[u8],
+        result_formats: ResultFormats,
+    ) -> Result<Option<ParamTransforms>, Error> {
         check_name("portal", portal)?;
         check_name("prepared statement", statement)?;
         let mut tracked = self.tracked();
         if !tracked.portals.contains_key(portal) && tracked.portals.len() >= MAX_PORTALS {
             return Err(Error::SessionLimit { what: "portals", limit: MAX_PORTALS });
         }
-        tracked.portals.insert(portal.to_vec(), statement.to_vec());
+        tracked
+            .portals
+            .insert(portal.to_vec(), Portal { statement: statement.to_vec(), result_formats });
         Ok(tracked.statements.get(statement).map(|statement| statement.params.clone()))
     }
 
@@ -338,7 +435,7 @@ impl SessionPortals {
     pub fn close_statement(&self, statement: &[u8]) {
         let mut tracked = self.tracked();
         tracked.statements.remove(statement);
-        tracked.portals.retain(|_, bound| bound != statement);
+        tracked.portals.retain(|_, bound| bound.statement != statement);
     }
 
     pub fn close_portal(&self, portal: &[u8]) {
@@ -353,7 +450,7 @@ impl SessionPortals {
             Target::Statement => Some(name.to_vec()),
             // A portal describes the statement it was bound to: every portal
             // of one statement returns the same columns.
-            Target::Portal => tracked.portals.get(name).cloned(),
+            Target::Portal => tracked.portals.get(name).map(|portal| portal.statement.clone()),
         };
         let statement = name.and_then(|name| {
             let id = tracked.statements.get(&name)?.id;
@@ -371,16 +468,18 @@ impl SessionPortals {
     /// rows already in flight for it.
     pub fn expect_execute(&self, portal: &[u8]) -> Result<(), Error> {
         let mut tracked = self.tracked();
-        let statement = tracked
-            .portals
-            .get(portal)
-            .and_then(|name| tracked.statements.get(name))
+        let bound = tracked.portals.get(portal);
+        let result_formats = bound.map(|portal| portal.result_formats.clone()).unwrap_or_default();
+        let statement = bound
+            .and_then(|portal| tracked.statements.get(&portal.statement))
             .map(|statement| (statement.id, statement.described.clone()));
         let (statement, positions) = match statement {
             Some((id, described)) => (Some(id), described),
             None => (None, None),
         };
-        push(&mut tracked, Pending::Execute { statement, positions })
+        let id = tracked.next_execute_id;
+        tracked.next_execute_id += 1;
+        push(&mut tracked, Pending::Execute { id, statement, positions, result_formats })
     }
 
     /// The backend answered with CopyInResponse or CopyBothResponse: from here
@@ -390,8 +489,21 @@ impl SessionPortals {
     /// Observed by the *read* path, because that is the direction the response
     /// travels in. The write path cannot tell a payload frame from a stray one
     /// on its own — see [`Self::copy_data`].
+    ///
+    /// This is also the only moment at which the Execute that started the copy
+    /// is unambiguous: the read path consumes expectations in order, so the
+    /// entry this response answers is the one at the front of the queue. It is
+    /// recorded now rather than inferred later, when a pipelined batch behind
+    /// the copy has already made "the last Execute" mean something else. A
+    /// simple-protocol `COPY ... FROM STDIN` has no Execute at all, which is
+    /// recorded as such.
     pub fn copy_in_started(&self) {
-        self.tracked().copy_in = true;
+        let mut tracked = self.tracked();
+        let execute = match tracked.pending.front() {
+            Some(Pending::Execute { id, .. }) => Some(*id),
+            _ => None,
+        };
+        tracked.copy_in = CopyIn::Started(execute);
     }
 
     /// The client sent `CopyData`, `CopyDone` or `CopyFail` (`msg_type` is
@@ -406,9 +518,14 @@ impl SessionPortals {
     /// then on every expectation is one response behind — which surfaces as a
     /// DataRow the read path cannot attribute to any portal.
     ///
-    /// Only markers queued after the Execute that started the copy are
-    /// dropped. A simple-protocol `COPY ... FROM STDIN` has no Execute and its
-    /// ReadyForQuery is not skipped, so its marker stays.
+    /// Only the markers of the copy's *own* batch are dropped: the run of
+    /// `Batch` entries immediately behind the Execute that started the copy,
+    /// which [`Self::copy_in_started`] recorded by id. Locating that Execute as
+    /// "the last one in the queue" instead was wrong for exactly the shape this
+    /// guards — a client that pipelines a second batch behind the copy, whose
+    /// Execute is the later one, so the marker dropped was that batch's and the
+    /// copy's own stayed. A simple-protocol `COPY ... FROM STDIN` has no
+    /// Execute and its ReadyForQuery is not skipped, so its marker stays.
     ///
     /// **Outside copy mode nothing here moves.** PostgreSQL discards `d`/`c`/
     /// `f` received outside a copy silently — no ErrorResponse, no
@@ -421,23 +538,26 @@ impl SessionPortals {
     /// refusal of its own session (SEC-33).
     pub fn copy_data(&self, msg_type: u8) {
         let mut tracked = self.tracked();
-        if !tracked.copy_in {
+        let CopyIn::Started(started_by) = tracked.copy_in else {
             return;
-        }
+        };
         // CopyDone/CopyFail end the copy: the backend leaves copy-in mode and
         // answers the Execute, so it is no longer skipping anything.
         if msg_type != COPY_DATA {
-            tracked.copy_in = false;
+            tracked.copy_in = CopyIn::Idle;
         }
-        let Some(execute) =
-            tracked.pending.iter().rposition(|p| matches!(p, Pending::Execute { .. }))
+        let Some(started_by) = started_by else {
+            return;
+        };
+        let Some(execute) = tracked
+            .pending
+            .iter()
+            .position(|p| matches!(p, Pending::Execute { id, .. } if *id == started_by))
         else {
             return;
         };
-        while tracked.pending.len() > execute + 1
-            && matches!(tracked.pending.back(), Some(Pending::Batch))
-        {
-            tracked.pending.pop_back();
+        while matches!(tracked.pending.get(execute + 1), Some(Pending::Batch)) {
+            tracked.pending.remove(execute + 1);
         }
     }
 
@@ -474,7 +594,7 @@ impl SessionPortals {
             }
         }
         for pending in &mut tracked.pending {
-            if let Pending::Execute { statement: Some(queued), positions: slot } = pending {
+            if let Pending::Execute { statement: Some(queued), positions: slot, .. } = pending {
                 if *queued == id && slot.is_none() {
                     *slot = Some(positions.clone());
                 }
@@ -512,10 +632,13 @@ impl SessionPortals {
     /// in flight for it unattributable.
     pub fn row_source(&self) -> RowSource {
         let tracked = self.tracked();
-        let Some(Pending::Execute { positions, .. }) = tracked.pending.front() else {
+        let Some(Pending::Execute { positions, result_formats, .. }) = tracked.pending.front()
+        else {
             return RowSource::LastDescription;
         };
-        positions.clone().map_or(RowSource::Undescribed, RowSource::Portal)
+        positions.clone().map_or(RowSource::Undescribed, |positions| {
+            RowSource::Portal(positions, result_formats.clone())
+        })
     }
 
     /// A result set ended: CommandComplete, PortalSuspended or
@@ -536,7 +659,7 @@ impl SessionPortals {
         // one message copy-in suppresses. This is the backstop for a copy that
         // ended some other way — an ErrorResponse mid-payload, a CopyDone the
         // proxy never saw because the client pipelined past it.
-        tracked.copy_in = false;
+        tracked.copy_in = CopyIn::Idle;
         while let Some(pending) = tracked.pending.pop_front() {
             if matches!(pending, Pending::Batch) {
                 break;
@@ -585,9 +708,9 @@ mod tests {
         portals.expect_describe(Target::Statement, b"s2").unwrap();
         portals.describe_answered(&positions(0));
 
-        portals.bind(b"", b"s1").unwrap();
+        portals.bind(b"", b"s1", ResultFormats::default()).unwrap();
         portals.expect_execute(b"").unwrap();
-        let RowSource::Portal(found) = portals.row_source() else {
+        let RowSource::Portal(found, _) = portals.row_source() else {
             panic!("s1's own description must be used");
         };
         assert_eq!(found.columns().len(), 2);
@@ -597,7 +720,7 @@ mod tests {
     fn an_execute_of_an_undescribed_statement_reports_undescribed() {
         let portals = portals();
         portals.parse(b"s1", ParamTransforms::default()).unwrap();
-        portals.bind(b"p", b"s1").unwrap();
+        portals.bind(b"p", b"s1", ResultFormats::default()).unwrap();
         portals.expect_execute(b"p").unwrap();
         assert!(matches!(portals.row_source(), RowSource::Undescribed));
         portals.execute_answered();
@@ -606,7 +729,7 @@ mod tests {
         portals.expect_describe(Target::Portal, b"p").unwrap();
         portals.describe_answered(&positions(1));
         portals.expect_execute(b"p").unwrap();
-        assert!(matches!(portals.row_source(), RowSource::Portal(_)));
+        assert!(matches!(portals.row_source(), RowSource::Portal(..)));
         portals.execute_answered();
 
         // Re-parsing the name invalidates the description it had.
@@ -627,7 +750,7 @@ mod tests {
     fn ready_for_query_drops_only_the_batch_that_ended() {
         let portals = portals();
         portals.parse(b"s1", ParamTransforms::default()).unwrap();
-        portals.bind(b"", b"s1").unwrap();
+        portals.bind(b"", b"s1", ResultFormats::default()).unwrap();
         // Batch 1 fails at Parse: its Describe and Execute never get answered.
         portals.expect_describe(Target::Statement, b"s1").unwrap();
         portals.expect_execute(b"").unwrap();
@@ -655,7 +778,7 @@ mod tests {
     fn a_sync_the_backend_ignores_during_copy_in_does_not_stay_queued() {
         let portals = portals();
         portals.parse(b"c", ParamTransforms::default()).unwrap();
-        portals.bind(b"", b"c").unwrap();
+        portals.bind(b"", b"c", ResultFormats::default()).unwrap();
         portals.expect_execute(b"").unwrap();
         portals.expect_batch().unwrap(); // ignored by the backend
         portals.copy_in_started(); // the CopyInResponse the read path saw
@@ -671,7 +794,47 @@ mod tests {
         portals.expect_describe(Target::Statement, b"c").unwrap();
         portals.describe_answered(&positions(1));
         portals.expect_execute(b"").unwrap();
-        assert!(matches!(portals.row_source(), RowSource::Portal(_)));
+        assert!(matches!(portals.row_source(), RowSource::Portal(..)));
+    }
+
+    /// A client may pipeline a whole second batch behind the copy's Execute.
+    /// Only the copy's own marker is ignored by the backend, so only that one
+    /// may be dropped: locating the copy by "the last Execute in the queue"
+    /// found the *second* batch's Execute and dropped that batch's marker
+    /// instead, leaving the copy's marker to absorb a ReadyForQuery that was
+    /// never coming and every response behind it one expectation out.
+    #[test]
+    fn a_batch_pipelined_behind_a_copy_keeps_its_own_marker() {
+        let portals = portals();
+        portals.parse(b"c", ParamTransforms::default()).unwrap();
+        portals.bind(b"", b"c", ResultFormats::default()).unwrap();
+        portals.expect_execute(b"").unwrap(); // COPY ... FROM STDIN
+        portals.expect_batch().unwrap(); // ignored by the backend
+
+        // A second batch, on the wire before the CopyInResponse came back.
+        portals.parse(b"s", ParamTransforms::default()).unwrap();
+        portals.bind(b"p", b"s", ResultFormats::default()).unwrap();
+        portals.expect_describe(Target::Portal, b"p").unwrap();
+        portals.expect_execute(b"p").unwrap();
+        portals.expect_batch().unwrap();
+
+        portals.copy_in_started();
+        portals.copy_data(COPY_DATA);
+
+        // The copy's own marker is the one that went; the second batch is
+        // untouched, so once the copy's CommandComplete settles its Execute
+        // that batch's description still lands on its own Execute.
+        portals.execute_answered();
+        portals.describe_answered(&positions(2));
+        let RowSource::Portal(found, _) = portals.row_source() else {
+            panic!("the batch pipelined behind the copy must keep its expectations");
+        };
+        assert_eq!(found.columns().len(), 2);
+
+        // ...and its marker is still there to absorb its own ReadyForQuery.
+        portals.execute_answered();
+        portals.batch_answered();
+        assert!(matches!(portals.row_source(), RowSource::LastDescription));
     }
 
     /// A simple-protocol `COPY ... FROM STDIN` has no Execute: its
@@ -701,7 +864,7 @@ mod tests {
             portals.copy_data(stray);
         }
         portals.parse(b"s1", ParamTransforms::default()).unwrap();
-        portals.bind(b"p", b"s1").unwrap();
+        portals.bind(b"p", b"s1", ResultFormats::default()).unwrap();
         portals.expect_describe(Target::Portal, b"p").unwrap();
         portals.expect_execute(b"p").unwrap();
         portals.expect_batch().unwrap();
@@ -711,7 +874,7 @@ mod tests {
 
         // The batch is intact: its Describe still lands on its own Execute...
         portals.describe_answered(&positions(2));
-        let RowSource::Portal(found) = portals.row_source() else {
+        let RowSource::Portal(found, _) = portals.row_source() else {
             panic!("a stray copy frame must not disturb this batch's expectations");
         };
         assert_eq!(found.columns().len(), 2);
@@ -721,7 +884,7 @@ mod tests {
         portals.expect_execute(b"p").unwrap();
         portals.expect_batch().unwrap();
         portals.batch_answered();
-        let RowSource::Portal(found) = portals.row_source() else {
+        let RowSource::Portal(found, _) = portals.row_source() else {
             panic!("the following batch's rows must still be attributed to its own statement");
         };
         assert_eq!(found.columns().len(), 2);
@@ -734,7 +897,7 @@ mod tests {
     fn copy_mode_ends_with_the_copy_and_a_later_sync_is_answered() {
         let portals = portals();
         portals.parse(b"c", ParamTransforms::default()).unwrap();
-        portals.bind(b"", b"c").unwrap();
+        portals.bind(b"", b"c", ResultFormats::default()).unwrap();
         portals.expect_execute(b"").unwrap();
         portals.expect_batch().unwrap(); // ignored by the backend
         portals.copy_in_started();
@@ -751,16 +914,16 @@ mod tests {
         portals.expect_describe(Target::Statement, b"c").unwrap();
         portals.describe_answered(&positions(1));
         portals.expect_execute(b"").unwrap();
-        assert!(matches!(portals.row_source(), RowSource::Portal(_)));
+        assert!(matches!(portals.row_source(), RowSource::Portal(..)));
     }
 
     #[test]
     fn closing_a_statement_forgets_it_and_its_portals() {
         let portals = portals();
         portals.parse(b"s1", ParamTransforms::default()).unwrap();
-        portals.bind(b"p", b"s1").unwrap();
+        portals.bind(b"p", b"s1", ResultFormats::default()).unwrap();
         portals.close_statement(b"s1");
-        assert!(portals.bind(b"p2", b"s1").unwrap().is_none());
+        assert!(portals.bind(b"p2", b"s1", ResultFormats::default()).unwrap().is_none());
         portals.expect_execute(b"p").unwrap();
         assert!(matches!(portals.row_source(), RowSource::Undescribed));
     }
@@ -777,7 +940,7 @@ mod tests {
         // Parse "s1" / Bind "p"→"s1" / Describe "p" / Execute "p" /
         // Close S "s1" / Sync.
         portals.parse(b"s1", ParamTransforms::default()).unwrap();
-        portals.bind(b"p", b"s1").unwrap();
+        portals.bind(b"p", b"s1", ResultFormats::default()).unwrap();
         portals.expect_describe(Target::Portal, b"p").unwrap();
         portals.expect_execute(b"p").unwrap();
         portals.close_statement(b"s1");
@@ -785,7 +948,7 @@ mod tests {
 
         // Only now do the responses arrive.
         portals.describe_answered(&positions(2));
-        let RowSource::Portal(found) = portals.row_source() else {
+        let RowSource::Portal(found, _) = portals.row_source() else {
             panic!("the description answered for this Execute must still reach it");
         };
         assert_eq!(found.columns().len(), 2);
@@ -797,14 +960,14 @@ mod tests {
     fn a_pipelined_portal_close_does_not_orphan_its_own_execute() {
         let portals = portals();
         portals.parse(b"s1", ParamTransforms::default()).unwrap();
-        portals.bind(b"p", b"s1").unwrap();
+        portals.bind(b"p", b"s1", ResultFormats::default()).unwrap();
         portals.expect_describe(Target::Portal, b"p").unwrap();
         portals.expect_execute(b"p").unwrap();
         portals.close_portal(b"p");
         portals.expect_batch().unwrap();
 
         portals.describe_answered(&positions(3));
-        let RowSource::Portal(found) = portals.row_source() else {
+        let RowSource::Portal(found, _) = portals.row_source() else {
             panic!("closing the portal must not orphan the rows already in flight");
         };
         assert_eq!(found.columns().len(), 3);
@@ -817,13 +980,13 @@ mod tests {
     fn a_reparse_mid_pipeline_does_not_inherit_the_previous_description() {
         let portals = portals();
         portals.parse(b"s1", ParamTransforms::default()).unwrap();
-        portals.bind(b"p", b"s1").unwrap();
+        portals.bind(b"p", b"s1", ResultFormats::default()).unwrap();
         portals.expect_describe(Target::Portal, b"p").unwrap();
 
         // The client re-parses the same name and executes the new statement
         // before reading the first Describe's answer.
         portals.parse(b"s1", ParamTransforms::default()).unwrap();
-        portals.bind(b"p", b"s1").unwrap();
+        portals.bind(b"p", b"s1", ResultFormats::default()).unwrap();
         portals.expect_execute(b"p").unwrap();
 
         portals.describe_answered(&positions(2));
@@ -840,7 +1003,7 @@ mod tests {
     fn an_execute_the_server_never_described_still_reports_undescribed() {
         let portals = portals();
         portals.parse(b"s1", ParamTransforms::default()).unwrap();
-        portals.bind(b"p", b"s1").unwrap();
+        portals.bind(b"p", b"s1", ResultFormats::default()).unwrap();
         portals.expect_execute(b"p").unwrap();
         portals.expect_batch().unwrap();
         assert!(matches!(portals.row_source(), RowSource::Undescribed));
@@ -861,7 +1024,7 @@ mod tests {
         let portals = portals();
         portals.parse(b"other", ParamTransforms::default()).unwrap();
         portals.parse(b"s1", ParamTransforms::default()).unwrap();
-        portals.bind(b"p", b"s1").unwrap();
+        portals.bind(b"p", b"s1", ResultFormats::default()).unwrap();
         portals
     }
 
@@ -873,7 +1036,10 @@ mod tests {
             portals.parse(&long, ParamTransforms::default()),
             Err(Error::NameTooLong { .. })
         ));
-        assert!(matches!(portals.bind(&long, b"s"), Err(Error::NameTooLong { .. })));
+        assert!(matches!(
+            portals.bind(&long, b"s", ResultFormats::default()),
+            Err(Error::NameTooLong { .. })
+        ));
 
         for i in 0..MAX_PREPARED_STATEMENTS {
             portals.parse(format!("s{i}").as_bytes(), ParamTransforms::default()).unwrap();

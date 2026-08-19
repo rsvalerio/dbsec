@@ -1012,67 +1012,39 @@ mod tests {
 
     /// Collects the level and fields of every event, so a log line an operator
     /// is told to look for is pinned like any other output.
-    #[derive(Clone, Default)]
-    struct CapturedLogs(std::sync::Arc<Mutex<Vec<(tracing::Level, String)>>>);
-
-    impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for CapturedLogs {
-        fn on_event(
-            &self,
-            event: &tracing::Event<'_>,
-            _ctx: tracing_subscriber::layer::Context<'_, S>,
-        ) {
-            struct Fields(String);
-            impl tracing::field::Visit for Fields {
-                fn record_debug(
-                    &mut self,
-                    field: &tracing::field::Field,
-                    value: &dyn std::fmt::Debug,
-                ) {
-                    self.0.push_str(&format!(" {}={value:?}", field.name()));
-                }
-            }
-            let mut fields = Fields(String::new());
-            event.record(&mut fields);
-            self.0.lock().expect("lock").push((*event.metadata().level(), fields.0));
-        }
-    }
-
     /// The migrated key stays readable at the old path too, so the operator
     /// who has to retire it must be able to see which names moved.
     ///
-    /// The capture guard is deliberately held across the `await`: the window
-    /// this test must have to itself is exactly the one in which the
-    /// subscriber is installed, and the work it is capturing happens inside
-    /// it. See [`crate::log_capture`].
-    #[allow(clippy::await_holding_lock)]
-    #[tokio::test]
-    async fn migrating_out_of_the_shared_map_warns_and_names_the_key() {
-        use tracing_subscriber::layer::SubscriberExt as _;
+    /// A plain `#[test]` driving its own runtime rather than `#[tokio::test]`:
+    /// [`crate::captured_events`] runs the work twice to prime the callsite,
+    /// which means handing it a closure it can call, not a future that can only
+    /// be awaited once. Each pass builds its own store, so the second migrates
+    /// a key that has not already moved.
+    #[test]
+    fn migrating_out_of_the_shared_map_warns_and_names_the_key() {
+        let runtime =
+            tokio::runtime::Builder::new_current_thread().enable_all().build().expect("runtime");
+        let (_, events) = crate::captured_events(|| {
+            // Built inside the runtime: `VaultKeySource` arms a timer as it is
+            // constructed, which needs a reactor in scope.
+            runtime.block_on(async {
+                let store = FakeStore::default();
+                *store.legacy.lock().expect("lock") =
+                    Some(HashMap::from([(NAME.to_owned(), hex::encode(STORED))]));
+                source(store).resolve_index_key(NAME).await.expect("adopts");
+            });
+        });
 
-        let _capture = crate::log_capture();
-        let store = FakeStore::default();
-        *store.legacy.lock().expect("lock") =
-            Some(HashMap::from([(NAME.to_owned(), hex::encode(STORED))]));
-        let keys = source(store);
-
-        let logs = CapturedLogs::default();
-        let guard =
-            tracing::subscriber::set_default(tracing_subscriber::registry().with(logs.clone()));
-        keys.resolve_index_key(NAME).await.expect("adopts");
-        drop(guard);
-
-        let captured = logs.0.lock().expect("lock");
-        let (level, fields) = captured
+        let event = events
             .iter()
-            .find(|(_, f)| f.contains("shared-map"))
-            .unwrap_or_else(|| panic!("the migration must announce itself: {captured:?}"));
-        assert_eq!(
-            *level,
-            tracing::Level::WARN,
-            "an unretired duplicate of key material is a warning"
+            .find(|event| event.contains("shared-map"))
+            .unwrap_or_else(|| panic!("the migration must announce itself: {events:?}"));
+        assert!(
+            event.starts_with("WARN"),
+            "an unretired duplicate of key material is a warning: {event}"
         );
-        assert!(fields.contains(NAME), "the migrated name is named: {fields}");
-        assert!(fields.contains("PLAN.md"), "and points at the cleanup procedure: {fields}");
+        assert!(event.contains(NAME), "the migrated name is named: {event}");
+        assert!(event.contains("PLAN.md"), "and points at the cleanup procedure: {event}");
     }
 
     #[test]
@@ -1241,28 +1213,23 @@ mod tests {
     /// it believed it did something.
     #[test]
     fn vault_skip_verify_can_neither_disable_verification_nor_pass_unreported() {
-        use tracing_subscriber::layer::SubscriberExt as _;
-
-        let logs = CapturedLogs::default();
-        let guard =
-            tracing::subscriber::set_default(tracing_subscriber::registry().with(logs.clone()));
-        let settings = client_settings(
-            &vault_config("https://bao.internal:8200"),
-            "t",
-            Duration::from_secs(5),
-            Some("false"),
-        )
-        .expect("settings build");
-        drop(guard);
+        let (settings, events) = crate::captured_events(|| {
+            client_settings(
+                &vault_config("https://bao.internal:8200"),
+                "t",
+                Duration::from_secs(5),
+                Some("false"),
+            )
+            .expect("settings build")
+        });
 
         assert!(settings.verify, "no environment variable may switch verification off");
-        let captured = logs.0.lock().expect("lock");
-        let (level, fields) = captured
+        let event = events
             .iter()
-            .find(|(_, f)| f.contains(SKIP_VERIFY_ENV))
-            .unwrap_or_else(|| panic!("the ignored override must be reported: {captured:?}"));
-        assert_eq!(*level, tracing::Level::WARN, "a defeated hardening attempt is a warning");
-        assert!(fields.contains("false"), "the value it was given is named: {fields}");
+            .find(|event| event.contains(SKIP_VERIFY_ENV))
+            .unwrap_or_else(|| panic!("the ignored override must be reported: {events:?}"));
+        assert!(event.starts_with("WARN"), "a defeated hardening attempt is a warning: {event}");
+        assert!(event.contains("false"), "the value it was given is named: {event}");
     }
 
     /// `VaultClientSettingsBuilder::address` is documented "# Panics". Nothing

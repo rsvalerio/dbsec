@@ -3,11 +3,11 @@ id: TASK-0154
 title: >-
   SEC-31: an untracked FunctionCall desyncs the pending queue and relays a later
   statement's stored bytes
-status: To Do
+status: Done
 assignee:
   - TASK-0179
 created_date: '2026-08-19 08:28'
-updated_date: '2026-08-19 09:01'
+updated_date: '2026-08-19 10:01'
 labels:
   - code-review-rust
   - protocol
@@ -43,6 +43,6 @@ frame. `'F'` is the one client message that owes a ReadyForQuery and is not reco
 
 ## Acceptance Criteria
 <!-- AC:BEGIN -->
-- [ ] #1 'F' either records a Pending::Batch so its ReadyForQuery settles its own marker, or is refused outright, consistently with 'V'
-- [ ] #2 A test pipelines FunctionCall ahead of a Parse/Describe/Bind/Execute/Sync batch and asserts the batch's RowDescription lands on its own Execute
+- [x] #1 'F' either records a Pending::Batch so its ReadyForQuery settles its own marker, or is refused outright, consistently with 'V'
+- [x] #2 A test pipelines FunctionCall ahead of a Parse/Describe/Bind/Execute/Sync batch and asserts the batch's RowDescription lands on its own Execute
 <!-- AC:END -->

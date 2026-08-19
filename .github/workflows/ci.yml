@@ -9,6 +9,28 @@ jobs:
   rust:
     uses: rsvalerio/forge/.github/workflows/rust-ci.yml@v1
 
+  # Not in the shared `rust-ci` workflow, which runs fmt, check, clippy, build,
+  # test and deny — all of them compiler lints. `broken_intra_doc_links = "deny"`
+  # is a rustdoc lint and fires only during a documentation build, so without
+  # this job it is enforced by whoever happens to run `cargo doc` locally. The
+  # links it was added to fix accumulated for exactly that reason.
+  docs:
+    name: Docs
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # `cargo doc` runs build scripts and proc macros, and a checkout
+          # leaves GITHUB_TOKEN in .git/config unless told not to.
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: cargo doc
+        run: cargo doc --no-deps --document-private-items --all-features
+
   # The reusable workflows above follow forge automatically because they are
   # referenced by tag; the config files copied out of forge do not. This job is
   # what makes "keep in sync" a checked claim rather than a remembered one.
@@ -20,4 +42,6 @@ jobs:
       contents: read
     steps:
       - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
       - run: ./scripts/forge-sync-check.sh

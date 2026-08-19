@@ -122,6 +122,15 @@ unused_qualifications = "deny"
 unused_lifetimes = "deny"
 unused_macro_rules = "deny"
 
+# rustdoc lints. `cargo doc` is where the module-level prose in `encrypt/` is
+# actually read as one document, and a broken `[`Item`]` there is a silent loss:
+# the reasoning about why a site is or is not an `Unprotected` hole is spread
+# across sibling modules, and the links are how a reviewer walks from one half
+# of that argument to the other. `deny` so the next module move fails the doc
+# build instead of quietly unlinking the prose.
+[workspace.lints.rustdoc]
+broken_intra_doc_links = "deny"
+
 [workspace.lints.clippy]
 all = { level = "deny", priority = -1 }
 # Debugging and placeholder leftovers: cheap to keep out, expensive to find in a

@@ -72,28 +72,95 @@ row_key = "id"      # unique per row: a primary key, or a unique column
 
 With that, a value copied from one row's `users.ssn` into another row's
 `users.ssn` no longer decrypts. It is opt-in because it constrains the SQL the
-table can take, and each constraint is a refusal rather than a silent
-degradation:
+table can take. **Almost every write-path constraint below is an
+`on_unprotected` site**, so it follows that setting rather than being an
+unconditional refusal: on the default `warn` the statement is logged — one
+warning naming the table and the row key — and relayed, and only `reject`
+answers the client with an ErrorResponse. Two are not, and both say so where
+they are described: a row key bound as an unusable parameter refuses that one
+statement under either setting, and read-path verification is never relaxed.
 
-- **Client-generated keys only.** `INSERT` must carry `id` in its column list.
-  A `serial` key does not exist yet when the proxy rewrites the statement, so
-  there is nothing to seal the value against.
+- **Client-generated keys only.** `INSERT` must carry `id` in its column list,
+  and its value must be a literal or a bound parameter. A `serial` key does not
+  exist yet when the proxy rewrites the statement, so there is nothing to seal
+  the value against. Refused under `reject`; under `warn` the row's protected
+  columns are sealed cell-only, which is the binding the table had before it
+  declared a row key — never plaintext.
 - **Single-row updates.** `UPDATE users SET ssn = $1 WHERE id = $2` is fine;
-  `WHERE dept = 'x'` is refused. One bound parameter cannot become a different
-  ciphertext for every matching row.
+  `WHERE dept = 'x'` is a site — refused under `reject`, and under `warn`
+  sealed cell-only, which is the binding the table had before it declared a row
+  key. One bound parameter cannot become a different ciphertext for every
+  matching row. The key has to be named on the table being written, so with an
+  `UPDATE ... FROM other`, qualify it: `WHERE u.id = $2`.
+- **The row key is immutable once a row holds a protected value.** An `UPDATE`
+  that assigns `id` moves the row out from under the key its values are sealed
+  against, and they never open again — so a statement that writes both `id` and
+  a protected column of the same table is a site too. That is only the case the
+  proxy can see: changing `id` on its own is reported by nothing and still
+  orphans every value already stored in that row. Re-encrypt the row's protected
+  columns in the same transaction if the key really has to move.
+- **Upserts conflict on the key.** `INSERT … ON CONFLICT (id) DO UPDATE SET ssn
+  = $2` is fine: the conflicting row is the row with that `id`. `ON CONFLICT
+  (email)`, `ON CONFLICT ON CONSTRAINT …` and a multi-row `VALUES` list are
+  sites, because the row the action updates may carry any key at all.
+- **A row key bound as a parameter has to be usable.** A NULL `$2`, a text key
+  that is not UTF-8, or a binary integer of the wrong width refuses that one
+  statement with an ErrorResponse under either setting — the session carries on
+  — because there is no "warn and relay" answer that is not a write bound to
+  the wrong row or to none.
 - **Reads must project the key.** `SELECT ssn FROM users WHERE id = $1` does not
-  return `id`, so it cannot be verified; select `id` too.
+  return `id`, so it cannot be verified; select `id` too. Unlike the write-path
+  sites this is an unconditional refusal (SQLSTATE 42501): the alternative is
+  handing the client a stored value the proxy could not verify.
+- **Once per result set.** A self-join projects `id` twice, and the wire
+  protocol identifies a result column by table OID and attribute number, which
+  are identical for both instances of the table. `SELECT a.id, a.ssn, b.id,
+  b.ssn FROM users a JOIN users b ...` is refused rather than opened against
+  whichever `id` came first; query each instance separately. An unconditional
+  refusal too, for the same reason.
+
+  Projecting the key *once* — `SELECT a.id, a.ssn, b.ssn` — is the same problem
+  seen from the other side, and it is not detectable in advance: it describes
+  identically to `SELECT id, ssn, ssn FROM users`, where both fields do name the
+  same row and open correctly. So it is not refused on sight. The values are
+  opened, and if one cannot authenticate against the single key on offer the
+  refusal names the table and says to query each instance separately. The
+  message also carries the other reading — a value that really does belong to
+  another row — because at that point the two are indistinguishable.
 
 The key column must be a type the proxy can canonicalise — integer, text or
 uuid — and must not itself be protected. Both are refused at startup, naming the
-column. Only `transform = "encrypt"` binds a row: `fpe` and `token` store the
-same bytes for a plaintext in every row by design, which is what makes them
-searchable, so a `row_key` on a table with no encrypt column is refused rather
-than left looking like coverage.
+column. `char(n)` is not one of them: the server blank-pads it on output and the
+client does not on input, so `'abc'` would seal against one form and read back as
+the other. The key's *value* is what binds, not the spelling it was written in —
+`0007`, `+7` and `7` are the same row, as are an upper-case, braced or
+unhyphenated `uuid`. Only `transform = "encrypt"` binds a row: `fpe` and `token`
+store the same bytes for a plaintext in every row by design, which is what makes
+them searchable, so a `row_key` on a table with no encrypt column is refused
+rather than left looking like coverage.
 
 Adopting it needs no migration. Values written before the change keep opening —
 the stored value decides which binding verifies it — so re-encrypt only when you
 want the row binding to be retroactive.
+
+That tolerance is a migration window, not a permanent setting. While it is open,
+a value carrying no row binding is accepted in a row-bound column, and nothing in
+the stored bytes says whether it predates the `row_key` or came from a write that
+could not name its row — an upsert branch, or an `UPDATE` the proxy warned about
+under `on_unprotected = "warn"`. Either way the result is a ciphertext that can
+be copied between rows of that column undetected, for as long as the DEK lives.
+Close the window once the table's older values have been re-encrypted:
+
+```toml
+[[table]]
+table              = "users"
+row_key            = "id"
+strict_row_binding = true   # a value with no row binding is refused on read
+```
+
+The refusal reaches the client as the same ErrorResponse a missing row key
+carries, and names the remedy. Turn it back off for the duration if a migration
+has to be re-run.
 
 **Identifier names** — a `[[column]]` name is the name the catalog holds. SQL
 identifiers are folded the way PostgreSQL folds them before they are compared
