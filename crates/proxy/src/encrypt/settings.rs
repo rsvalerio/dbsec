@@ -220,7 +220,7 @@ mod tests {
     use dbsec_core::blind_index;
 
     use crate::encrypt::lexer::parse_sql;
-    use crate::encrypt::tests::*;
+    use crate::encrypt::test_support::*;
     use crate::encrypt::{QueryRewriter, StartupSettings};
     use crate::portal::SessionPortals;
     use crate::session::FrameAction;

@@ -421,7 +421,7 @@ mod tests {
     use crate::columns::ProtectedColumn;
 
     use crate::config::OnUnprotected;
-    use crate::encrypt::tests::*;
+    use crate::encrypt::test_support::*;
     use crate::encrypt::unprotected::Unprotected;
     use crate::encrypt::WriteCatalog;
     use crate::rows::tests::transform;

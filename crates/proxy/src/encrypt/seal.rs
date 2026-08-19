@@ -646,7 +646,7 @@ mod tests {
     use dbsec_core::{blind_index, pgwire};
 
     use crate::config::OnUnprotected;
-    use crate::encrypt::tests::*;
+    use crate::encrypt::test_support::*;
     use crate::encrypt::WriteCatalog;
     use crate::rows::tests::transform;
     use crate::session::FrameAction;

@@ -3,9 +3,10 @@ id: TASK-0188
 title: >-
   ARCH: encrypt/mod.rs still carries a 1,600-line end-to-end test module after
   the layer split
-status: Triage
+status: Done
 assignee: []
 created_date: '2026-08-19 10:39'
+updated_date: '2026-08-19 13:03'
 labels:
   - code-review-rust
   - architecture
@@ -45,6 +46,6 @@ through would finish the job.
 
 ## Acceptance Criteria
 <!-- AC:BEGIN -->
-- [ ] #1 The shared test helpers live in their own module rather than alongside the suite
-- [ ] #2 Each end-to-end test sits in the module whose entry point it drives, or in a named integration test module
+- [x] #1 The shared test helpers live in their own module rather than alongside the suite
+- [x] #2 Each end-to-end test sits in the module whose entry point it drives, or in a named integration test module
 <!-- AC:END -->
