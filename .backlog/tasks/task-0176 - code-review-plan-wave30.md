@@ -1,11 +1,11 @@
 ---
 id: TASK-0176
 title: code-review-plan-wave30
-status: To Do
+status: Done
 assignee:
   - code-review-wave
 created_date: '2026-08-19 08:59'
-updated_date: '2026-08-19 09:00'
+updated_date: '2026-08-19 09:55'
 labels:
   - code-review-wave
 dependencies:
@@ -27,4 +27,6 @@ code-review-plan-wave30
 
 <!-- SECTION:NOTES:BEGIN -->
 Overlaps: TASK-0174 (wave28: crates/proxy/src/rowkey.rs, crates/proxy/src/rows.rs); TASK-0175 (wave29: crates/proxy/src/rowkey.rs, crates/proxy/src/rows.rs); TASK-0177 (wave31: crates/proxy/src/rowkey.rs, crates/proxy/src/rows.rs); TASK-0179 (wave33: crates/proxy/src/portal.rs, crates/proxy/src/rows.rs); TASK-0180 (wave34: crates/proxy/src/portal.rs); TASK-0183 (wave37: crates/proxy/src/rows.rs)
+
+Branch: code-review/TASK-0176
 <!-- SECTION:NOTES:END -->
