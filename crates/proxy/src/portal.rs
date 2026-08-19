@@ -157,8 +157,12 @@ pub enum RowKeySource {
     Literal(RowKey),
     /// The row key is another placeholder, canonicalised at Bind from that
     /// parameter's bytes. The type is carried because those bytes cannot be
-    /// interpreted without it (see `crate::rowkey`).
-    Param { index: usize, type_oid: u32 },
+    /// interpreted without it (see `crate::rowkey`), and the column name
+    /// because canonicalising the client's own bytes can fail — a NULL key,
+    /// non-UTF-8 text, a wrong-width integer — and the refusal that follows is
+    /// only actionable if it says which column the placeholder was supposed to
+    /// be naming a row with.
+    Param { index: usize, type_oid: u32, column: Arc<str> },
 }
 
 impl ParamAction {

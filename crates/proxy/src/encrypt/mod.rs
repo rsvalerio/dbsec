@@ -151,6 +151,7 @@ use std::collections::HashSet;
 use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::Arc;
 
+use dbsec_core::envelope::RowKey;
 use dbsec_core::pgwire;
 use dbsec_core::transform::{FieldTransform, WireForm};
 use sqlparser::ast::{
@@ -224,6 +225,46 @@ fn record_param(
             "dbsec refused this statement: placeholder ${placeholder} feeds two protected \
              positions that need different values, and a Bind carries one value per \
              placeholder; give each position its own placeholder"
+        ))),
+        Err(other) => Err(Rejection::Fatal(Box::new(other))),
+    }
+}
+
+/// The row key one sealed parameter binds to, resolved from the Bind that
+/// carries it.
+///
+/// [`RowKeySource::Param`] is the only arm with work to do: the key is another
+/// parameter of this same Bind, so its bytes exist only now. Canonicalising
+/// them reads *client input* — a NULL, a text body that is not UTF-8, a binary
+/// integer of the wrong width, an undefined format code — and every one of
+/// those is ordinary, well-formed traffic that a client can send by accident.
+///
+/// Propagating them as [`Error`] closed the connection with no ErrorResponse,
+/// which is the regression [`record_param`] was written to remove two lines
+/// away in the same function: a session torn down over well-formed SQL, and
+/// under a connection pool the retry killing the next connection too. They are
+/// statement-level refusals for the same reason every other Bind-time refusal
+/// is — nothing has gone upstream, so the statement can be refused and the
+/// session kept.
+fn bind_row_key(
+    row: &RowKeySource,
+    bind: &pgwire::BindMessage<'_>,
+) -> Result<Option<RowKey>, Rejection> {
+    let (index, type_oid, column) = match row {
+        RowKeySource::None => return Ok(None),
+        RowKeySource::Literal(key) => return Ok(Some(key.clone())),
+        RowKeySource::Param { index, type_oid, column } => (*index, *type_oid, column),
+    };
+    let resolved = rowkey::Format::from_code(bind.param_format(index)).and_then(|format| {
+        rowkey::canonical(type_oid, format, bind.params.get(index).copied().flatten())
+    });
+    match resolved {
+        Ok(key) => Ok(Some(key)),
+        Err(Error::RowKeyType(why)) => Err(Rejection::Refused(format!(
+            "dbsec refused this statement: placeholder ${} supplies the row key {column} that \
+             this statement's protected values are sealed against, but {why}; bind a usable \
+             {column} for the row being written",
+            index.saturating_add(1)
         ))),
         Err(other) => Err(Rejection::Fatal(Box::new(other))),
     }
@@ -570,16 +611,16 @@ impl QueryRewriter {
             let Some(Some(value)) = values.get_mut(*index) else { continue };
             let replacement = match action {
                 ParamAction::Seal { transform, row } => {
-                    let key = match row {
-                        RowKeySource::None => None,
-                        RowKeySource::Literal(key) => Some(key.clone()),
-                        // The key is another parameter of this same Bind, so
-                        // its bytes exist only now.
-                        RowKeySource::Param { index, type_oid } => {
-                            let format = rowkey::Format::from_code(bind.param_format(*index))?;
-                            let raw = bind.params.get(*index).copied().flatten();
-                            Some(rowkey::canonical(*type_oid, format, raw)?)
+                    let key = match bind_row_key(row, &bind) {
+                        Ok(key) => key,
+                        // Same shape as a refused Parse: nothing has gone
+                        // upstream, so the proxy owns the batch until Sync and
+                        // the session carries on.
+                        Err(Rejection::Refused(message)) => {
+                            self.awaiting_sync = true;
+                            return Ok(FrameAction::Reply(error_response(&message)));
                         }
+                        Err(Rejection::Fatal(error)) => return Err(*error),
                     };
                     encode_param(transform.seal(value, key.as_ref())?, transform.wire(), binary)
                 }
@@ -3201,7 +3242,7 @@ mod tests {
         // Under warn the same statements relay, each with one warning naming
         // the table — and a query over nothing protected stays silent.
         let _capture = crate::log_capture();
-        let captured = CapturedEvents::default();
+        let captured = crate::CapturedEvents::default();
         let subscriber = tracing_subscriber::registry().with(captured.clone());
         tracing::subscriber::with_default(subscriber, || {
             let mut permissive = rewriter(catalog(false));
@@ -3216,7 +3257,7 @@ mod tests {
             }
         });
 
-        let events = captured.0.lock().expect("captured events");
+        let events = captured.events();
         assert_eq!(events.len(), statements.len(), "one warning each: {events:?}");
         for event in events.iter() {
             assert!(event.contains("read path cannot decrypt or mask"), "{event}");
@@ -3263,7 +3304,7 @@ mod tests {
         // Under warn the reads relay with one warning each, naming the table,
         // and the write stays silent.
         let _capture = crate::log_capture();
-        let captured = CapturedEvents::default();
+        let captured = crate::CapturedEvents::default();
         let subscriber = tracing_subscriber::registry().with(captured.clone());
         tracing::subscriber::with_default(subscriber, || {
             let mut permissive = rewriter(mask_only_catalog(OnUnprotected::Warn));
@@ -3278,7 +3319,7 @@ mod tests {
             }
         });
 
-        let events = captured.0.lock().expect("captured events");
+        let events = captured.events();
         assert_eq!(events.len(), out.len(), "one warning per read, none for the write: {events:?}");
         for event in events.iter() {
             assert!(event.contains("notes"), "{event}");
@@ -4476,35 +4517,6 @@ mod tests {
         assert!(!expr_shape(expr).contains("a@b.io"));
     }
 
-    /// Everything the write path emits while it is the active subscriber, one
-    /// string per event. Asserting on the code's *shape* is not enough here:
-    /// the claim is about what reaches the log, so the test reads the log.
-    #[derive(Clone, Default)]
-    struct CapturedEvents(Arc<std::sync::Mutex<Vec<String>>>);
-
-    impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for CapturedEvents {
-        fn on_event(
-            &self,
-            event: &tracing::Event<'_>,
-            _ctx: tracing_subscriber::layer::Context<'_, S>,
-        ) {
-            struct Fields<'a>(&'a mut String);
-            impl tracing::field::Visit for Fields<'_> {
-                fn record_debug(
-                    &mut self,
-                    field: &tracing::field::Field,
-                    value: &dyn std::fmt::Debug,
-                ) {
-                    use std::fmt::Write as _;
-                    let _ = write!(self.0, " {}={value:?}", field.name());
-                }
-            }
-            let mut line = String::new();
-            event.record(&mut Fields(&mut line));
-            self.0.lock().expect("captured events").push(line);
-        }
-    }
-
     /// Every passthrough site, driven with a distinct plaintext, and then the
     /// whole log grepped for those plaintexts. Each of these values is bound
     /// to a protected column or embedded in SQL the parser choked on, so any
@@ -4515,7 +4527,7 @@ mod tests {
         use tracing_subscriber::layer::SubscriberExt as _;
 
         let _capture = crate::log_capture();
-        let captured = CapturedEvents::default();
+        let captured = crate::CapturedEvents::default();
         let subscriber = tracing_subscriber::registry().with(captured.clone());
         tracing::subscriber::with_default(subscriber, || {
             // The ambiguity site needs two protected relations in scope, so it
@@ -4560,7 +4572,7 @@ mod tests {
             ));
         });
 
-        let events = captured.0.lock().unwrap().join("\n");
+        let events = captured.events().join("\n");
         assert!(events.contains("passing through unencrypted"), "the sites did emit: {events}");
         for plaintext in [
             "alice", "bob", "carol", "dave", "erin", "fred", "gina", "hank", "ivan", "judy",

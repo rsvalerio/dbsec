@@ -137,6 +137,45 @@ pub fn log_capture() -> std::sync::MutexGuard<'static, ()> {
     dbsec_core::sync::Unpoisoned::unpoisoned(LOG_CAPTURE.lock())
 }
 
+/// Everything emitted while it is the active subscriber, one string per event.
+///
+/// Lives here next to [`log_capture`], which every user of it has to hold:
+/// the two are one mechanism, and the write path, the read path and the vault
+/// client all assert on what reaches the log. Asserting on the code's *shape*
+/// is not enough for those claims — the claim is about the log, so the test
+/// reads the log.
+#[cfg(test)]
+#[derive(Clone, Default)]
+pub struct CapturedEvents(Arc<std::sync::Mutex<Vec<String>>>);
+
+#[cfg(test)]
+impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for CapturedEvents {
+    fn on_event(
+        &self,
+        event: &tracing::Event<'_>,
+        _ctx: tracing_subscriber::layer::Context<'_, S>,
+    ) {
+        struct Fields<'a>(&'a mut String);
+        impl tracing::field::Visit for Fields<'_> {
+            fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+                use std::fmt::Write as _;
+                let _ = write!(self.0, " {}={value:?}", field.name());
+            }
+        }
+        let mut line = String::new();
+        event.record(&mut Fields(&mut line));
+        self.0.lock().expect("captured events").push(line);
+    }
+}
+
+#[cfg(test)]
+impl CapturedEvents {
+    /// The events captured so far, as one string per event.
+    pub fn events(&self) -> Vec<String> {
+        self.0.lock().expect("captured events").clone()
+    }
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
     #[error("{message}; {USAGE}")]

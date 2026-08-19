@@ -224,11 +224,7 @@ impl QueryRewriter {
         match row {
             AssignmentRow::Known(source) => Ok(source.clone()),
             AssignmentRow::Missing { table, column, shape } => {
-                self.unprotected(&Unprotected::RowKeyMissing {
-                    table: table.clone(),
-                    column: column.clone(),
-                    shape,
-                })?;
+                self.row_key_missing(table, column, shape)?;
                 Ok(RowKeySource::None)
             }
             AssignmentRow::Reassigned { table, column } => {
@@ -239,6 +235,32 @@ impl QueryRewriter {
                 Ok(RowKeySource::None)
             }
         }
+    }
+
+    /// Reports a statement that writes a row-bound table without saying which
+    /// row it writes.
+    ///
+    /// The one place [`Unprotected::RowKeyMissing`] is built. The three sites
+    /// that reach it — an `INSERT` without the key in its column list, an
+    /// `INSERT` whose key is neither a literal nor a parameter, and an
+    /// assignment list whose row the statement never pinned — differ only in
+    /// `shape`, so the identification of the table (`schema.table`, then the
+    /// key column) belongs here rather than being re-derived at each one.
+    ///
+    /// Like every other [`Unprotected`] site this consults `on_unprotected`:
+    /// under `warn` it logs and the value seals cell-only, under `reject` it
+    /// refuses the statement.
+    fn row_key_missing(
+        &self,
+        table: &str,
+        column: &str,
+        shape: &'static str,
+    ) -> Result<(), Rejection> {
+        self.unprotected(&Unprotected::RowKeyMissing {
+            table: table.to_owned(),
+            column: column.to_owned(),
+            shape,
+        })
     }
 
     /// The declared row key for a table, if it has one.
@@ -265,8 +287,13 @@ impl QueryRewriter {
         spec: &ResolvedRowKey,
     ) -> Option<RowKeySource> {
         match unwrap_casts(expr) {
-            Expr::Value(Value::Placeholder(placeholder)) => placeholder_index(placeholder)
-                .map(|index| RowKeySource::Param { index, type_oid: spec.type_oid }),
+            Expr::Value(Value::Placeholder(placeholder)) => {
+                placeholder_index(placeholder).map(|index| RowKeySource::Param {
+                    index,
+                    type_oid: spec.type_oid,
+                    column: Arc::from(spec.name.as_str()),
+                })
+            }
             other => {
                 // The literal's own text is what the server will store, so it
                 // is canonicalised through the same type as the value that
@@ -309,16 +336,17 @@ impl QueryRewriter {
         let Some((schema, table_name)) = resolved_name(&table) else {
             return Ok(SealedValues::default());
         };
+        let qualified = format!("{schema}.{table_name}");
         let spec = self.row_key_spec(&schema, &table_name);
         let key_position = spec.as_ref().and_then(|spec| {
             insert.columns.iter().position(|ident| normalize(ident) == spec.name.to_lowercase())
         });
         if let (Some(spec), None) = (spec.as_ref(), key_position) {
-            self.unprotected(&Unprotected::RowKeyMissing {
-                table: format!("{schema}.{table_name}"),
-                column: spec.name.clone(),
-                shape: "INSERT without the row key in its column list",
-            })?;
+            self.row_key_missing(
+                &qualified,
+                &spec.name,
+                "INSERT without the row key in its column list",
+            )?;
             return Ok(SealedValues::default());
         }
 
@@ -331,11 +359,11 @@ impl QueryRewriter {
                     let Some(source) =
                         row.get(position).and_then(|expr| self.row_key_source(expr, spec))
                     else {
-                        self.unprotected(&Unprotected::RowKeyMissing {
-                            table: format!("{schema}.{table_name}"),
-                            column: spec.name.clone(),
-                            shape: "INSERT whose row key is not a literal or a parameter",
-                        })?;
+                        self.row_key_missing(
+                            &qualified,
+                            &spec.name,
+                            "INSERT whose row key is not a literal or a parameter",
+                        )?;
                         return Ok(SealedValues::default());
                     };
                     source
