@@ -756,6 +756,15 @@ impl RowDecryptor {
         // it resolves names against the tables in scope, so a column projected
         // out of a derived table (`SELECT email FROM (SELECT email FROM users) s`)
         // is invisible to it and only surfaces here.
+        //
+        // The reverse gap is why this is a backstop and not the check: the
+        // match is on the field *name*, and PostgreSQL names the output of
+        // `SELECT lower(email) FROM users` `lower`, not `email`. A cast keeps
+        // the name and is caught here; a function call is not, and never can
+        // be. Anything computed over a base table in the statement's own scope
+        // is therefore decided by the write path
+        // (`encrypt::scope::computed_protected_column`), which still has the
+        // column name in front of it.
         let computed = fields.iter().enumerate().find(|(index, field)| {
             field.table_oid == 0 && !covered.contains(index) && named_like_protected(field)
         });
