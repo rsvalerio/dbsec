@@ -95,6 +95,11 @@ degradation:
   refused, because the row the action updates may carry any key at all.
 - **Reads must project the key.** `SELECT ssn FROM users WHERE id = $1` does not
   return `id`, so it cannot be verified; select `id` too.
+- **Once per result set.** A self-join projects `id` twice, and the wire
+  protocol identifies a result column by table OID and attribute number, which
+  are identical for both instances of the table. `SELECT a.id, a.ssn, b.id,
+  b.ssn FROM users a JOIN users b ...` is refused rather than opened against
+  whichever `id` came first; query each instance separately.
 
 The key column must be a type the proxy can canonicalise — integer, text or
 uuid — and must not itself be protected. Both are refused at startup, naming the
