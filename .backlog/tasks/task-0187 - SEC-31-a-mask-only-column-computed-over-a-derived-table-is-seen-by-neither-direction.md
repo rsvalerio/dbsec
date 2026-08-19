@@ -3,9 +3,10 @@ id: TASK-0187
 title: >-
   SEC-31: a mask-only column computed over a derived table is seen by neither
   direction
-status: Triage
+status: Done
 assignee: []
 created_date: '2026-08-19 10:15'
+updated_date: '2026-08-19 12:51'
 labels:
   - code-review-rust
   - security
@@ -51,6 +52,6 @@ table.
 
 ## Acceptance Criteria
 <!-- AC:BEGIN -->
-- [ ] #1 A derived table's output columns are resolvable in the enclosing scope, so a computation over a protected column projected out of one raises Unprotected::ComputedColumn
-- [ ] #2 A test asserts SELECT lower(body) FROM (SELECT body FROM notes) s on a mask-only column is refused under reject and warned under warn
+- [x] #1 A derived table's output columns are resolvable in the enclosing scope, so a computation over a protected column projected out of one raises Unprotected::ComputedColumn
+- [x] #2 A test asserts SELECT lower(body) FROM (SELECT body FROM notes) s on a mask-only column is refused under reject and warned under warn
 <!-- AC:END -->

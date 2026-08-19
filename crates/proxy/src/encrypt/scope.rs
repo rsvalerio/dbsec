@@ -18,6 +18,7 @@
 //! through [`ColumnResolution`]; the projection check goes through
 //! [`ScopedTable::read_columns`].
 
+use std::borrow::Cow;
 use std::sync::Arc;
 
 use dbsec_core::transform::FieldTransform;
@@ -32,10 +33,14 @@ pub(super) struct ScopedTable<'a> {
     pub(super) name: Vec<String>,
     /// The write direction: the columns a statement here has to seal. Empty
     /// for a table whose only protection is a read-path mask.
-    pub(super) columns: &'a Columns,
+    ///
+    /// Borrowed from the catalog for a base table, and owned for a derived one
+    /// — `FROM (SELECT body FROM notes) s` exposes a *computed* set of columns
+    /// under the names the subquery gave them, which no catalog entry holds.
+    pub(super) columns: Cow<'a, Columns>,
     /// The read direction: every column name the read path protects here,
     /// mask-only ones included. See [`ReadColumns`].
-    pub(super) read_columns: &'a ReadColumns,
+    pub(super) read_columns: Cow<'a, ReadColumns>,
 }
 
 /// Protected tables a predicate can reference.
@@ -82,6 +87,21 @@ impl TableScope<'_> {
         }
     }
 
+    /// The transform protecting a (possibly qualified) column reference, if
+    /// exactly one in scope carries the name.
+    ///
+    /// [`ColumnResolution::Ambiguous`] answers `None` here on purpose: this is
+    /// used to carry a column out of a derived table, and a name two protected
+    /// relations inside it both claim cannot be attributed to either. The read
+    /// direction still carries it — see [`Self::resolves_read`], where one
+    /// candidate and two are the same answer.
+    pub(super) fn transform_of(&self, idents: &[Ident]) -> Option<&Arc<dyn FieldTransform>> {
+        match self.resolve(idents) {
+            ColumnResolution::One(transform) => Some(transform),
+            ColumnResolution::Ambiguous | ColumnResolution::Unknown => None,
+        }
+    }
+
     /// Whether a (possibly qualified) column reference names a column the
     /// *read* path protects.
     ///
@@ -92,7 +112,7 @@ impl TableScope<'_> {
     /// path was supposed to open or mask, and "some protected table in scope
     /// carries this name" already answers it. Two candidates are the same
     /// answer as one.
-    fn resolves_read(&self, idents: &[Ident]) -> bool {
+    pub(super) fn resolves_read(&self, idents: &[Ident]) -> bool {
         let Some((column, qualifiers)) = idents.split_last() else { return false };
         let column = normalize(column);
         self.tables
@@ -255,6 +275,16 @@ pub(super) fn computed_protected_column<'a>(
         return None;
     }
     Some((read_protected_reference(expr, scope)?, expr))
+}
+
+/// The identifier path of a bare column reference, qualifiers included, or
+/// `None` for anything computed.
+pub(super) fn column_idents(expr: &Expr) -> Option<Vec<Ident>> {
+    match expr {
+        Expr::Identifier(ident) => Some(vec![ident.clone()]),
+        Expr::CompoundIdentifier(idents) => Some(idents.clone()),
+        _ => None,
+    }
 }
 
 pub(super) fn column_name(expr: &Expr) -> Option<String> {

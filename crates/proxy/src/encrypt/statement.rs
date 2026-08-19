@@ -376,11 +376,13 @@ impl QueryRewriter {
             tables: vec![ScopedTable {
                 alias: insert.table_alias.as_ref().map(normalize),
                 name: insert.table_name.0.iter().map(normalize).collect(),
-                columns,
+                columns: std::borrow::Cow::Borrowed(columns),
                 // The write lookup above already resolved the name, so the
                 // read direction is fetched without repeating its
                 // `search_path` guard — reaching here means the name resolved.
-                read_columns: self.catalog.read_columns_of(&insert.table_name),
+                read_columns: std::borrow::Cow::Borrowed(
+                    self.catalog.read_columns_of(&insert.table_name),
+                ),
             }],
         };
         // Which row the conflict action writes, read before `insert.on` is

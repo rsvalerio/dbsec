@@ -1548,6 +1548,78 @@ pub(in crate::encrypt) mod tests {
         }
     }
 
+    /// The same leak one level in: `SELECT lower(body) FROM (SELECT body FROM
+    /// notes) s`.
+    ///
+    /// The base-table form above is caught by resolving the projection against
+    /// the catalog's read direction, but a derived table used to contribute no
+    /// columns to the enclosing scope at all — the scope walk took base tables
+    /// and parenthesised joins and nothing else — so `lower(body)` resolved
+    /// against nothing and the statement was relayed under `reject` too. The
+    /// read path's backstop is no help here either: PostgreSQL names the output
+    /// field `lower`.
+    ///
+    /// A cast keeps the name and so *was* caught by the read path; it is
+    /// included to pin that the write path now sees it as well, rather than the
+    /// two directions disagreeing about the same statement.
+    #[test]
+    fn a_computed_projection_over_a_derived_table_is_a_site_in_both_modes() {
+        let computed = [
+            "SELECT lower(body) FROM (SELECT body FROM notes) s",
+            "SELECT lower(s.body) FROM (SELECT body FROM notes) s",
+            // Renamed on the way out: the enclosing query can only name it `b`.
+            "SELECT lower(b) FROM (SELECT body AS b FROM notes) s",
+            // Carried by a wildcard rather than named.
+            "SELECT lower(body) FROM (SELECT * FROM notes) s",
+            // Two levels of nesting.
+            "SELECT lower(body) FROM (SELECT body FROM (SELECT body FROM notes) inner_s) s",
+            "SELECT body::text || '' FROM (SELECT body FROM notes) s",
+        ];
+
+        let mut strict = rewriter(mask_only_catalog(OnUnprotected::Reject));
+        for sql in computed {
+            let action = strict.on_frame(b'Q', &query_frame(sql)).unwrap();
+            let message = refusal(&action);
+            assert!(message.contains("cannot be decrypted or masked"), "{sql}: {message}");
+        }
+
+        // Projecting the column through unchanged is still the read path's
+        // job, at any depth — reporting it would refuse working SQL.
+        for sql in [
+            "SELECT body FROM (SELECT body FROM notes) s",
+            "SELECT s.body FROM (SELECT body FROM notes) s",
+            "SELECT * FROM (SELECT body FROM notes) s",
+            // A derived table over nothing protected stays out of scope.
+            "SELECT lower(id) FROM (SELECT id FROM other) s",
+        ] {
+            assert!(
+                matches!(strict.on_frame(b'Q', &query_frame(sql)).unwrap(), FrameAction::Relay),
+                "{sql}"
+            );
+        }
+
+        let (_, events) = crate::captured_events(|| {
+            let mut permissive = rewriter(mask_only_catalog(OnUnprotected::Warn));
+            for sql in computed.iter().chain(&["SELECT body FROM (SELECT body FROM notes) s"]) {
+                assert!(
+                    matches!(
+                        permissive.on_frame(b'Q', &query_frame(sql)).unwrap(),
+                        FrameAction::Relay
+                    ),
+                    "{sql}"
+                );
+            }
+        });
+        assert_eq!(
+            events.len(),
+            computed.len(),
+            "one warning per computed projection, none for the direct select: {events:?}"
+        );
+        for event in events.iter() {
+            assert!(event.contains("read path cannot decrypt or mask"), "{event}");
+        }
+    }
+
     /// A searchable predicate inside `COPY (query) TO STDOUT` is an ordinary
     /// predicate: left alone it compares the client's plaintext against the
     /// stored `blind_index || envelope`, matching no row — and "no rows" is

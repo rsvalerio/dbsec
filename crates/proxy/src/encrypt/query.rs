@@ -4,7 +4,9 @@
 //!
 //! Two jobs meet here. Building the [`TableScope`] a predicate resolves names
 //! against is one: which relations a `FROM`, its joins, its derived tables and
-//! its CTEs bring into scope, and under which aliases. Walking a query so that
+//! its CTEs bring into scope, and under which aliases. A derived table is in
+//! scope for the columns it *projects*, not the ones it reads — see
+//! [`QueryRewriter::derived_scope`]. Walking a query so that
 //! every place a predicate can hide — a join constraint, a `WHERE`, a
 //! `HAVING`, a set operation's two halves, a derived table's own query — is
 //! visited is the other.
@@ -13,15 +15,17 @@
 //! descend into is a predicate relayed unrewritten, which is the silent
 //! wrong-rows failure the whole rewrite exists to prevent.
 
+use std::borrow::Cow;
+
 use sqlparser::ast::{
     Expr, GroupByExpr, Ident, JoinConstraint, JoinOperator, ObjectName, Query, Select, SelectItem,
-    SetExpr, TableFactor, TableWithJoins,
+    SetExpr, TableAlias, TableFactor, TableWithJoins,
 };
 
 use crate::portal::ParamTransforms;
 
 use super::catalog::{normalize, Columns, ReadColumns};
-use super::scope::{computed_protected_column, expr_shape, ScopedTable, TableScope};
+use super::scope::{column_idents, computed_protected_column, expr_shape, ScopedTable, TableScope};
 use super::unprotected::Unprotected;
 use super::{QueryRewriter, Rejection};
 
@@ -242,20 +246,107 @@ impl QueryRewriter {
                     tables.push(ScopedTable {
                         alias: alias.as_ref().map(|alias| normalize(&alias.name)),
                         name: name.0.iter().map(normalize).collect(),
-                        columns,
-                        read_columns,
+                        columns: Cow::Borrowed(columns),
+                        read_columns: Cow::Borrowed(read_columns),
                     });
                 }
                 TableFactor::NestedJoin { table_with_joins, .. } => {
                     self.scope_of(table_with_joins, tables)?;
                 }
-                // A derived table brings its own scope, and a set-returning
-                // function, `UNNEST` or `JSON_TABLE` names no base table the
-                // catalog could resolve.
+                // A derived table brings its own scope, but the columns it
+                // *projects* are visible here, under the names it gave them.
+                TableFactor::Derived { subquery, alias, .. } => {
+                    if let Some(derived) = self.derived_scope(subquery, alias.as_ref())? {
+                        tables.push(derived);
+                    }
+                }
+                // A set-returning function, `UNNEST` or `JSON_TABLE` names no
+                // base table the catalog could resolve.
                 _ => {}
             }
         }
         Ok(())
+    }
+
+    /// The protected columns a derived table exposes to the query around it.
+    ///
+    /// `SELECT lower(body) FROM (SELECT body FROM notes) s` used to be seen by
+    /// neither direction: the write path put no columns in scope for a derived
+    /// table, so `lower(body)` resolved against nothing, and the read path's
+    /// name-based backstop is looking at `lower`, which is what PostgreSQL
+    /// calls the output field. For a mask-only column that is the whole
+    /// protection gone — the stored value *is* the plaintext (SEC-31).
+    ///
+    /// Only the shapes that carry a column through unchanged are propagated: a
+    /// bare reference, an aliased one, and a wildcard. A projection that
+    /// *computes* over a protected column is already this same site one level
+    /// in, raised by the subquery's own pass, and giving its output a name here
+    /// would report it twice.
+    ///
+    /// The two directions are collected separately rather than one from the
+    /// other, because a mask-only column appears in the read set and in no
+    /// write set at all, and it is precisely the column this exists for.
+    fn derived_scope<'a>(
+        &'a self,
+        subquery: &Query,
+        alias: Option<&TableAlias>,
+    ) -> Result<Option<ScopedTable<'a>>, Rejection> {
+        let SetExpr::Select(select) = subquery.body.as_ref() else { return Ok(None) };
+        let inner = self.scope(&select.from)?;
+        let mut columns = Columns::new();
+        let mut read_columns = ReadColumns::new();
+        let carry = |columns: &mut Columns,
+                     read_columns: &mut ReadColumns,
+                     name: String,
+                     idents: &[Ident]| {
+            if let Some(transform) = inner.transform_of(idents) {
+                columns.insert(name.clone(), transform.clone());
+            }
+            if inner.resolves_read(idents) {
+                read_columns.insert(name);
+            }
+        };
+        for item in &select.projection {
+            match item {
+                SelectItem::UnnamedExpr(expr) => {
+                    if let Some(idents) = column_idents(expr) {
+                        let Some(name) = idents.last().map(normalize) else { continue };
+                        carry(&mut columns, &mut read_columns, name, &idents);
+                    }
+                }
+                SelectItem::ExprWithAlias { expr, alias } => {
+                    if let Some(idents) = column_idents(expr) {
+                        carry(&mut columns, &mut read_columns, normalize(alias), &idents);
+                    }
+                }
+                // A wildcard carries every name through unrenamed, so the
+                // inner scope's own sets are the answer.
+                SelectItem::Wildcard(_) | SelectItem::QualifiedWildcard(..) => {
+                    for table in &inner.tables {
+                        if let SelectItem::QualifiedWildcard(name, _) = item {
+                            if !table.matches(&name.0) {
+                                continue;
+                            }
+                        }
+                        columns.extend(table.columns.iter().map(|(k, v)| (k.clone(), v.clone())));
+                        read_columns.extend(table.read_columns.iter().cloned());
+                    }
+                }
+            }
+        }
+        if columns.is_empty() && read_columns.is_empty() {
+            return Ok(None);
+        }
+        // A derived table must be aliased in PostgreSQL, so the alias is the
+        // only name a qualified reference into it can use; an unaliased one
+        // cannot be referenced by qualifier at all and matches bare names only.
+        let name = alias.map(|alias| vec![normalize(&alias.name)]).unwrap_or_default();
+        Ok(Some(ScopedTable {
+            alias: alias.map(|alias| normalize(&alias.name)),
+            name,
+            columns: Cow::Owned(columns),
+            read_columns: Cow::Owned(read_columns),
+        }))
     }
 
     /// Every protected table a `COPY (query) TO STDOUT` would read, gathered
