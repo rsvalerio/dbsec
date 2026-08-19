@@ -113,7 +113,10 @@
 //!
 //! Anything added later must stay inside that set;
 //! `no_event_from_the_write_path_carries_a_plaintext_value` is the test that
-//! keeps it honest by driving every site and grepping the emitted events.
+//! keeps it honest by driving every site and grepping the emitted events. It
+//! stays every site because the test ends in an exhaustive match over a value
+//! of each `Unprotected` variant: a variant added without a driver does not
+//! compile, and one whose driver stops firing fails the assertion.
 
 mod lexer;
 
@@ -2203,6 +2206,35 @@ mod tests {
             catalog,
             SessionPortals::new(),
             None,
+            Arc::new(AtomicU8::new(b'I')),
+            StartupSettings::default(),
+        )
+    }
+
+    /// A rewriter whose `users` table declares `id` as its row key.
+    ///
+    /// [`rewriter`] passes no read context, and `row_key_spec` reads the
+    /// declarations out of that context — so without one every table is
+    /// cell-bound and the row-key sites cannot fire at all.
+    fn row_bound_rewriter() -> QueryRewriter {
+        use crate::rows::{Resolved, ResolvedRowKey, RowContext, DEFAULT_MAX_PROTECTED_VALUE_LEN};
+
+        let spec = ResolvedRowKey { attnum: 1, type_oid: rowkey::oid::INT4, name: "id".into() };
+        let rows = Arc::new(RowContext::new(
+            Resolved {
+                row_key_by_table: std::collections::HashMap::from([(
+                    ("public".to_owned(), "users".to_owned()),
+                    spec,
+                )]),
+                ..Default::default()
+            },
+            OnUnprotected::Warn,
+            DEFAULT_MAX_PROTECTED_VALUE_LEN,
+        ));
+        QueryRewriter::new(
+            catalog(true),
+            SessionPortals::new(),
+            Some(rows),
             Arc::new(AtomicU8::new(b'I')),
             StartupSettings::default(),
         )
@@ -4561,10 +4593,19 @@ mod tests {
         let _capture = crate::log_capture();
         let captured = crate::CapturedEvents::default();
         let subscriber = tracing_subscriber::registry().with(captured.clone());
-        tracing::subscriber::with_default(subscriber, || {
+        let drive = || {
             // The ambiguity site needs two protected relations in scope, so it
             // is driven through a catalog of its own.
             let mut ambiguous = rewriter(ambiguous_catalog(OnUnprotected::Warn));
+            // The remaining sites each need a session the loop below cannot
+            // be: one whose column is not searchable, one that still resolves
+            // unqualified names after turning standard_conforming_strings off
+            // (the loop's rewriter has since seen `SET search_path`), and one
+            // with a read context declaring a row key. Built here, before the
+            // binding below shadows the helper that makes them.
+            let mut unindexed = rewriter(catalog(false));
+            let mut escapes = rewriter(catalog(true));
+            let mut row_bound = row_bound_rewriter();
             let mut rewriter = rewriter(catalog(true));
             for sql in [
                 "INSERT INTO users (email) VALUES (lower('alice@secret.test'))",
@@ -4572,6 +4613,9 @@ mod tests {
                 "INSERT INTO users VALUES (1, 'carol@secret.test')",
                 "INSERT INTO users (email) SELECT email FROM other",
                 "COPY users (email) FROM STDIN",
+                "COPY users TO STDOUT",
+                "COPY (SELECT email FROM users WHERE email LIKE 'sara@secret.test%') TO STDOUT",
+                "SELECT upper(email) FROM users",
                 "MERGE INTO users u USING staging s ON u.id = s.id \
                  WHEN MATCHED THEN UPDATE SET email = s.email",
                 "PREPARE ins AS INSERT INTO users (email) VALUES ('dave@secret.test')",
@@ -4595,6 +4639,8 @@ mod tests {
                 // Errors are the point of some of these; only the log matters.
                 drop(rewriter.on_frame(b'Q', &query_frame(sql)));
             }
+            // A Query body that is not UTF-8 at all, which no `&str` can be.
+            drop(rewriter.on_frame(b'Q', &[b'S', b'E', 0xff, 0xfe, 0]));
             drop(ambiguous.on_frame(
                 b'Q',
                 &query_frame(
@@ -4602,15 +4648,121 @@ mod tests {
                      WHERE email = 'mona@secret.test'",
                 ),
             ));
+            drop(unindexed.on_frame(
+                b'Q',
+                &query_frame("SELECT id FROM users WHERE email = 'opal@secret.test'"),
+            ));
+            for sql in [
+                "SET standard_conforming_strings = off",
+                r"INSERT INTO users (email) VALUES ('nina\secret.test')",
+            ] {
+                drop(escapes.on_frame(b'Q', &query_frame(sql)));
+            }
+            for sql in [
+                "INSERT INTO users (email) VALUES ('quinn@secret.test')",
+                "UPDATE users SET email = 'rita@secret.test'",
+            ] {
+                drop(row_bound.on_frame(b'Q', &query_frame(sql)));
+            }
+        };
+
+        // Driven twice, and the first pass is thrown away. `tracing` decides
+        // whether a callsite has any listener the first time it is hit, using
+        // whatever subscriber *that* thread has — so a site another test's
+        // thread reaches first, having none, caches "nobody is listening" and
+        // its event never reaches the capture here, however this test is
+        // ordered. The pass below puts every site this test reads on the
+        // register; `rebuild_interest_cache` then recomputes them all against
+        // the capturing subscriber, and the second pass is the one that counts.
+        drive();
+        tracing::subscriber::with_default(subscriber, || {
+            tracing::callsite::rebuild_interest_cache();
+            drive();
         });
 
-        let events = captured.events().join("\n");
+        let lines = captured.events();
+        let events = lines.join("\n");
         assert!(events.contains("passing through unencrypted"), "the sites did emit: {events}");
         for plaintext in [
             "alice", "bob", "carol", "dave", "erin", "fred", "gina", "hank", "ivan", "judy",
-            "kate", "liam", "mona", "secret",
+            "kate", "liam", "mona", "nina", "opal", "quinn", "rita", "sara", "secret",
         ] {
             assert!(!events.contains(plaintext), "{plaintext} reached the log:\n{events}");
+        }
+
+        // Every site is driven, and stays driven. The match is exhaustive, so
+        // a variant added to [`Unprotected`] without a driver above stops this
+        // test compiling; the assertion then fails until something actually
+        // emits it. The needles identify a site in the log by its warning
+        // wording, plus the field that tells the two COPY directions apart.
+        let table = ObjectName(vec![Ident::new("users")]);
+        let unparseable = parse_sql("UPDATE users SET email 'zoe'").expect_err("does not parse");
+        for site in [
+            Unprotected::NonUtf8,
+            Unprotected::Unparseable(&unparseable),
+            Unprotected::NoColumnList(&table),
+            Unprotected::InsertFromSelect(&table),
+            Unprotected::Copy { table: &table, to: false },
+            Unprotected::Copy { table: &table, to: true },
+            Unprotected::CopyQuery { table: "public.users".to_owned() },
+            Unprotected::Unsupported { table: &table, shape: "MERGE" },
+            Unprotected::AmbiguousLiteral { column: "email" },
+            Unprotected::UnsupportedValue { column: "email", shape: "function call" },
+            Unprotected::ComputedColumn { column: "email".to_owned(), shape: "function call" },
+            Unprotected::RowKeyMissing {
+                table: "public.users".to_owned(),
+                column: "id".to_owned(),
+                shape: "INSERT without the row key in its column list",
+            },
+            Unprotected::Predicate { column: "email".to_owned(), shape: "LIKE" },
+            Unprotected::AmbiguousColumn { column: "email".to_owned(), shape: "comparison" },
+            Unprotected::UnindexedPredicate { column: "email".to_owned(), shape: "comparison" },
+            Unprotected::SearchPathChanged,
+            Unprotected::EscapeStringsChanged,
+            Unprotected::SearchPath(&table),
+        ] {
+            let needles: &[&str] = match &site {
+                Unprotected::NonUtf8 => &["query is not valid UTF-8"],
+                Unprotected::Unparseable(_) => &["unparseable SQL"],
+                Unprotected::NoColumnList(_) => &["INSERT without a column list"],
+                Unprotected::InsertFromSelect(_) => &["INSERT ... SELECT into a protected table"],
+                Unprotected::Copy { to: false, .. } => {
+                    &["COPY on a protected table", r#"direction="from""#]
+                }
+                Unprotected::Copy { to: true, .. } => {
+                    &["COPY on a protected table", r#"direction="to""#]
+                }
+                Unprotected::CopyQuery { .. } => &["COPY of a query over a protected table"],
+                Unprotected::Unsupported { .. } => {
+                    &["statement writes a protected table but is not rewritten"]
+                }
+                Unprotected::AmbiguousLiteral { .. } => &["string literal contains a backslash"],
+                Unprotected::UnsupportedValue { .. } => {
+                    &["unsupported expression for a protected column"]
+                }
+                Unprotected::ComputedColumn { .. } => {
+                    &["protected column projected through an expression"]
+                }
+                Unprotected::RowKeyMissing { .. } => {
+                    &["row-bound table written without its row key"]
+                }
+                Unprotected::Predicate { .. } => &["unsupported predicate for a searchable column"],
+                Unprotected::AmbiguousColumn { .. } => {
+                    &["unqualified column matches a protected column in more than one relation"]
+                }
+                Unprotected::UnindexedPredicate { .. } => {
+                    &["predicate over a protected column with no equality index"]
+                }
+                Unprotected::SearchPathChanged => &["session changed search_path"],
+                Unprotected::EscapeStringsChanged => {
+                    &["session turned standard_conforming_strings off"]
+                }
+                Unprotected::SearchPath(_) => &["unqualified name may be a protected table"],
+            };
+            assert!(
+                lines.iter().any(|line| needles.iter().all(|needle| line.contains(needle))),
+                "no event drove the site logging {needles:?}:\n{events}"
+            );
         }
     }
 }
