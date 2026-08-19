@@ -3,11 +3,11 @@ id: TASK-0156
 title: >-
   PERF-3: per-row row-key extraction allocates per protected column and on every
   DataRow
-status: To Do
+status: Done
 assignee:
   - TASK-0175
 created_date: '2026-08-19 08:29'
-updated_date: '2026-08-19 09:01'
+updated_date: '2026-08-19 10:03'
 labels:
   - code-review-rust
   - performance
@@ -38,6 +38,12 @@ caps protected values, not the key — so the multiplier is unbounded in size as
 
 ## Acceptance Criteria
 <!-- AC:BEGIN -->
-- [ ] #1 The row key is canonicalised at most once per DataRow per distinct slot, and not at all when no position carries a slot
-- [ ] #2 canonical validates UTF-8 without the intermediate String on the pass-through arms
+- [x] #1 The row key is canonicalised at most once per DataRow per distinct slot, and not at all when no position carries a slot
+- [x] #2 canonical validates UTF-8 without the intermediate String on the pass-through arms
 <!-- AC:END -->
+
+## Implementation Notes
+
+<!-- SECTION:NOTES:BEGIN -->
+Fixed in wave TASK-0175 (branch code-review/TASK-0175). `decrypt_row` now canonicalises the row key once per *distinct slot* per DataRow via the new `distinct_slots` helper, instead of once per protected column; the result is shared by every column that binds to it (`RowKeyOnce` splits the `Result` so the key is borrowed and the failure reason moved). A row whose positions carry no slot allocates nothing. `canonical` validates UTF-8 in place on the pass-through arms and no longer builds an intermediate `String`.
+<!-- SECTION:NOTES:END -->
