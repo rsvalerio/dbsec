@@ -134,8 +134,9 @@ use scope::{
     ambiguous_column, ambiguous_operand, column_name, column_ref, computed_protected_column,
     expr_shape, protected_column, protected_operand, ScopedTable, TableScope,
 };
+use seal::UpdateTarget;
 
-use catalog::{normalize, resolved_name, Columns};
+use catalog::{normalize, Columns};
 
 use unprotected::{frame, Unprotected};
 
@@ -263,12 +264,38 @@ struct SealTarget<'a> {
     row: &'a RowKeySource,
 }
 
+/// Which row an assignment list writes, so its protected values can be sealed
+/// against it.
+///
+/// The "cannot say" cases are carried rather than acted on where they are
+/// discovered, because whether they matter depends on what the list turns out
+/// to assign: `ON CONFLICT (email) DO UPDATE SET hits = hits + 1` names no row
+/// and needs none, and reporting it as an unprotected site would refuse
+/// correct SQL under `reject`. [`QueryRewriter::row_of`] resolves this at the
+/// one point where it is known that a protected value is about to be sealed,
+/// and under `warn` falls back to cell-only binding — the protection this
+/// table had before it declared a row key, never plaintext.
+enum AssignmentRow {
+    /// The row is known — or the table declares no row key at all, in which
+    /// case this holds [`RowKeySource::None`] and binding is cell-only, as it
+    /// was before row keys existed.
+    Known(RowKeySource),
+    /// The table is row-bound and the statement does not pin the row this list
+    /// writes, so there is no key to seal against.
+    Missing { table: String, column: String, shape: &'static str },
+    /// The list assigns the row key column itself. The key the statement pins
+    /// is the row the values are being moved *out of*, so sealing against it
+    /// stores bytes that can never be opened again.
+    Reassigned { table: String, column: String },
+}
+
 /// What an assignment list may write into: the target table's protected
 /// columns, and what the rest of the same statement already sealed.
 struct AssignmentScope<'a> {
     /// Which row this assignment list writes, when the target table declares a
-    /// row key. `None` is the ordinary cell-only case.
-    row: RowKeySource,
+    /// row key. [`AssignmentRow::Known`] with [`RowKeySource::None`] is the
+    /// ordinary cell-only case.
+    row: AssignmentRow,
     columns: &'a Columns,
     sealed: SealedValues,
 }
@@ -276,7 +303,7 @@ struct AssignmentScope<'a> {
 impl AssignmentScope<'_> {
     /// A plain `UPDATE`: no `EXCLUDED` relation exists, so no value in this
     /// statement is one the proxy sealed a clause earlier.
-    fn of(columns: &Columns, row: RowKeySource) -> AssignmentScope<'_> {
+    fn of(columns: &Columns, row: AssignmentRow) -> AssignmentScope<'_> {
         AssignmentScope { row, columns, sealed: SealedValues::default() }
     }
 
@@ -303,6 +330,15 @@ impl AssignmentScope<'_> {
     /// - and it must be one the `VALUES` list actually carried. `EXCLUDED.c`
     ///   for a column the INSERT did not list is that column's default, which
     ///   nothing sealed.
+    ///
+    /// One more condition is checked by the caller rather than here, because
+    /// it is not a property of the expression: on a row-bound table the sealed
+    /// value carries the *inserted* row's key, so re-storing it into the
+    /// conflicting row is only correct when the two are the same row.
+    /// [`QueryRewriter::seal_assignments`] therefore resolves the conflict
+    /// action's row before consulting this whitelist, so a conflict target
+    /// that does not prove the two rows share a key is reported — refused
+    /// under `reject` — rather than waved through as "already sealed".
     fn re_stores_a_sealed_value(&self, value: &Expr, column: &str) -> bool {
         let Expr::CompoundIdentifier(idents) = value else { return false };
         let [qualifier, referenced] = idents.as_slice() else { return false };
@@ -795,30 +831,15 @@ impl QueryRewriter {
                 let mut changed = false;
                 if let TableFactor::Table { name, .. } = &table.relation {
                     if let Some(columns) = self.table(name)? {
-                        let spec = resolved_name(name)
-                            .and_then(|(schema, table)| self.row_key_spec(&schema, &table));
-                        let row = match spec.as_ref() {
-                            None => RowKeySource::None,
-                            Some(spec) => {
-                                let found = selection
-                                    .as_ref()
-                                    .and_then(|where_| self.row_key_in_predicate(where_, spec));
-                                match found {
-                                    Some(source) => source,
-                                    None => {
-                                        let (schema, table_name) =
-                                            resolved_name(name).unwrap_or_default();
-                                        self.unprotected(&Unprotected::RowKeyMissing {
-                                            table: format!("{schema}.{table_name}"),
-                                            column: spec.name.clone(),
-                                            shape: "UPDATE whose WHERE does not pin one row by \
-                                                    its row key",
-                                        })?;
-                                        RowKeySource::None
-                                    }
-                                }
-                            }
-                        };
+                        let row = self.update_row(
+                            &UpdateTarget {
+                                table,
+                                from: from.as_ref(),
+                                selection: selection.as_ref(),
+                                assignments,
+                            },
+                            columns,
+                        );
                         let target = AssignmentScope::of(columns, row);
                         changed |= self.seal_assignments(assignments, &target, params)?;
                     }
@@ -1007,7 +1028,23 @@ impl QueryRewriter {
                 columns,
             }],
         };
-        let target = AssignmentScope { row: RowKeySource::None, columns, sealed };
+        // Which row the conflict action writes, read before `insert.on` is
+        // borrowed mutably below. Hardcoding `RowKeySource::None` here sealed
+        // every upsert-written value with cell-only binding on a table whose
+        // `INSERT`ed values a few lines above were bound to their row — the
+        // same statement writing `DBS3` for the inserted row and `DBS2` for
+        // the conflict-updated one, with no site reported for either policy.
+        let row = match insert.on.as_ref() {
+            Some(OnInsert::OnConflict(OnConflict {
+                conflict_target,
+                action: OnConflictAction::DoUpdate(update),
+            })) => self.conflict_row(insert, conflict_target.as_ref(), &update.assignments),
+            Some(OnInsert::DuplicateKeyUpdate(assignments)) => {
+                self.conflict_row(insert, None, assignments)
+            }
+            _ => AssignmentRow::Known(RowKeySource::None),
+        };
+        let target = AssignmentScope { row, columns, sealed };
         // The conflict action writes the same columns on every existing row,
         // and it is a plain assignment list — the UPDATE path handles it.
         match insert.on.as_mut() {

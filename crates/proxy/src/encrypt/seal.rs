@@ -14,18 +14,68 @@ use std::sync::Arc;
 
 use dbsec_core::transform::{FieldTransform, WireForm};
 use sqlparser::ast::{
-    Assignment, AssignmentTarget, Expr, Ident, Insert, ObjectName, SetExpr, Value,
+    Assignment, AssignmentTarget, ConflictTarget, Expr, Ident, Insert, ObjectName, SetExpr,
+    TableFactor, TableWithJoins, Value,
 };
 
 use super::catalog::{normalize, resolved_name, Columns};
-use super::scope::{column_name, expr_shape};
+use super::scope::{expr_shape, ScopedTable};
 use super::{
-    literal_plaintext, placeholder_index, unwrap_casts, AssignmentScope, QueryRewriter, Rejection,
-    SealTarget, SealedValues, Unprotected,
+    literal_plaintext, placeholder_index, unwrap_casts, AssignmentRow, AssignmentScope,
+    QueryRewriter, Rejection, SealTarget, SealedValues, Unprotected,
 };
 use crate::portal::{ParamTransforms, RowKeySource};
 use crate::rowkey;
 use crate::rows::ResolvedRowKey;
+
+/// The parts of an `UPDATE` that decide which row its assignment list writes.
+///
+/// A struct rather than four more parameters: the repo caps a function at five
+/// and these are only ever read together.
+pub(super) struct UpdateTarget<'a> {
+    /// The relation being written, with any joins sqlparser attached to it.
+    pub(super) table: &'a TableWithJoins,
+    /// `UPDATE ... FROM other`, which makes the statement a join.
+    pub(super) from: Option<&'a TableWithJoins>,
+    pub(super) selection: Option<&'a Expr>,
+    pub(super) assignments: &'a [Assignment],
+}
+
+/// Whether an assignment list writes `wanted`, on either target shape: `SET id
+/// = …` and the row-wise `SET (id, ssn) = (…)`.
+fn assigns_column(assignments: &[Assignment], wanted: &str) -> bool {
+    let named = |name: &ObjectName| name.0.last().is_some_and(|ident| normalize(ident) == wanted);
+    assignments.iter().any(|assignment| match &assignment.target {
+        AssignmentTarget::ColumnName(name) => named(name),
+        AssignmentTarget::Tuple(names) => names.iter().any(named),
+    })
+}
+
+/// Whether `expr` names the row key **of the relation the statement writes**.
+///
+/// Matching the last ident alone answered a different question — "does this
+/// spell the row key" — and `Statement::Update` carries a `FROM`, so `UPDATE
+/// users u SET ssn = 'x' FROM audit a WHERE a.id = 1 AND u.id = 99` matched
+/// `a.id` first and sealed `ssn` against row `1` while the server wrote row
+/// `99`. The value lands in a row it is not bound to and surfaces at read time
+/// as a false tamper alarm that kills the session — and the joined relation
+/// and its predicate are the part of such a statement an attacker has the most
+/// freedom to shape.
+///
+/// A qualifier is therefore resolved against the target relation, and a bare
+/// name is accepted only when the statement joins nothing else: the catalog
+/// holds the columns of protected tables only, so with a join in play the
+/// proxy cannot prove a bare `id` is not the other side's.
+fn names_row_key(expr: &Expr, wanted: &str, target: &ScopedTable<'_>, joined: bool) -> bool {
+    match expr {
+        Expr::Identifier(ident) => !joined && normalize(ident) == wanted,
+        Expr::CompoundIdentifier(idents) => match idents.split_last() {
+            Some((column, qualifiers)) => normalize(column) == wanted && target.matches(qualifiers),
+            None => false,
+        },
+        _ => false,
+    }
+}
 
 impl QueryRewriter {
     /// The row an `UPDATE` writes, read out of its `WHERE`.
@@ -38,20 +88,22 @@ impl QueryRewriter {
     /// of rows, and a set has no single key to bind. Those are refusals rather
     /// than silent cell-only writes, because a value stored bound to the wrong
     /// row — or to none — never opens again.
-    pub(super) fn row_key_in_predicate(
+    fn row_key_in_predicate(
         &self,
         expr: &Expr,
         spec: &ResolvedRowKey,
+        target: &ScopedTable<'_>,
+        joined: bool,
     ) -> Option<RowKeySource> {
         use sqlparser::ast::BinaryOperator;
         match expr {
             Expr::BinaryOp { left, op: BinaryOperator::And, right } => self
-                .row_key_in_predicate(left, spec)
-                .or_else(|| self.row_key_in_predicate(right, spec)),
-            Expr::Nested(inner) => self.row_key_in_predicate(inner, spec),
+                .row_key_in_predicate(left, spec, target, joined)
+                .or_else(|| self.row_key_in_predicate(right, spec, target, joined)),
+            Expr::Nested(inner) => self.row_key_in_predicate(inner, spec, target, joined),
             Expr::BinaryOp { left, op: BinaryOperator::Eq, right } => {
                 let wanted = spec.name.to_lowercase();
-                let names = |e: &Expr| column_name(e).is_some_and(|name| name == wanted);
+                let names = |e: &Expr| names_row_key(e, &wanted, target, joined);
                 if names(left) {
                     self.row_key_source(right, spec)
                 } else if names(right) {
@@ -61,6 +113,131 @@ impl QueryRewriter {
                 }
             }
             _ => None,
+        }
+    }
+
+    /// Which row an `UPDATE`'s assignment list writes.
+    ///
+    /// Nothing is reported here: whether a gap matters depends on what the list
+    /// turns out to assign, which only [`Self::seal_assignments`] knows. See
+    /// [`AssignmentRow`].
+    pub(super) fn update_row(&self, target: &UpdateTarget<'_>, columns: &Columns) -> AssignmentRow {
+        let TableFactor::Table { name, alias, .. } = &target.table.relation else {
+            return AssignmentRow::Known(RowKeySource::None);
+        };
+        let Some((schema, table_name)) = resolved_name(name) else {
+            return AssignmentRow::Known(RowKeySource::None);
+        };
+        let Some(spec) = self.row_key_spec(&schema, &table_name) else {
+            return AssignmentRow::Known(RowKeySource::None);
+        };
+        let qualified = format!("{schema}.{table_name}");
+        let wanted = spec.name.to_lowercase();
+        if assigns_column(target.assignments, &wanted) {
+            return AssignmentRow::Reassigned { table: qualified, column: spec.name };
+        }
+        let scoped = ScopedTable {
+            alias: alias.as_ref().map(|alias| normalize(&alias.name)),
+            name: name.0.iter().map(normalize).collect(),
+            columns,
+        };
+        let joined = target.from.is_some() || !target.table.joins.is_empty();
+        let found = target
+            .selection
+            .and_then(|where_| self.row_key_in_predicate(where_, &spec, &scoped, joined));
+        match found {
+            Some(source) => AssignmentRow::Known(source),
+            None => AssignmentRow::Missing {
+                table: qualified,
+                column: spec.name,
+                shape: "UPDATE whose WHERE does not pin one row by its row key",
+            },
+        }
+    }
+
+    /// Which row an `INSERT`'s conflict action writes.
+    ///
+    /// The conflict action updates the row that *already exists*, so its key is
+    /// the one the `VALUES` row proposed only when the conflict is on the row
+    /// key itself: `ON CONFLICT (id)` means the row that conflicted is the row
+    /// with that `id`. `ON CONFLICT (email)` conflicts on some other unique
+    /// column, whose row may carry any key at all, and MySQL's `ON DUPLICATE
+    /// KEY UPDATE` names no key — both are gaps, not derivations.
+    pub(super) fn conflict_row(
+        &self,
+        insert: &Insert,
+        conflict_target: Option<&ConflictTarget>,
+        assignments: &[Assignment],
+    ) -> AssignmentRow {
+        let Some((schema, table_name)) = resolved_name(&insert.table_name) else {
+            return AssignmentRow::Known(RowKeySource::None);
+        };
+        let Some(spec) = self.row_key_spec(&schema, &table_name) else {
+            return AssignmentRow::Known(RowKeySource::None);
+        };
+        let qualified = format!("{schema}.{table_name}");
+        let wanted = spec.name.to_lowercase();
+        if assigns_column(assignments, &wanted) {
+            return AssignmentRow::Reassigned { table: qualified, column: spec.name };
+        }
+        let missing = |shape| AssignmentRow::Missing {
+            table: qualified.clone(),
+            column: spec.name.clone(),
+            shape,
+        };
+        match conflict_target {
+            Some(ConflictTarget::Columns(columns))
+                if columns.iter().any(|ident| normalize(ident) == wanted) => {}
+            _ => return missing("conflict action whose ON CONFLICT target is not the row key"),
+        }
+        let Some(position) = insert.columns.iter().position(|ident| normalize(ident) == wanted)
+        else {
+            return missing("conflict action of an INSERT without the row key in its column list");
+        };
+        let Some(source) = insert.source.as_ref() else {
+            return missing("conflict action of an INSERT with no VALUES list");
+        };
+        let SetExpr::Values(values) = source.body.as_ref() else {
+            return missing("conflict action of an INSERT ... SELECT");
+        };
+        // One conflict action, one sealed value: a multi-row VALUES list
+        // conflicts once per row and each conflicting row carries its own key,
+        // so there is no single key the action's values could bind to.
+        let [row] = values.rows.as_slice() else {
+            return missing("conflict action of a multi-row INSERT");
+        };
+        match row.get(position).and_then(|expr| self.row_key_source(expr, &spec)) {
+            Some(source) => AssignmentRow::Known(source),
+            None => missing("conflict action whose row key is not a literal or a parameter"),
+        }
+    }
+
+    /// The row a protected assignment seals against, reporting the site when
+    /// the statement gives none.
+    ///
+    /// Under `reject` the report is the answer and nothing is written. Under
+    /// `warn` the value still seals, cell-only — the binding this table had
+    /// before it declared a row key. Falling back to *no* sealing would be a
+    /// downgrade dressed as a fix: it turns a relocatable ciphertext into
+    /// plaintext at rest, which is the one outcome `warn` exists to avoid.
+    fn row_of(&self, row: &AssignmentRow) -> Result<RowKeySource, Rejection> {
+        match row {
+            AssignmentRow::Known(source) => Ok(source.clone()),
+            AssignmentRow::Missing { table, column, shape } => {
+                self.unprotected(&Unprotected::RowKeyMissing {
+                    table: table.clone(),
+                    column: column.clone(),
+                    shape,
+                })?;
+                Ok(RowKeySource::None)
+            }
+            AssignmentRow::Reassigned { table, column } => {
+                self.unprotected(&Unprotected::RowKeyReassigned {
+                    table: table.clone(),
+                    column: column.clone(),
+                })?;
+                Ok(RowKeySource::None)
+            }
         }
     }
 
@@ -191,13 +368,19 @@ impl QueryRewriter {
                     let Some(ident) = column.0.last() else { continue };
                     let name = normalize(ident);
                     let Some(transform) = target.columns.get(&name) else { continue };
+                    // Before the `EXCLUDED` whitelist, not after: what that
+                    // whitelist re-stores is a value sealed against the
+                    // *inserted* row's key, so it is only the right bytes for
+                    // the conflicting row when the two rows share a key —
+                    // which is exactly what a `Known` row here means.
+                    let row = self.row_of(&target.row)?;
                     if target.re_stores_a_sealed_value(value, &name) {
                         continue;
                     }
                     let transform = transform.clone();
                     let name = ident.value.clone();
                     let seal_target =
-                        SealTarget { transform: &transform, column: &name, row: &target.row };
+                        SealTarget { transform: &transform, column: &name, row: &row };
                     changed |= self.seal_expr(value, &seal_target, params)?;
                 }
                 AssignmentTarget::Tuple(names) => {
@@ -285,10 +468,11 @@ impl QueryRewriter {
 
         let mut changed = false;
         for (position, ident, transform) in &protected {
+            let row = self.row_of(&target.row)?;
             if target.re_stores_a_sealed_value(&elements[*position], &normalize(ident)) {
                 continue;
             }
-            let seal_target = SealTarget { transform, column: &ident.value, row: &target.row };
+            let seal_target = SealTarget { transform, column: &ident.value, row: &row };
             changed |= self.seal_expr(&mut elements[*position], &seal_target, params)?;
         }
         Ok(changed)

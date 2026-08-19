@@ -72,7 +72,7 @@ impl TableScope<'_> {
 }
 
 impl ScopedTable<'_> {
-    fn matches(&self, qualifiers: &[Ident]) -> bool {
+    pub(super) fn matches(&self, qualifiers: &[Ident]) -> bool {
         match qualifiers {
             [] => true,
             [qualifier] => {

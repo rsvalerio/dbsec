@@ -64,6 +64,16 @@ pub(super) enum Unprotected<'a> {
     /// key — often meaning the application has to stop relying on a
     /// server-generated one.
     RowKeyMissing { table: String, column: String, shape: &'static str },
+    /// An assignment list on a row-bound table that writes the row key column
+    /// itself — `UPDATE users SET ssn = 'x', id = 99 WHERE id = 7`, or the
+    /// same shape in a conflict action.
+    ///
+    /// Kept apart from [`Self::RowKeyMissing`] because the statement *does*
+    /// name a row: it names the row the values are being moved out of. Sealing
+    /// against that key stores bytes the row they land in can never open, so
+    /// the remedy is to move the row and write the protected column in
+    /// separate statements, not to supply a key.
+    RowKeyReassigned { table: String, column: String },
     /// A predicate over a searchable column that no index match can express.
     Predicate { column: String, shape: &'static str },
     /// An unqualified name matching a protected column in more than one
@@ -155,6 +165,12 @@ impl Unprotected<'_> {
                 "row-bound table written without its row key; the value is stored bound to no \
                  row and will not open"
             ),
+            Self::RowKeyReassigned { table, column } => tracing::warn!(
+                table = %table,
+                row_key = %column,
+                "assignment list on a row-bound table writes its row key; a value sealed here \
+                 would be bound to the row the statement moves it out of and will not open"
+            ),
             Self::Predicate { column, shape } => tracing::warn!(
                 column,
                 shape,
@@ -235,6 +251,12 @@ impl Unprotected<'_> {
             Self::RowKeyMissing { table, column, shape } => format!(
                 "{table} binds its encrypted values to the row key {column}, but this is a \
                  {shape}; the statement must supply {column} as a literal or a parameter"
+            ),
+            Self::RowKeyReassigned { table, column } => format!(
+                "{table} binds its encrypted values to the row key {column}, and this statement \
+                 assigns {column} itself, so the value would be sealed against a row it does not \
+                 land in; change {column} in a statement that writes no protected column of \
+                 {table}"
             ),
             Self::Predicate { column, shape } => format!(
                 "searchable column {column} was used in a {shape}, which cannot be matched \

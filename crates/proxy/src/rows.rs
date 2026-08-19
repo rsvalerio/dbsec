@@ -1364,6 +1364,175 @@ pub mod tests {
         assert_eq!(pgwire::parse_data_row(&opened).unwrap()[1], Some(&b"alice@x.io"[..]));
     }
 
+    /// The sealed literals of a rewritten statement, in the order they appear.
+    fn sealed_literals(sql: &str) -> Vec<Vec<u8>> {
+        let mut out = Vec::new();
+        let mut rest = sql;
+        while let Some(start) = rest.find("\\x") {
+            let tail = &rest[start + 2..];
+            let end = tail.find('\'').expect("terminated literal");
+            out.push(hex::decode(&tail[..end]).expect("hex literal"));
+            rest = &tail[end..];
+        }
+        out
+    }
+
+    /// The rewritten SQL of a simple-protocol statement, or the refusal text.
+    fn write(rewriter: &mut crate::encrypt::QueryRewriter, sql: &str) -> Result<String, String> {
+        match rewriter.on_frame(b'Q', &query_frame(sql)).unwrap() {
+            FrameAction::Replace(body) => Ok(String::from_utf8_lossy(&body).into_owned()),
+            FrameAction::Relay => Ok(sql.to_owned()),
+            FrameAction::Reply(bytes) | FrameAction::RefuseAndClose(bytes) => {
+                Err(String::from_utf8_lossy(&bytes).into_owned())
+            }
+        }
+    }
+
+    /// The row key a `users` row with this `id` is sealed against.
+    fn key_of(id: &str) -> RowKey {
+        crate::rowkey::canonical(
+            crate::rowkey::oid::INT4,
+            crate::rowkey::Format::Text,
+            Some(id.as_bytes()),
+        )
+        .expect("canonical row key")
+    }
+
+    /// `INSERT … ON CONFLICT (id) DO UPDATE SET email = …` built the conflict
+    /// action's scope with a hardcoded `RowKeySource::None`, so the same
+    /// statement wrote `DBS3` for the inserted row and a relocatable `DBS2`
+    /// for the conflict-updated one — with no site reported, so `reject` did
+    /// not catch it either.
+    #[test]
+    fn an_upsert_binds_its_conflict_action_to_the_row_it_conflicts_on() {
+        let (_ctx, mut rewriter, _d) = row_bound_session();
+        let rewritten = write(
+            &mut rewriter,
+            "INSERT INTO users (id, email) VALUES (7, 'alice@x.io') \
+             ON CONFLICT (id) DO UPDATE SET email = 'bob@x.io'",
+        )
+        .expect("the upsert conflicts on the row key, so both values bind to it");
+
+        let sealed = sealed_literals(&rewritten);
+        assert_eq!(sealed.len(), 2, "both the value and the conflict action are sealed");
+        for stored in &sealed {
+            assert!(stored.starts_with(envelope::MAGIC_V3), "row-bound: {stored:?}");
+        }
+        let key = key_of("7");
+        assert_eq!(
+            transform(false).open(&sealed[1], Some(&key)).unwrap(),
+            Some(b"bob@x.io".to_vec()),
+            "the conflict action is bound to the row ON CONFLICT (id) names"
+        );
+    }
+
+    /// Every conflict action whose row key the statement does not pin: a
+    /// conflict on another unique column, a named constraint, MySQL's
+    /// `ON DUPLICATE KEY UPDATE`, and a multi-row `VALUES` list — each of
+    /// which updates a row that may carry any key at all.
+    #[test]
+    fn an_upsert_that_cannot_name_its_conflicting_row_is_refused() {
+        for sql in [
+            "INSERT INTO users (id, email) VALUES (7, 'a@x.io') \
+             ON CONFLICT (email) DO UPDATE SET email = 'b@x.io'",
+            "INSERT INTO users (id, email) VALUES (7, 'a@x.io') \
+             ON CONFLICT ON CONSTRAINT users_pkey DO UPDATE SET email = 'b@x.io'",
+            "INSERT INTO users (id, email) VALUES (7, 'a@x.io') \
+             ON DUPLICATE KEY UPDATE email = 'b@x.io'",
+            "INSERT INTO users (id, email) VALUES (7, 'a@x.io'), (8, 'c@x.io') \
+             ON CONFLICT (id) DO UPDATE SET email = 'b@x.io'",
+        ] {
+            let (_ctx, mut rewriter, _d) = row_bound_session();
+            let refusal = write(&mut rewriter, sql).expect_err(sql);
+            assert!(refusal.contains("row key id"), "{sql} => {refusal}");
+        }
+    }
+
+    /// `SET email = EXCLUDED.email` re-stores the value sealed for the
+    /// *inserted* row, which is the right ciphertext for the conflicting row
+    /// only when the two share a key — so it stays passed through on
+    /// `ON CONFLICT (id)` and is refused on any other target.
+    #[test]
+    fn excluded_is_re_stored_only_where_the_conflicting_row_shares_the_key() {
+        let (_ctx, mut rewriter, _d) = row_bound_session();
+        let rewritten = write(
+            &mut rewriter,
+            "INSERT INTO users (id, email) VALUES (7, 'alice@x.io') \
+             ON CONFLICT (id) DO UPDATE SET email = EXCLUDED.email",
+        )
+        .expect("re-storing the sealed value is what the column is supposed to hold");
+        assert!(rewritten.contains("EXCLUDED.email"), "{rewritten}");
+        assert_eq!(sealed_literals(&rewritten).len(), 1, "only the VALUES row is sealed");
+
+        let (_ctx, mut rewriter, _d) = row_bound_session();
+        let refusal = write(
+            &mut rewriter,
+            "INSERT INTO users (id, email) VALUES (7, 'alice@x.io') \
+             ON CONFLICT (email) DO UPDATE SET email = EXCLUDED.email",
+        )
+        .expect_err("the conflicting row's key is not the one EXCLUDED.email is sealed against");
+        assert!(refusal.contains("row key id"), "{refusal}");
+    }
+
+    /// `row_key_in_predicate` matched on the *last* ident of a compound name,
+    /// so `UPDATE … FROM` bound the value to the joined relation's key: the
+    /// `a.id = 1` arm won over `u.id = 99` and the value was sealed against a
+    /// row the statement never writes. Attacker-influenceable, because the
+    /// joined relation and its predicate are the free part of the statement.
+    #[test]
+    fn an_update_from_binds_the_target_relations_row_key_not_the_joined_ones() {
+        let (_ctx, mut rewriter, _d) = row_bound_session();
+        let rewritten = write(
+            &mut rewriter,
+            "UPDATE users u SET email = 'alice@x.io' FROM audit a WHERE a.id = 1 AND u.id = 99",
+        )
+        .expect("u.id pins the row this statement writes");
+
+        let sealed = sealed_literals(&rewritten);
+        assert_eq!(sealed.len(), 1);
+        assert_eq!(
+            transform(false).open(&sealed[0], Some(&key_of("99"))).unwrap(),
+            Some(b"alice@x.io".to_vec()),
+            "bound to the row the UPDATE writes"
+        );
+        assert!(
+            transform(false).open(&sealed[0], Some(&key_of("1"))).is_err(),
+            "never bound to the joined relation's key"
+        );
+    }
+
+    /// The same statement with the target's key left unqualified: with a join
+    /// in scope a bare `id` may belong to either relation, and the catalog
+    /// holds no columns for the unprotected one, so it is signalled rather
+    /// than guessed.
+    #[test]
+    fn an_unqualified_row_key_is_refused_once_the_statement_joins() {
+        let (_ctx, mut rewriter, _d) = row_bound_session();
+        let refusal = write(
+            &mut rewriter,
+            "UPDATE users u SET email = 'alice@x.io' FROM audit a WHERE a.id = 1 AND id = 99",
+        )
+        .expect_err("a bare id is ambiguous across the join");
+        assert!(refusal.contains("row key id"), "{refusal}");
+    }
+
+    /// An assignment list that writes the row key moves the row out from under
+    /// the key its `WHERE` pins, so a value sealed against that key lands in a
+    /// row that can never open it. Both assignment-target shapes are covered.
+    #[test]
+    fn an_update_that_also_assigns_the_row_key_is_refused() {
+        for sql in [
+            "UPDATE users SET email = 'a@x.io', id = 99 WHERE id = 7",
+            "UPDATE users SET (id, email) = (99, 'a@x.io') WHERE id = 7",
+            "INSERT INTO users (id, email) VALUES (7, 'a@x.io') \
+             ON CONFLICT (id) DO UPDATE SET email = 'b@x.io', id = 99",
+        ] {
+            let (_ctx, mut rewriter, _d) = row_bound_session();
+            let refusal = write(&mut rewriter, sql).expect_err(sql);
+            assert!(refusal.contains("assigns id itself"), "{sql} => {refusal}");
+        }
+    }
+
     /// Parse + Describe(statement) + Sync: what a driver sends the first time
     /// it sees a query.
     fn prepare(rewriter: &mut crate::encrypt::QueryRewriter, statement: &[u8], sql: &[u8]) {
