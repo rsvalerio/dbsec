@@ -10,20 +10,32 @@
 //! two protected tables both carry is reported as an unprotected site, because
 //! guessing which one was meant would rewrite a predicate against the wrong
 //! blind index and silently match nothing.
+//!
+//! A scope carries both directions of the catalog, because the two questions
+//! asked of it have different right answers for a mask-only column: a
+//! predicate over one needs no rewrite, while projecting a computation over
+//! one leaks the value the mask exists to hide. Predicate resolution goes
+//! through [`ColumnResolution`]; the projection check goes through
+//! [`ScopedTable::read_columns`].
 
 use std::sync::Arc;
 
 use dbsec_core::transform::FieldTransform;
 use sqlparser::ast::{Expr, FunctionArg, FunctionArgExpr, Ident, SelectItem};
 
-use super::catalog::{normalize, Columns};
+use super::catalog::{normalize, Columns, ReadColumns};
 
 pub(super) struct ScopedTable<'a> {
     pub(super) alias: Option<String>,
     /// The table's name parts, normalized — owned so the scope does not
     /// borrow the statement it was built from, which the rewrite mutates.
     pub(super) name: Vec<String>,
+    /// The write direction: the columns a statement here has to seal. Empty
+    /// for a table whose only protection is a read-path mask.
     pub(super) columns: &'a Columns,
+    /// The read direction: every column name the read path protects here,
+    /// mask-only ones included. See [`ReadColumns`].
+    pub(super) read_columns: &'a ReadColumns,
 }
 
 /// Protected tables a predicate can reference.
@@ -68,6 +80,25 @@ impl TableScope<'_> {
         } else {
             ColumnResolution::One(transform)
         }
+    }
+
+    /// Whether a (possibly qualified) column reference names a column the
+    /// *read* path protects.
+    ///
+    /// Deliberately not a [`ColumnResolution`]. Ambiguity matters to the write
+    /// direction because it has to pick a blind index to compare against, and
+    /// picking wrong matches the wrong rows. Here nothing is rewritten: the
+    /// only question is whether the value leaving the server is one the read
+    /// path was supposed to open or mask, and "some protected table in scope
+    /// carries this name" already answers it. Two candidates are the same
+    /// answer as one.
+    fn resolves_read(&self, idents: &[Ident]) -> bool {
+        let Some((column, qualifiers)) = idents.split_last() else { return false };
+        let column = normalize(column);
+        self.tables
+            .iter()
+            .filter(|table| table.matches(qualifiers))
+            .any(|table| table.read_columns.contains(&column))
     }
 }
 
@@ -170,12 +201,21 @@ pub(super) fn expr_operands(expr: &Expr) -> Vec<&Expr> {
     }
 }
 
-/// The first protected column an expression references, however deeply.
-pub(super) fn protected_reference(expr: &Expr, scope: &TableScope<'_>) -> Option<String> {
-    if column_ref(scope, expr).is_some() {
+/// Whether an expression *is* a reference to a read-protected column.
+fn read_column_ref(scope: &TableScope<'_>, expr: &Expr) -> bool {
+    match expr {
+        Expr::Identifier(ident) => scope.resolves_read(std::slice::from_ref(ident)),
+        Expr::CompoundIdentifier(idents) => scope.resolves_read(idents),
+        _ => false,
+    }
+}
+
+/// The first read-protected column an expression references, however deeply.
+fn read_protected_reference(expr: &Expr, scope: &TableScope<'_>) -> Option<String> {
+    if read_column_ref(scope, expr) {
         return column_name(expr);
     }
-    expr_operands(expr).into_iter().find_map(|child| protected_reference(child, scope))
+    expr_operands(expr).into_iter().find_map(|child| read_protected_reference(child, scope))
 }
 
 /// A projection item that computes over a protected column rather than
@@ -190,8 +230,17 @@ pub(super) fn protected_reference(expr: &Expr, scope: &TableScope<'_>) -> Option
 ///
 /// The read path cannot recover from this on its own: an expression output is
 /// named `?column?` unless the client aliases it, so there is nothing left to
-/// match on. The statement, however, still says plainly which column is being
-/// computed over, so the decision is made here while that is still knowable.
+/// match on. `SELECT lower(email) FROM users` is worse than that — PostgreSQL
+/// names the field `lower`, so `rows::check_for_stale_mapping`'s name-based
+/// backstop matches nothing either. The statement, however, still says plainly
+/// which column is being computed over, so the decision is made here while
+/// that is still knowable.
+///
+/// Resolution runs against the *read* direction of the scope, not the write
+/// one. The write direction has no entry for a mask-only column — a plaintext
+/// write to one is correct — so resolving against it raised no site for
+/// exactly the case this doc opens with, where the stored value *is* the
+/// plaintext and the mask is the only thing that ever hid it.
 pub(super) fn computed_protected_column<'a>(
     item: &'a SelectItem,
     scope: &TableScope<'_>,
@@ -200,11 +249,12 @@ pub(super) fn computed_protected_column<'a>(
         SelectItem::UnnamedExpr(expr) | SelectItem::ExprWithAlias { expr, .. } => expr,
         SelectItem::QualifiedWildcard(..) | SelectItem::Wildcard(_) => return None,
     };
-    // A bare column reference is the case the read path handles correctly.
-    if column_ref(scope, expr).is_some() {
+    // A bare column reference is the case the read path handles correctly:
+    // it arrives with a real `(table_oid, attnum)` to match on.
+    if read_column_ref(scope, expr) {
         return None;
     }
-    Some((protected_reference(expr, scope)?, expr))
+    Some((read_protected_reference(expr, scope)?, expr))
 }
 
 pub(super) fn column_name(expr: &Expr) -> Option<String> {
@@ -225,9 +275,11 @@ pub(super) fn column_name(expr: &Expr) -> Option<String> {
 /// plaintext*, which is true of `encrypt` without `searchable`, of `fpe` and
 /// of `token` just as much as of a searchable column — the searchable ones
 /// are merely the subset the rewriter can also *fix*. Mask-only columns are
-/// not protected here at all: [`WriteCatalog::new`] skips columns with no
-/// transform, so they never enter the scope and their predicates are correct
-/// as written.
+/// not protected here at all: they carry no transform, so they are absent from
+/// [`ScopedTable::columns`] and every path through [`column_ref`] misses them
+/// — deliberately, because their stored form *is* the plaintext and their
+/// predicates are correct as written. They are in the scope's
+/// [`ScopedTable::read_columns`], which only the projection check consults.
 ///
 /// `IS NULL` and `IS NOT NULL` are deliberately absent: nullness survives
 /// sealing exactly. [`QueryRewriter::seal_expr`] returns early on a NULL

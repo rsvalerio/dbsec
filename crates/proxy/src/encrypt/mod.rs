@@ -139,7 +139,7 @@ use scope::{
 };
 use seal::UpdateTarget;
 
-use catalog::{normalize, Columns};
+use catalog::{normalize, Columns, ReadColumns};
 
 use unprotected::{frame, Unprotected};
 
@@ -802,6 +802,28 @@ impl QueryRewriter {
         Ok(false)
     }
 
+    /// [`Self::table`] for scope building: both directions of one table from a
+    /// single lookup, so an unresolvable `search_path` is reported once rather
+    /// than once per direction. See [`WriteCatalog::scoped`].
+    ///
+    /// The `search_path` guard is the read direction's, which is the wider of
+    /// the two: a table whose only protected column is mask-only is not in
+    /// [`WriteCatalog::may_be_protected`] at all, and a scope that dropped it
+    /// on an untrusted `search_path` would leave the projection check blind to
+    /// the one case where the stored value is the plaintext.
+    fn scoped_table(
+        &self,
+        name: &ObjectName,
+    ) -> Result<Option<(&Columns, &ReadColumns)>, Rejection> {
+        if self.search_path_trusted || name.0.len() > 1 {
+            return Ok(self.catalog.scoped(name));
+        }
+        if self.catalog.may_protect_reads(name) {
+            self.unprotected(&Unprotected::SearchPath(name))?;
+        }
+        Ok(None)
+    }
+
     fn rewrite_sql(&mut self, query: &[u8]) -> Result<SqlOutcome, Error> {
         let Ok(text) = std::str::from_utf8(query) else {
             return self.unprotected_sql(&Unprotected::NonUtf8);
@@ -1095,6 +1117,10 @@ impl QueryRewriter {
                 alias: insert.table_alias.as_ref().map(normalize),
                 name: insert.table_name.0.iter().map(normalize).collect(),
                 columns,
+                // The write lookup above already resolved the name, so the
+                // read direction is fetched without repeating its
+                // `search_path` guard — reaching here means the name resolved.
+                read_columns: self.catalog.read_columns_of(&insert.table_name),
             }],
         };
         // Which row the conflict action writes, read before `insert.on` is
@@ -1445,11 +1471,12 @@ impl QueryRewriter {
         for factor in factors {
             match factor {
                 TableFactor::Table { name, alias, .. } => {
-                    let Some(columns) = self.table(name)? else { continue };
+                    let Some((columns, read_columns)) = self.scoped_table(name)? else { continue };
                     tables.push(ScopedTable {
                         alias: alias.as_ref().map(|alias| normalize(&alias.name)),
                         name: name.0.iter().map(normalize).collect(),
                         columns,
+                        read_columns,
                     });
                 }
                 TableFactor::NestedJoin { table_with_joins, .. } => {
@@ -3392,6 +3419,77 @@ mod tests {
         assert_eq!(events.len(), out.len(), "one warning per read, none for the write: {events:?}");
         for event in events.iter() {
             assert!(event.contains("notes"), "{event}");
+        }
+    }
+
+    /// `SELECT lower(body) FROM notes` on a mask-only column is the sharpest
+    /// form of the computed-projection leak and used to be the one case
+    /// neither direction saw.
+    ///
+    /// The write catalog has no entry for a mask-only column — a plaintext
+    /// write to one is correct — so resolving the projection against it raised
+    /// nothing. The read path's own backstop misses it too: PostgreSQL names
+    /// the field `lower`, not `body`, so a name-based match finds nothing to
+    /// act on, and the *stored* value is the plaintext. Under `reject` the
+    /// statement was relayed and the client got the value the mask exists to
+    /// hide, with no signal from either end.
+    ///
+    /// A bare `SELECT body` must stay silent: it arrives with a real
+    /// `(table_oid, attnum)` and the read path masks it correctly, so
+    /// reporting it would refuse working SQL under `reject`.
+    #[test]
+    fn a_computed_mask_only_projection_is_a_write_path_site_in_both_modes() {
+        use tracing_subscriber::layer::SubscriberExt as _;
+
+        let computed = [
+            "SELECT lower(body) FROM notes",
+            "SELECT body || '' FROM notes",
+            "SELECT coalesce(body, '') AS body FROM notes",
+            "SELECT lower(n.body) FROM notes n",
+        ];
+
+        let mut strict = rewriter(mask_only_catalog(OnUnprotected::Reject));
+        for sql in computed {
+            let action = strict.on_frame(b'Q', &query_frame(sql)).unwrap();
+            let message = refusal(&action);
+            assert!(message.contains("body"), "{sql}: {message}");
+            assert!(message.contains("cannot be decrypted or masked"), "{sql}: {message}");
+        }
+
+        // Selecting the column directly is what the read path handles, so it
+        // is relayed untouched under the fail-closed policy.
+        for sql in ["SELECT body FROM notes", "SELECT n.body FROM notes n", "SELECT * FROM notes"] {
+            assert!(
+                matches!(strict.on_frame(b'Q', &query_frame(sql)).unwrap(), FrameAction::Relay),
+                "{sql}"
+            );
+        }
+
+        let _capture = crate::log_capture();
+        let captured = crate::CapturedEvents::default();
+        let subscriber = tracing_subscriber::registry().with(captured.clone());
+        tracing::subscriber::with_default(subscriber, || {
+            let mut permissive = rewriter(mask_only_catalog(OnUnprotected::Warn));
+            for sql in computed.iter().chain(&["SELECT body FROM notes"]) {
+                assert!(
+                    matches!(
+                        permissive.on_frame(b'Q', &query_frame(sql)).unwrap(),
+                        FrameAction::Relay
+                    ),
+                    "{sql}"
+                );
+            }
+        });
+
+        let events = captured.events();
+        assert_eq!(
+            events.len(),
+            computed.len(),
+            "one warning per computed projection, none for the direct select: {events:?}"
+        );
+        for event in events.iter() {
+            assert!(event.contains("read path cannot decrypt or mask"), "{event}");
+            assert!(event.contains("body"), "{event}");
         }
     }
 

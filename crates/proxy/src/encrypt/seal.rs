@@ -140,6 +140,10 @@ impl QueryRewriter {
             alias: alias.as_ref().map(|alias| normalize(&alias.name)),
             name: name.0.iter().map(normalize).collect(),
             columns,
+            // Only the write direction is consulted below — this scope exists
+            // to find the row key in a predicate — but a `ScopedTable` carries
+            // both, so the read direction is filled in from the same name.
+            read_columns: self.catalog.read_columns_of(name),
         };
         let joined = target.from.is_some() || !target.table.joins.is_empty();
         let found = target

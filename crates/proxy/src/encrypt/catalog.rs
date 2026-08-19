@@ -10,6 +10,9 @@
 //! from it: writing plaintext to one is correct. [`WriteCatalog::protects_reads`]
 //! answers "does reading this hand the client something the read path must act
 //! on", where a mask-only column is exactly the case that matters.
+//! [`WriteCatalog::scoped`] hands out both at once, which is what lets a
+//! `TableScope` resolve a predicate against the write direction and a
+//! projection against the read one without asking twice.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -23,6 +26,14 @@ use crate::config::{fold_identifier, OnUnprotected};
 /// The protected columns of one table, keyed by column name.
 pub(super) type Columns = HashMap<String, Arc<dyn FieldTransform>>;
 
+/// The names of one table's columns the *read* path protects — the
+/// transformed ones and the mask-only ones alike.
+///
+/// A superset of [`Columns`]' keys, and the reason it exists: a mask-only
+/// column has no transform, so it is absent from `Columns` by design, yet
+/// reading it is exactly the case the read path must act on.
+pub(super) type ReadColumns = HashSet<String>;
+
 /// Protected columns keyed by name for SQL matching:
 /// `(schema, table) → column → transform`.
 pub struct WriteCatalog {
@@ -31,13 +42,19 @@ pub struct WriteCatalog {
     /// can be recognised as *possibly* protected even when `search_path` no
     /// longer says which schema it resolves to.
     bare_names: HashSet<String>,
-    /// The tables the *read* path has something to do to, which is a superset
-    /// of `tables`: a mask-only column has no transform, so it is not in the
-    /// write catalog at all, but the mask applied on the way out is the only
-    /// thing protecting it. See [`Self::protects_reads`].
-    read_tables: HashSet<(String, String)>,
-    /// The `bare_names` of `read_tables`.
+    /// The columns the *read* path has something to do to, keyed by table.
+    /// A superset of `tables`: a mask-only column has no transform, so it is
+    /// not in the write catalog at all, but the mask applied on the way out is
+    /// the only thing protecting it. See [`Self::protects_reads`].
+    read_columns: HashMap<(String, String), ReadColumns>,
+    /// The `bare_names` of `read_columns`' tables.
     read_bare_names: HashSet<String>,
+    /// Handed out for a table that protects reads but has nothing to seal, so
+    /// [`Self::scoped`] can answer with a `&Columns` without the caller having
+    /// to special-case a table whose only protection is a mask.
+    no_columns: Columns,
+    /// The `no_columns` of the read direction, for [`Self::read_columns_of`].
+    no_read_columns: ReadColumns,
     pub(super) on_unprotected: OnUnprotected,
 }
 
@@ -45,14 +62,17 @@ impl WriteCatalog {
     pub fn new(columns: &[ProtectedColumn], on_unprotected: OnUnprotected) -> Self {
         let mut tables: HashMap<_, Columns> = HashMap::new();
         let mut bare_names = HashSet::new();
-        let mut read_tables = HashSet::new();
+        let mut read_columns: HashMap<_, ReadColumns> = HashMap::new();
         let mut read_bare_names = HashSet::new();
         for column in columns {
             // Every configured column protects the read path somehow: config
             // validation refuses `transform = "none"` without a mask, so a
             // column with no transform always carries one.
             read_bare_names.insert(column.table.clone());
-            read_tables.insert((column.schema.clone(), column.table.clone()));
+            read_columns
+                .entry((column.schema.clone(), column.table.clone()))
+                .or_default()
+                .insert(column.column.clone());
             // Mask-only columns have no transform; their writes pass through.
             let Some(transform) = &column.transform else { continue };
             bare_names.insert(column.table.clone());
@@ -61,7 +81,15 @@ impl WriteCatalog {
                 .or_default()
                 .insert(column.column.clone(), transform.clone());
         }
-        Self { tables, bare_names, read_tables, read_bare_names, on_unprotected }
+        Self {
+            tables,
+            bare_names,
+            read_columns,
+            read_bare_names,
+            no_columns: Columns::new(),
+            no_read_columns: ReadColumns::new(),
+            on_unprotected,
+        }
     }
 
     /// Looks a table up the way Postgres would resolve the SQL name: the last
@@ -88,7 +116,32 @@ impl WriteCatalog {
     /// past the read path — `COPY … TO`, in either of its two forms — hands
     /// the client exactly what the mask exists to withhold.
     pub(super) fn protects_reads(&self, name: &ObjectName) -> bool {
-        resolved_name(name).is_some_and(|key| self.read_tables.contains(&key))
+        resolved_name(name).is_some_and(|key| self.read_columns.contains_key(&key))
+    }
+
+    /// The read direction of one table on its own, empty when the table
+    /// protects no reads. For a caller that already resolved the write
+    /// direction and only needs the other half.
+    pub(super) fn read_columns_of(&self, name: &ObjectName) -> &ReadColumns {
+        resolved_name(name)
+            .and_then(|key| self.read_columns.get(&key))
+            .unwrap_or(&self.no_read_columns)
+    }
+
+    /// Both directions of one table at once, for building a `TableScope`.
+    ///
+    /// A scope answers two different questions about the same statement —
+    /// "which transform seals this predicate" (write direction) and "does
+    /// projecting this hand the client something the read path must act on"
+    /// (read direction) — so it needs both halves, and needs them from a
+    /// single lookup: two would report an unresolvable `search_path` twice for
+    /// one name. `None` means the table is protected in neither direction;
+    /// a table protected only by a mask answers with an empty [`Columns`],
+    /// because a plaintext write to it is correct.
+    pub(super) fn scoped(&self, name: &ObjectName) -> Option<(&Columns, &ReadColumns)> {
+        let key = resolved_name(name)?;
+        let read = self.read_columns.get(&key)?;
+        Some((self.tables.get(&key).unwrap_or(&self.no_columns), read))
     }
 
     /// [`Self::may_be_protected`] for the read direction.
