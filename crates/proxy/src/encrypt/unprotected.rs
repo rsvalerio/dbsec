@@ -162,8 +162,11 @@ impl Unprotected<'_> {
                 table = %table,
                 row_key = %column,
                 shape,
-                "row-bound table written without its row key; the value is stored bound to no \
-                 row and will not open"
+                "row-bound table written without its row key; the value is sealed against its \
+                 column only. It still decrypts — what is lost is relocation detection: it can \
+                 be copied into another row of this column undetected until it is re-encrypted. \
+                 Set strict_row_binding on this [[table]] to have such a value refused on read \
+                 instead of opening"
             ),
             Self::RowKeyReassigned { table, column } => tracing::warn!(
                 table = %table,
