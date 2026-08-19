@@ -3,7 +3,8 @@
 //! Not a QA gate — it is a stopwatch, not an assertion. Run it with:
 //!
 //! ```text
-//! cargo test -p dbsec-core --release --test bench -- --ignored --nocapture
+//! cargo nextest run -p dbsec-core --release --test bench \
+//!     --run-ignored ignored-only --no-capture
 //! ```
 //!
 //! It exists to justify caching cipher state per key instead of rebuilding it
@@ -65,7 +66,7 @@ fn measure(label: &str, mut op: impl FnMut(usize)) {
 }
 
 #[test]
-#[ignore = "throughput measurement, not a correctness gate; run with --ignored --nocapture"]
+#[ignore = "throughput measurement, not a correctness gate; run with --run-ignored ignored-only --no-capture"]
 fn seal_open_throughput() {
     let keys: Arc<dyn KeySource> = Arc::new(BenchKeys);
     let plaintexts: Vec<Vec<u8>> =

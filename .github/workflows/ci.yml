@@ -8,6 +8,40 @@ on:
 jobs:
   rust:
     uses: rsvalerio/forge/.github/workflows/rust-ci.yml@v1
+    with:
+      # The shared workflow's test job runs `cargo test`. This repo runs the
+      # suite under nextest instead, in the `test` job below, so the shared one
+      # is turned off rather than duplicated. Every other gate (fmt, check,
+      # clippy, build, deny) still comes from forge.
+      run-tests: false
+
+  test:
+    name: Test
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+    env:
+      CARGO_TERM_COLOR: always
+      RUST_BACKTRACE: 1
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          rustflags: ""
+      - name: Install cargo-nextest
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-nextest
+      # No `--run-ignored`: every ignored test needs the Postgres/OpenBao
+      # services, and those suites run in `e2e.yml`. Doctests are a separate
+      # step because nextest does not run them.
+      - name: cargo nextest run --all --all-features
+        run: cargo nextest run --all --all-features
+      - name: cargo test --all --all-features --doc
+        run: cargo test --all --all-features --doc
 
   # Not in the shared `rust-ci` workflow, which runs fmt, check, clippy, build,
   # test and deny — all of them compiler lints. `broken_intra_doc_links = "deny"`

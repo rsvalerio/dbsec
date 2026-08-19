@@ -1,6 +1,6 @@
 name: e2e
-# The forge `rust-ci` workflow runs the QA gates, and `cargo test` skips the
-# e2e suites because they are `#[ignore]`d — they need a database. This
+# The QA gates (forge's `rust-ci`, plus the nextest `test` job in `ci.yml`)
+# skip the e2e suites because they are `#[ignore]`d — they need a database. This
 # workflow supplies the services and runs them, using the same
 # DBSEC_E2E_DSN / DBSEC_E2E_VAULT_ADDR hooks the Makefile takes, so nothing
 # here starts containers of its own.
@@ -46,6 +46,10 @@ jobs:
           python-version: '3.x'
       - name: Install the psycopg drivers
         run: pip install --quiet 'psycopg[binary]' psycopg2-binary
+      - name: Install cargo-nextest
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-nextest
       - uses: actions/cache@v4
         with:
           path: |
@@ -99,6 +103,10 @@ jobs:
             -d '{"type":"transit"}' "$DBSEC_E2E_VAULT_ADDR/v1/sys/mounts/transit"
           curl -sf -X POST -H "X-Vault-Token: $DBSEC_E2E_VAULT_TOKEN" \
             -d '{}' "$DBSEC_E2E_VAULT_ADDR/v1/transit/keys/dbsec"
+      - name: Install cargo-nextest
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-nextest
       - uses: actions/cache@v4
         with:
           path: |

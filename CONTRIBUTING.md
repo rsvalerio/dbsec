@@ -12,12 +12,13 @@ no nightly, except for `make fuzz`, which needs nightly plus `cargo-fuzz`.
 git clone https://github.com/rsvalerio/dbsec
 cd dbsec
 cargo build --all --all-features
+cargo install cargo-nextest --locked   # the runner `make test` and CI use
 ```
 
 `make help` lists every target. The two worth knowing up front:
 
 ```bash
-make check   # every QA gate, via `ops verify qa` (fmt, clippy, check, test)
+make check   # every QA gate, via `ops verify qa` (fmt, clippy, build, deps, tests)
 make e2e     # the driver matrix against a dockerized Postgres
 ```
 
@@ -45,13 +46,16 @@ All of these must pass — CI enforces them:
 ```bash
 cargo fmt --all --check
 cargo clippy --all --all-features -- -D warnings
-cargo test --all --all-features
+cargo nextest run --all --all-features
+cargo test --all --all-features --doc
 ```
 
 If you touch dependencies, also run `cargo deny check`.
 
-These are the same gates the shared `rust-ci` workflow runs, so a green local run means a
-green CI run. Note `cargo fmt --all --check` **checks** rather than reformats: a
+The fmt, clippy and dependency gates come from the shared `rust-ci` workflow; the tests
+are this repo's own CI job, because nextest replaces `cargo test` there — and because
+nextest does not run doctests, they stay a separate `cargo test --doc` run. Either way a
+green local run means a green CI run. Note `cargo fmt --all --check` **checks** rather than reformats: a
 misformatted tree fails rather than silently fixing itself.
 
 ## Commit messages
