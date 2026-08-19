@@ -256,6 +256,26 @@ pub enum RowSource {
 /// the name is closed or re-parsed.
 type StatementId = u64;
 
+/// Identifies one queued Execute. Minted per Execute and never reused, so the
+/// Execute that started a copy stays identifiable however the queue moves
+/// around it.
+type ExecuteId = u64;
+
+/// Whether a copy is in progress, and which Execute started it.
+///
+/// Only the read path can answer the first half — the CopyInResponse travels
+/// upstream→client — and only the queue can answer the second, which is why
+/// both live here. See [`SessionPortals::copy_data`].
+#[derive(Clone, Copy, Default)]
+enum CopyIn {
+    /// No copy in progress: every `d`/`c`/`f` frame is a stray.
+    #[default]
+    Idle,
+    /// A copy started by the Execute with this id, or by a simple-protocol
+    /// `COPY ... FROM STDIN`, which has no Execute at all (`None`).
+    Started(Option<ExecuteId>),
+}
+
 /// The statement a queued Describe is about: its name, to find the map entry,
 /// and its id, to confirm the entry is still the same incarnation.
 struct StatementRef {
@@ -301,6 +321,12 @@ enum Pending {
     /// captured here for the same reason: the portal may be closed or rebound
     /// before its rows come back.
     Execute {
+        /// Identifies *this* Execute among the ones queued. A copy is started
+        /// by one particular Execute, and the batch marker that has to be
+        /// dropped is the one that Execute queued behind it — not whichever
+        /// Execute happens to be last in a pipelined queue. See
+        /// [`SessionPortals::copy_data`].
+        id: ExecuteId,
         statement: Option<StatementId>,
         positions: Option<Positions>,
         result_formats: ResultFormats,
@@ -327,12 +353,15 @@ struct Tracked {
     /// Source of [`StatementId`]s. Monotonic for the life of the session, so
     /// an id is never reused and a stale reference can only fail to match.
     next_statement_id: StatementId,
+    /// Source of [`ExecuteId`]s, monotonic for the life of the session for the
+    /// same reason.
+    next_execute_id: ExecuteId,
     /// Whether the backend has answered with a CopyInResponse (or a
     /// CopyBothResponse) that no CopyDone/CopyFail or ReadyForQuery has
-    /// finished yet. Only the read path can know this — the response travels
-    /// upstream→client — which is why it lives here rather than in the write
-    /// path that consumes it. See [`Self::copy_data`].
-    copy_in: bool,
+    /// finished yet, and which Execute it answered. Only the read path can know
+    /// this — the response travels upstream→client — which is why it lives here
+    /// rather than in the write path that consumes it. See [`Self::copy_data`].
+    copy_in: CopyIn,
 }
 
 /// One session's extended-protocol state, shared by its two relay tasks.
@@ -447,7 +476,9 @@ impl SessionPortals {
             Some((id, described)) => (Some(id), described),
             None => (None, None),
         };
-        push(&mut tracked, Pending::Execute { statement, positions, result_formats })
+        let id = tracked.next_execute_id;
+        tracked.next_execute_id += 1;
+        push(&mut tracked, Pending::Execute { id, statement, positions, result_formats })
     }
 
     /// The backend answered with CopyInResponse or CopyBothResponse: from here
@@ -457,8 +488,21 @@ impl SessionPortals {
     /// Observed by the *read* path, because that is the direction the response
     /// travels in. The write path cannot tell a payload frame from a stray one
     /// on its own — see [`Self::copy_data`].
+    ///
+    /// This is also the only moment at which the Execute that started the copy
+    /// is unambiguous: the read path consumes expectations in order, so the
+    /// entry this response answers is the one at the front of the queue. It is
+    /// recorded now rather than inferred later, when a pipelined batch behind
+    /// the copy has already made "the last Execute" mean something else. A
+    /// simple-protocol `COPY ... FROM STDIN` has no Execute at all, which is
+    /// recorded as such.
     pub fn copy_in_started(&self) {
-        self.tracked().copy_in = true;
+        let mut tracked = self.tracked();
+        let execute = match tracked.pending.front() {
+            Some(Pending::Execute { id, .. }) => Some(*id),
+            _ => None,
+        };
+        tracked.copy_in = CopyIn::Started(execute);
     }
 
     /// The client sent `CopyData`, `CopyDone` or `CopyFail` (`msg_type` is
@@ -473,9 +517,14 @@ impl SessionPortals {
     /// then on every expectation is one response behind — which surfaces as a
     /// DataRow the read path cannot attribute to any portal.
     ///
-    /// Only markers queued after the Execute that started the copy are
-    /// dropped. A simple-protocol `COPY ... FROM STDIN` has no Execute and its
-    /// ReadyForQuery is not skipped, so its marker stays.
+    /// Only the markers of the copy's *own* batch are dropped: the run of
+    /// `Batch` entries immediately behind the Execute that started the copy,
+    /// which [`Self::copy_in_started`] recorded by id. Locating that Execute as
+    /// "the last one in the queue" instead was wrong for exactly the shape this
+    /// guards — a client that pipelines a second batch behind the copy, whose
+    /// Execute is the later one, so the marker dropped was that batch's and the
+    /// copy's own stayed. A simple-protocol `COPY ... FROM STDIN` has no
+    /// Execute and its ReadyForQuery is not skipped, so its marker stays.
     ///
     /// **Outside copy mode nothing here moves.** PostgreSQL discards `d`/`c`/
     /// `f` received outside a copy silently — no ErrorResponse, no
@@ -488,23 +537,26 @@ impl SessionPortals {
     /// refusal of its own session (SEC-33).
     pub fn copy_data(&self, msg_type: u8) {
         let mut tracked = self.tracked();
-        if !tracked.copy_in {
+        let CopyIn::Started(started_by) = tracked.copy_in else {
             return;
-        }
+        };
         // CopyDone/CopyFail end the copy: the backend leaves copy-in mode and
         // answers the Execute, so it is no longer skipping anything.
         if msg_type != COPY_DATA {
-            tracked.copy_in = false;
+            tracked.copy_in = CopyIn::Idle;
         }
-        let Some(execute) =
-            tracked.pending.iter().rposition(|p| matches!(p, Pending::Execute { .. }))
+        let Some(started_by) = started_by else {
+            return;
+        };
+        let Some(execute) = tracked
+            .pending
+            .iter()
+            .position(|p| matches!(p, Pending::Execute { id, .. } if *id == started_by))
         else {
             return;
         };
-        while tracked.pending.len() > execute + 1
-            && matches!(tracked.pending.back(), Some(Pending::Batch))
-        {
-            tracked.pending.pop_back();
+        while matches!(tracked.pending.get(execute + 1), Some(Pending::Batch)) {
+            tracked.pending.remove(execute + 1);
         }
     }
 
@@ -606,7 +658,7 @@ impl SessionPortals {
         // one message copy-in suppresses. This is the backstop for a copy that
         // ended some other way — an ErrorResponse mid-payload, a CopyDone the
         // proxy never saw because the client pipelined past it.
-        tracked.copy_in = false;
+        tracked.copy_in = CopyIn::Idle;
         while let Some(pending) = tracked.pending.pop_front() {
             if matches!(pending, Pending::Batch) {
                 break;
@@ -742,6 +794,46 @@ mod tests {
         portals.describe_answered(&positions(1));
         portals.expect_execute(b"").unwrap();
         assert!(matches!(portals.row_source(), RowSource::Portal(..)));
+    }
+
+    /// A client may pipeline a whole second batch behind the copy's Execute.
+    /// Only the copy's own marker is ignored by the backend, so only that one
+    /// may be dropped: locating the copy by "the last Execute in the queue"
+    /// found the *second* batch's Execute and dropped that batch's marker
+    /// instead, leaving the copy's marker to absorb a ReadyForQuery that was
+    /// never coming and every response behind it one expectation out.
+    #[test]
+    fn a_batch_pipelined_behind_a_copy_keeps_its_own_marker() {
+        let portals = portals();
+        portals.parse(b"c", ParamTransforms::default()).unwrap();
+        portals.bind(b"", b"c", ResultFormats::default()).unwrap();
+        portals.expect_execute(b"").unwrap(); // COPY ... FROM STDIN
+        portals.expect_batch().unwrap(); // ignored by the backend
+
+        // A second batch, on the wire before the CopyInResponse came back.
+        portals.parse(b"s", ParamTransforms::default()).unwrap();
+        portals.bind(b"p", b"s", ResultFormats::default()).unwrap();
+        portals.expect_describe(Target::Portal, b"p").unwrap();
+        portals.expect_execute(b"p").unwrap();
+        portals.expect_batch().unwrap();
+
+        portals.copy_in_started();
+        portals.copy_data(COPY_DATA);
+
+        // The copy's own marker is the one that went; the second batch is
+        // untouched, so once the copy's CommandComplete settles its Execute
+        // that batch's description still lands on its own Execute.
+        portals.execute_answered();
+        portals.describe_answered(&positions(2));
+        let RowSource::Portal(found, _) = portals.row_source() else {
+            panic!("the batch pipelined behind the copy must keep its expectations");
+        };
+        assert_eq!(found.columns().len(), 2);
+
+        // ...and its marker is still there to absorb its own ReadyForQuery.
+        portals.execute_answered();
+        portals.batch_answered();
+        assert!(matches!(portals.row_source(), RowSource::LastDescription));
     }
 
     /// A simple-protocol `COPY ... FROM STDIN` has no Execute: its
