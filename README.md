@@ -1,8 +1,8 @@
 # dbsec
 
-Transparent PostgreSQL proxy for field-level encryption — a deliberately small
-Acra replacement. A library (`dbsec-core`) does the work; the `dbsec` binary is
-a thin tokio TCP wrapper around it.
+Transparent PostgreSQL proxy for field-level encryption — deliberately small.
+A library (`dbsec-core`) does the work; the `dbsec` binary is a thin tokio TCP
+wrapper around it.
 
 - AES-256-GCM ciphertext envelope with key ids (rotation-friendly) and the column bound
   into the associated data, so stored bytes do not authenticate in another column;
@@ -11,7 +11,9 @@ a thin tokio TCP wrapper around it.
 - Storage-free pseudonymization (FF1 FPE + HMAC tokens) and read-path masking
 - TLS on both hops (rustls), flat TOML config, PostgreSQL only
 
-Status: scaffold. Roadmap and design in [plans/PLAN.md](plans/PLAN.md).
+Status: scaffold. Roadmap and design in [plans/PLAN.md](plans/PLAN.md); how it
+compares to Acra, CipherStash and the rest in
+[plans/COMPARISON.md](plans/COMPARISON.md).
 
 ## Operating the proxy
 
