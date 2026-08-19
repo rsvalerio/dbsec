@@ -3,11 +3,11 @@ id: TASK-0162
 title: >-
   TEST-20: a CLI test binds a hardcoded global port and can hang the suite
   indefinitely
-status: To Do
+status: Done
 assignee:
   - TASK-0182
 created_date: '2026-08-19 08:31'
-updated_date: '2026-08-19 09:01'
+updated_date: '2026-08-19 09:25'
 labels:
   - code-review-rust
   - test-quality
@@ -38,7 +38,7 @@ diagnostic.
 
 ## Acceptance Criteria
 <!-- AC:BEGIN -->
-- [ ] #1 The test observes the fallback without racing for the port, or binds with expect() so a failed setup fails loudly instead of arming a hang
-- [ ] #2 No Command::output() in cli.rs is reachable by an invocation of dbsec that stays running
-- [ ] #3 --allow-core-dumps gains at least one spawned-binary case
+- [x] #1 The test observes the fallback without racing for the port, or binds with expect() so a failed setup fails loudly instead of arming a hang
+- [x] #2 No Command::output() in cli.rs is reachable by an invocation of dbsec that stays running
+- [x] #3 --allow-core-dumps gains at least one spawned-binary case
 <!-- AC:END -->

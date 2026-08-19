@@ -1,11 +1,11 @@
 ---
 id: TASK-0171
 title: 'READ-4: a doc comment was detached from its test by the closed-pipe fix'
-status: To Do
+status: Done
 assignee:
   - TASK-0182
 created_date: '2026-08-19 08:32'
-updated_date: '2026-08-19 09:01'
+updated_date: '2026-08-19 09:25'
 labels:
   - code-review-rust
   - readability
@@ -32,6 +32,6 @@ rather than above the existing test, so the reader of the closed-pipe test is to
 
 ## Acceptance Criteria
 <!-- AC:BEGIN -->
-- [ ] #1 The TASK-0130 paragraph moves to immediately above help_is_a_startup_outcome_rather_than_a_usage_error
-- [ ] #2 a_closed_pipe_makes_help_succeed_rather_than_fail keeps only its own doc lines
+- [x] #1 The TASK-0130 paragraph moves to immediately above help_is_a_startup_outcome_rather_than_a_usage_error
+- [x] #2 a_closed_pipe_makes_help_succeed_rather_than_fail keeps only its own doc lines
 <!-- AC:END -->
