@@ -2,6 +2,65 @@
 All notable changes to this project will be documented in this file. See [conventional commits](https://www.conventionalcommits.org/) for commit guidelines.
 
 - - -
+## v0.5.0 - 2026-08-19
+#### Features
+- (**envelope**) make a cell-only value in a row-bound column refusable - (1ae82e8) - Rodrigo Valeri
+#### Bug Fixes
+- (**ci**) compare a forge waiver by what it does, not by how diff spelled it - (86e5702) - Rodrigo Valeri, *Claude Opus 5 (1M context)*
+- (**encrypt**) match a row-key reference the way PostgreSQL folds identifiers - (650dd61) - Rodrigo Valeri, *Claude Opus 5 (1M context)*
+- (**encrypt**) put a derived table's output columns in the enclosing scope - (cc2141f) - Rodrigo Valeri, *Claude Opus 5 (1M context)*
+- (**encrypt**) seal an INSERT cell-only when it cannot name its row - (358c54f) - Rodrigo Valeri, *Claude Opus 5 (1M context)*
+- (**encrypt**) report a computed mask-only column as unprotected - (740154e) - Rodrigo Valeri
+- (**encrypt**) refuse an unusable row-key Bind parameter, not the session - (b7d72f7) - Rodrigo Valeri
+- (**encrypt**) seal assignment lists against the row they actually write - (76de717) - Rodrigo Valeri
+- (**portal**) drop the batch marker of the Execute that started the copy - (a8024a8) - Rodrigo Valeri
+- (**proxy**) queue a batch marker for the legacy FunctionCall - (eaf2941) - Rodrigo Valeri
+- (**proxy**) read a row key in the format its Bind chose, and refuse an ambiguous one - (1ed573e) - Rodrigo Valeri
+- (**rowkey**) canonicalise a row key by value, not by its spelling - (a04a1c9) - Rodrigo Valeri
+- (**rows**) name the self-join that projects its row key only once - (d33a072) - Rodrigo Valeri, *Claude Opus 5 (1M context)*
+- (**rows**) say which read-path failure happened, and to which cell - (8f4ef12) - Rodrigo Valeri
+#### Performance Improvements
+- (**rows**) canonicalise a row's key once, under the type it resolved as - (e12b1ac) - Rodrigo Valeri
+#### Documentation
+- (**cli**) reattach the help-outcome comment to its own test - (3e3c59a) - Rodrigo Valeri
+- (**readme**) state which types can name a row, and that value binds - (ae53acb) - Rodrigo Valeri
+- (**readme**) state the row-binding constraints as on_unprotected sites - (1e5378b) - Rodrigo Valeri
+- (**readme**) note that a row-keyed table's key may appear once per result set - (ea2241f) - Rodrigo Valeri
+- (**readme**) state the row_key constraints on upserts and key updates - (4c0b9d4) - Rodrigo Valeri
+- (**rows**) say what the name-based computed-column backstop cannot catch - (0d06328) - Rodrigo Valeri
+- (**unprotected**) say what a missing row key actually costs - (13fca95) - Rodrigo Valeri
+- repair the broken intra-doc links and deny them going forward - (377c8d1) - Rodrigo Valeri
+#### Tests
+- (**cli**) observe the fallback and the closed pipe without racing or hanging - (6c3715c) - Rodrigo Valeri
+- (**encrypt**) drive the reassigned-row-key site the exhaustive match now demands - (cedeb5c) - Rodrigo Valeri
+- (**encrypt**) pin the refusal cap and truncate on a char boundary - (ad1d200) - Rodrigo Valeri
+- (**encrypt**) drive every unprotected site and keep the set honest - (2d0fecd) - Rodrigo Valeri
+- (**rows**) drive every row-key-missing site under warn and reject - (41d3152) - Rodrigo Valeri
+- give every log-capture test the callsite priming it needs - (df0ddc1) - Rodrigo Valeri, *Claude Opus 5 (1M context)*
+#### Continuous Integration
+- run cargo doc so the intra-doc-link deny actually fires - (5b3669d) - Rodrigo Valeri, *Claude Opus 5 (1M context)*
+#### Refactoring
+- (**encrypt**) split the shared fixtures and the end-to-end suite out of mod.rs - (a5df549) - Rodrigo Valeri, *Claude Opus 5 (1M context)*
+- (**encrypt**) split the rewriter into frame, statement, query and predicate layers - (a9c45f5) - Rodrigo Valeri
+- (**encrypt**) split the text-array element parsers out of decode_text_array - (60a77de) - Rodrigo Valeri
+#### Miscellaneous Chores
+- (**backlog**) correct the TASK-0190 record and date its claims - (80fd941) - Rodrigo Valeri, *Claude Opus 5 (1M context)*
+- (**backlog**) close code-review wave34 - (dfc3dd7) - Rodrigo Valeri
+- (**backlog**) close code-review wave37 - (201d5ff) - Rodrigo Valeri
+- (**backlog**) close code-review wave35 - (6af9ace) - Rodrigo Valeri
+- (**backlog**) close code-review wave33 - (bebd2df) - Rodrigo Valeri
+- (**backlog**) close code-review wave29 - (0829331) - Rodrigo Valeri
+- (**backlog**) close code-review wave28 - (6c20251) - Rodrigo Valeri
+- (**backlog**) close code-review wave30 - (ecdbf4f) - Rodrigo Valeri
+- (**backlog**) close code-review wave32 - (be84805) - Rodrigo Valeri
+- (**backlog**) close code-review wave27 - (516c1b6) - Rodrigo Valeri
+- (**backlog**) close code-review wave31 - (a4eedd5) - Rodrigo Valeri
+- (**backlog**) close code-review wave36 - (f1417bf) - Rodrigo Valeri
+- (**backlog**) file the formal review of the row-binding and wave work - (e4e9801) - Rodrigo Valerio, *Claude Opus 5 (1M context)*
+- save backlog tasks - (562289d) - Rodrigo Valerio
+
+- - -
+
 ## v0.4.1 - 2026-08-18
 #### Bug Fixes
 - (**cli**) treat a closed pipe as a successful --help - (ee2a89b) - Rodrigo Valerio, *Claude Opus 5 (1M context)*
