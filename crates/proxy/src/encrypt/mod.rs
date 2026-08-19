@@ -1382,8 +1382,6 @@ pub(in crate::encrypt) mod tests {
     /// setting being escaped by rewriting the statement.
     #[test]
     fn a_query_source_copy_out_over_a_protected_table_is_a_site_in_both_modes() {
-        use tracing_subscriber::layer::SubscriberExt as _;
-
         let statements = [
             "COPY (SELECT email FROM users) TO STDOUT",
             "COPY (SELECT * FROM users WHERE id = 1) TO STDOUT",
@@ -1413,10 +1411,7 @@ pub(in crate::encrypt) mod tests {
 
         // Under warn the same statements relay, each with one warning naming
         // the table — and a query over nothing protected stays silent.
-        let _capture = crate::log_capture();
-        let captured = crate::CapturedEvents::default();
-        let subscriber = tracing_subscriber::registry().with(captured.clone());
-        tracing::subscriber::with_default(subscriber, || {
+        let (_, events) = crate::captured_events(|| {
             let mut permissive = rewriter(catalog(false));
             for sql in statements.iter().chain(&["COPY (SELECT id FROM other) TO STDOUT"]) {
                 assert!(
@@ -1428,8 +1423,6 @@ pub(in crate::encrypt) mod tests {
                 );
             }
         });
-
-        let events = captured.events();
         assert_eq!(events.len(), statements.len(), "one warning each: {events:?}");
         for event in events.iter() {
             assert!(event.contains("read path cannot decrypt or mask"), "{event}");
@@ -1447,8 +1440,6 @@ pub(in crate::encrypt) mod tests {
     /// least leaves as ciphertext.
     #[test]
     fn a_mask_only_table_is_a_copy_out_site_in_both_forms_and_both_modes() {
-        use tracing_subscriber::layer::SubscriberExt as _;
-
         let out = ["COPY notes TO STDOUT", "COPY (SELECT body FROM notes) TO STDOUT"];
 
         let mut strict = rewriter(mask_only_catalog(OnUnprotected::Reject));
@@ -1475,10 +1466,7 @@ pub(in crate::encrypt) mod tests {
 
         // Under warn the reads relay with one warning each, naming the table,
         // and the write stays silent.
-        let _capture = crate::log_capture();
-        let captured = crate::CapturedEvents::default();
-        let subscriber = tracing_subscriber::registry().with(captured.clone());
-        tracing::subscriber::with_default(subscriber, || {
+        let (_, events) = crate::captured_events(|| {
             let mut permissive = rewriter(mask_only_catalog(OnUnprotected::Warn));
             for sql in out.iter().chain(&["COPY notes FROM STDIN"]) {
                 assert!(
@@ -1490,8 +1478,6 @@ pub(in crate::encrypt) mod tests {
                 );
             }
         });
-
-        let events = captured.events();
         assert_eq!(events.len(), out.len(), "one warning per read, none for the write: {events:?}");
         for event in events.iter() {
             assert!(event.contains("notes"), "{event}");
@@ -1515,8 +1501,6 @@ pub(in crate::encrypt) mod tests {
     /// reporting it would refuse working SQL under `reject`.
     #[test]
     fn a_computed_mask_only_projection_is_a_write_path_site_in_both_modes() {
-        use tracing_subscriber::layer::SubscriberExt as _;
-
         let computed = [
             "SELECT lower(body) FROM notes",
             "SELECT body || '' FROM notes",
@@ -1541,10 +1525,7 @@ pub(in crate::encrypt) mod tests {
             );
         }
 
-        let _capture = crate::log_capture();
-        let captured = crate::CapturedEvents::default();
-        let subscriber = tracing_subscriber::registry().with(captured.clone());
-        tracing::subscriber::with_default(subscriber, || {
+        let (_, events) = crate::captured_events(|| {
             let mut permissive = rewriter(mask_only_catalog(OnUnprotected::Warn));
             for sql in computed.iter().chain(&["SELECT body FROM notes"]) {
                 assert!(
@@ -1556,8 +1537,6 @@ pub(in crate::encrypt) mod tests {
                 );
             }
         });
-
-        let events = captured.events();
         assert_eq!(
             events.len(),
             computed.len(),
@@ -1945,11 +1924,6 @@ pub(in crate::encrypt) mod tests {
     /// rules exist to prevent.
     #[test]
     fn no_event_from_the_write_path_carries_a_plaintext_value() {
-        use tracing_subscriber::layer::SubscriberExt as _;
-
-        let _capture = crate::log_capture();
-        let captured = crate::CapturedEvents::default();
-        let subscriber = tracing_subscriber::registry().with(captured.clone());
         let drive = || {
             // The ambiguity site needs two protected relations in scope, so it
             // is driven through a catalog of its own.
@@ -2024,21 +1998,10 @@ pub(in crate::encrypt) mod tests {
             }
         };
 
-        // Driven twice, and the first pass is thrown away. `tracing` decides
-        // whether a callsite has any listener the first time it is hit, using
-        // whatever subscriber *that* thread has — so a site another test's
-        // thread reaches first, having none, caches "nobody is listening" and
-        // its event never reaches the capture here, however this test is
-        // ordered. The pass below puts every site this test reads on the
-        // register; `rebuild_interest_cache` then recomputes them all against
-        // the capturing subscriber, and the second pass is the one that counts.
-        drive();
-        tracing::subscriber::with_default(subscriber, || {
-            tracing::callsite::rebuild_interest_cache();
-            drive();
-        });
-
-        let lines = captured.events();
+        // [`crate::captured_events`] drives this twice and throws the first
+        // pass away — see there for why a capture test that skips that step
+        // can silently stop capturing.
+        let (_, lines) = crate::captured_events(drive);
         let events = lines.join("\n");
         assert!(events.contains("passing through unencrypted"), "the sites did emit: {events}");
         for plaintext in [

@@ -2075,8 +2075,6 @@ pub mod tests {
     /// test, so a path that fails open again fails here.
     #[test]
     fn every_site_that_cannot_name_the_row_reports_itself_in_both_modes() {
-        use tracing_subscriber::layer::SubscriberExt as _;
-
         // (sql, the shape the site reports)
         const SITES: [(&str, &str); 3] = [
             (
@@ -2103,10 +2101,7 @@ pub mod tests {
             assert!(!refusal.contains("alice@secret.test"), "{sql} => {refusal}");
         }
 
-        let _capture = crate::log_capture();
-        let captured = crate::CapturedEvents::default();
-        let subscriber = tracing_subscriber::registry().with(captured.clone());
-        let relayed = tracing::subscriber::with_default(subscriber, || {
+        let (relayed, events) = crate::captured_events(|| {
             SITES
                 .iter()
                 .map(|(sql, _)| {
@@ -2116,7 +2111,6 @@ pub mod tests {
                 .collect::<Vec<_>>()
         });
 
-        let events = captured.events();
         assert_eq!(events.len(), SITES.len(), "one warning per site: {events:?}");
         for (event, (sql, shape)) in events.iter().zip(SITES) {
             assert!(event.contains("public.users"), "{sql} => {event}");

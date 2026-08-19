@@ -162,7 +162,10 @@ impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for CapturedEvents {
                 let _ = write!(self.0, " {}={value:?}", field.name());
             }
         }
-        let mut line = String::new();
+        // The level leads the line so a test can assert on it with the same
+        // `contains` every other assertion here uses. The fields follow, each
+        // already space-prefixed, so nothing that reads only fields changes.
+        let mut line = event.metadata().level().to_string();
         event.record(&mut Fields(&mut line));
         self.0.lock().expect("captured events").push(line);
     }
@@ -174,6 +177,40 @@ impl CapturedEvents {
     pub fn events(&self) -> Vec<String> {
         self.0.lock().expect("captured events").clone()
     }
+}
+
+/// Runs `drive` under a capturing subscriber and hands back what it returned
+/// and every event it emitted.
+///
+/// `drive` is called **twice**, and the first pass is thrown away. `tracing`
+/// decides whether a callsite has any listener the first time it is hit, using
+/// whatever subscriber *that thread* has — so a site another test's thread
+/// reached first, having none, is cached as "nobody is listening" and its
+/// events never reach a capture installed later, however the suite is ordered.
+/// The discarded pass puts every site `drive` touches on the register, and
+/// `rebuild_interest_cache` then recomputes them all against the subscriber
+/// installed here.
+///
+/// That makes `drive` run twice, so it has to build its own state each time
+/// rather than closing over a rewriter or a session it mutates.
+///
+/// This is the only place the priming trick lives. Open-coded per test it was
+/// silently absent from three of the four capture tests, and a capture test
+/// that quietly stops capturing still passes every `contains` it makes — the
+/// assertions are all "an event said this", and no event says nothing.
+#[cfg(test)]
+pub fn captured_events<T>(mut drive: impl FnMut() -> T) -> (T, Vec<String>) {
+    use tracing_subscriber::layer::SubscriberExt as _;
+
+    let _capture = log_capture();
+    drop(drive());
+    let captured = CapturedEvents::default();
+    let subscriber = tracing_subscriber::registry().with(captured.clone());
+    let value = tracing::subscriber::with_default(subscriber, || {
+        tracing::callsite::rebuild_interest_cache();
+        drive()
+    });
+    (value, captured.events())
 }
 
 #[derive(Debug, thiserror::Error)]

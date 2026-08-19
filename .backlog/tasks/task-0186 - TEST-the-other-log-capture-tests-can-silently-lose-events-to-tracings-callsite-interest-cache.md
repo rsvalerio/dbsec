@@ -3,9 +3,10 @@ id: TASK-0186
 title: >-
   TEST: the other log-capture tests can silently lose events to tracing's
   callsite interest cache
-status: Triage
+status: Done
 assignee: []
 created_date: '2026-08-19 10:10'
+updated_date: '2026-08-19 12:33'
 labels:
   - code-review-rust
   - test-quality
@@ -47,6 +48,6 @@ by unrelated test scheduling is not a guard. The fix wants to be one shared help
 
 ## Acceptance Criteria
 <!-- AC:BEGIN -->
-- [ ] #1 The three remaining log-capture tests cannot lose an event to a callsite another thread registered first
-- [ ] #2 The priming/rebuild step lives in one shared test helper rather than being open-coded per test
+- [x] #1 The three remaining log-capture tests cannot lose an event to a callsite another thread registered first
+- [x] #2 The priming/rebuild step lives in one shared test helper rather than being open-coded per test
 <!-- AC:END -->
