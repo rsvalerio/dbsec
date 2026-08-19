@@ -47,25 +47,18 @@ pub mod oid {
     pub const UUID: u32 = 2950;
 }
 
-/// The wire format one value arrived in: 0 text, 1 binary, per the protocol's
-/// format codes.
+/// Which shape a row key's bytes arrived in: its ordinary text rendering, or
+/// the type's fixed-width binary encoding.
+///
+/// Deliberately not constructed from a PostgreSQL format code here. The `i16`
+/// codes belong to the wire protocol, which this crate does not speak — a
+/// caller that holds values rather than frames knows which of these two it
+/// has, and one that reads frames decodes the code where it reads them
+/// (`proxy::portal::value_format`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Format {
     Text,
     Binary,
-}
-
-impl Format {
-    /// The protocol sends format codes as `i16`. Anything but 0 or 1 is
-    /// undefined, and guessing at it would be guessing at the bytes of a value
-    /// that decides where a ciphertext belongs.
-    pub fn from_code(code: i16) -> Result<Self, Error> {
-        match code {
-            0 => Ok(Self::Text),
-            1 => Ok(Self::Binary),
-            other => Err(Error::RowKeyType(format!("unknown wire format code {other}"))),
-        }
-    }
 }
 
 /// Whether a key of this type can be canonicalised. Worth checking once,
@@ -257,7 +250,6 @@ mod tests {
             canonical(1114, Format::Text, Some(b"2026-08-19 08:00:00")),
             Err(Error::RowKeyType(_))
         ));
-        assert!(matches!(Format::from_code(7), Err(Error::RowKeyType(_))));
     }
 
     /// The write path hands `canonical` a client's spelling, not the server's

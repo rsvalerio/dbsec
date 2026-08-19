@@ -91,7 +91,7 @@ fn bind_row_key(
         RowKeySource::Literal(key) => return Ok(Some(key.clone())),
         RowKeySource::Param { index, type_oid, column } => (*index, *type_oid, column),
     };
-    let resolved = rowkey::Format::from_code(bind.param_format(index)).and_then(|format| {
+    let resolved = crate::portal::value_format(bind.param_format(index)).and_then(|format| {
         rowkey::canonical(type_oid, format, bind.params.get(index).copied().flatten())
     });
     match resolved {

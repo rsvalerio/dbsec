@@ -14,8 +14,11 @@ dependencies: []
 <!-- SECTION:DESCRIPTION:BEGIN -->
 cargo check --manifest-path fuzz/Cargo.toml fails with four errors on fuzz_targets/envelope.rs and fuzz_targets/transform.rs. Both call APIs that have since changed shape:
 
-- envelope.rs passes a &CellContext where decrypt() now takes a &Binding
-- transform.rs calls FieldTransform::open(stored) with one argument; it takes (stored, row)
+- envelope.rs passes a &CellContext as the second argument of the free function
+  envelope::decrypt(key, binding, data), which has taken a &Binding since the column
+  binding landed
+- transform.rs has three stale one-argument open(stored) calls — on EncryptTransform,
+  FpeTransform and TokenTransform — each of which now takes (stored, row)
 
 Pre-existing, not caused by the TASK-0192 refactor — confirmed by checking out HEAD and reproducing the same four errors. It went unnoticed because fuzz/ is excluded from the workspace, so neither cargo check --workspace nor the QA gates ever build it; only make fuzz does, and that is not in CI.
 

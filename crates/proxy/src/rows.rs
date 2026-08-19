@@ -1090,7 +1090,7 @@ fn read_row_key(
     })?;
     // From the Bind, not from the description: a Describe of a statement
     // reports zero for every column, whatever the portal later asked for.
-    let format = dbsec_core::rowkey::Format::from_code(formats.for_column(index))?;
+    let format = crate::portal::value_format(formats.for_column(index))?;
     Ok(dbsec_core::rowkey::canonical(type_oid, format, raw.as_deref())?)
 }
 

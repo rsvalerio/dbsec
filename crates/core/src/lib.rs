@@ -1,12 +1,20 @@
 //! dbsec-core: field-level encryption, pseudonymization and masking for
 //! PostgreSQL columns.
 //!
-//! The crate is deliberately protocol-free and I/O-free: it transforms values,
-//! and says nothing about how they reach the database. That is what lets the
-//! same primitives serve an application sealing a field before it hands it to
-//! its own driver and the `dbsec` proxy sealing the same field mid-flight —
-//! both write the identical envelope. The PostgreSQL wire codec the proxy needs
-//! lives in `dbsec-pgwire`. See plans/PLAN.md for the roadmap.
+//! The crate is deliberately protocol-free: it transforms values, and says
+//! nothing about how they reach the database. That is what lets the same
+//! primitives serve an application sealing a field before it hands it to its
+//! own driver and the `dbsec` proxy sealing the same field mid-flight — both
+//! write the identical envelope. The PostgreSQL wire codec the proxy needs
+//! lives in `dbsec-pgwire`, and the `i16` format codes stay there with it.
+//!
+//! It is not I/O-free, and the exception is exactly one type:
+//! [`keys::FileKeySource`] reads a TOML keyfile, which is why
+//! [`Error::KeyFileRead`], [`Error::KeyFileWrite`] and [`Error::KeyFileParse`]
+//! exist and why `toml` is in the dependency graph. That is a dev and test key
+//! source; an application shipping its own [`keys::KeySource`] should not have
+//! to compile a TOML parser to get an envelope, so the type is to move behind
+//! a `keyfile` feature (TASK-0192.06). See plans/PLAN.md for the roadmap.
 
 pub mod blind_index;
 pub mod envelope;

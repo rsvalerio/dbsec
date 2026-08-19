@@ -53,6 +53,7 @@ use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex, MutexGuard};
 
 use dbsec_core::envelope::RowKey;
+use dbsec_core::rowkey::Format;
 use dbsec_core::sync::Unpoisoned as _;
 use dbsec_core::transform::FieldTransform;
 
@@ -121,6 +122,22 @@ impl ResultFormats {
             Some(codes) => dbsec_pgwire::format_code(codes, index),
             None => 0,
         }
+    }
+}
+
+/// Decodes a wire format code into the shape [`dbsec_core::rowkey`] expects.
+///
+/// This is the boundary the library will not cross: the `i16` codes are the
+/// protocol's, so the mapping lives here with the other frame reading rather
+/// than inside a crate that never sees a frame. Anything but 0 or 1 is
+/// undefined, and guessing at it would be guessing at the bytes of a value
+/// that decides where a ciphertext belongs — so it is refused, as the same
+/// `RowKeyType` the rest of row-key canonicalisation reports.
+pub fn value_format(code: i16) -> Result<Format, dbsec_core::Error> {
+    match code {
+        0 => Ok(Format::Text),
+        1 => Ok(Format::Binary),
+        other => Err(dbsec_core::Error::RowKeyType(format!("unknown wire format code {other}"))),
     }
 }
 
@@ -1085,5 +1102,20 @@ mod tests {
             Err(Error::ConflictingParameter { placeholder: 1 })
         ));
         assert_eq!(params.iter().count(), 1);
+    }
+
+    /// The `i16` a client puts on the wire decides how a row key's bytes are
+    /// read, so an undefined code is refused rather than guessed at — the row
+    /// binding is only worth anything if both directions agree on the value.
+    #[test]
+    fn only_the_two_defined_format_codes_are_accepted() {
+        assert_eq!(value_format(0).unwrap(), Format::Text);
+        assert_eq!(value_format(1).unwrap(), Format::Binary);
+        for undefined in [-1, 2, i16::MAX] {
+            assert!(
+                matches!(value_format(undefined), Err(dbsec_core::Error::RowKeyType(_))),
+                "format code {undefined} was accepted"
+            );
+        }
     }
 }
