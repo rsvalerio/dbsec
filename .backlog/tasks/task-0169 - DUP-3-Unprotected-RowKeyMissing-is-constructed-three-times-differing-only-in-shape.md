@@ -3,11 +3,11 @@ id: TASK-0169
 title: >-
   DUP-3: Unprotected::RowKeyMissing is constructed three times, differing only
   in shape
-status: To Do
+status: Done
 assignee:
   - TASK-0174
 created_date: '2026-08-19 08:32'
-updated_date: '2026-08-19 09:01'
+updated_date: '2026-08-19 09:56'
 labels:
   - code-review-rust
   - duplication
@@ -35,6 +35,6 @@ really are three different statements.
 
 ## Acceptance Criteria
 <!-- AC:BEGIN -->
-- [ ] #1 A single row_key_missing helper on QueryRewriter replaces all three sites
-- [ ] #2 The three warning and refusal texts are byte-identical to today's
+- [x] #1 A single row_key_missing helper on QueryRewriter replaces all three sites
+- [x] #2 The three warning and refusal texts are byte-identical to today's
 <!-- AC:END -->

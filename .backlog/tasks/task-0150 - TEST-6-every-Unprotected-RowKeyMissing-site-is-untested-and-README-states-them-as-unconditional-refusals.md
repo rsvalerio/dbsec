@@ -3,11 +3,11 @@ id: TASK-0150
 title: >-
   TEST-6: every Unprotected::RowKeyMissing site is untested, and README states
   them as unconditional refusals
-status: To Do
+status: Done
 assignee:
   - TASK-0174
 created_date: '2026-08-19 08:27'
-updated_date: '2026-08-19 09:01'
+updated_date: '2026-08-19 10:00'
 labels:
   - code-review-rust
   - test-coverage
@@ -49,7 +49,13 @@ the suite would stay green.
 
 ## Acceptance Criteria
 <!-- AC:BEGIN -->
-- [ ] #1 A test per site drives it under Warn (relayed, exactly one warning naming table and row key) and under Reject (ErrorResponse text); row_bound_session is parameterised by policy
-- [ ] #2 A read-path test omits the row-key field from the RowDescription, feeds a DBS3 value, and asserts RefuseAndClose with the 42501 ErrorResponse
-- [ ] #3 README either says these are reported through on_unprotected (warning by default) or the sites stop consulting the policy; tests pin whichever is chosen
+- [x] #1 A test per site drives it under Warn (relayed, exactly one warning naming table and row key) and under Reject (ErrorResponse text); row_bound_session is parameterised by policy
+- [x] #2 A read-path test omits the row-key field from the RowDescription, feeds a DBS3 value, and asserts RefuseAndClose with the 42501 ErrorResponse
+- [x] #3 README either says these are reported through on_unprotected (warning by default) or the sites stop consulting the policy; tests pin whichever is chosen
 <!-- AC:END -->
+
+## Implementation Notes
+
+<!-- SECTION:NOTES:BEGIN -->
+AC #3 resolved by documenting the write-path row-binding constraints as on_unprotected sites (warning by default) in README, and pinning both modes in rows::tests::every_site_that_cannot_name_the_row_reports_itself_in_both_modes.
+<!-- SECTION:NOTES:END -->
