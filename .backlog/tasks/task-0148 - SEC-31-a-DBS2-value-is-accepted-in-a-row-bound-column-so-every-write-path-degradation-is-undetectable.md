@@ -3,11 +3,11 @@ id: TASK-0148
 title: >-
   SEC-31: a DBS2 value is accepted in a row-bound column, so every write-path
   degradation is undetectable
-status: To Do
+status: Done
 assignee:
   - TASK-0178
 created_date: '2026-08-19 08:27'
-updated_date: '2026-08-19 09:01'
+updated_date: '2026-08-19 09:39'
 labels:
   - code-review-rust
   - security
@@ -49,7 +49,13 @@ the older version, which is unguarded and reachable through ordinary SQL.
 
 ## Acceptance Criteria
 <!-- AC:BEGIN -->
-- [ ] #1 An opt-in strict mode makes a DBS2 envelope in a row-bound column an error, so back-compat is a stated migration window rather than a permanent hole
-- [ ] #2 The RowKeyMissing warning text is corrected: the value does open; what is lost is relocation detection
-- [ ] #3 A test seals with Binding::cell and asserts opening with Binding::row fails in strict mode
+- [x] #1 An opt-in strict mode makes a DBS2 envelope in a row-bound column an error, so back-compat is a stated migration window rather than a permanent hole
+- [x] #2 The RowKeyMissing warning text is corrected: the value does open; what is lost is relocation detection
+- [x] #3 A test seals with Binding::cell and asserts opening with Binding::row fails in strict mode
 <!-- AC:END -->
+
+## Implementation Notes
+
+<!-- SECTION:NOTES:BEGIN -->
+Strict mode is opt-in per [[table]] (strict_row_binding, default false) and enforced on the read path: envelope::Binding gains a `strict` flag plus Binding::row_strict, and Cipher::decrypt returns the new Error::RowBindingDowngraded for a DBS2/DBS1 value in a row-bound column. EncryptTransform carries it via a .strict_row_binding(bool) builder wired from columns::build; rows::is_refusal treats it as a client-visible refusal. RowKeyMissing warn text corrected (the value does open; what is lost is relocation detection) and README documents the migration window.
+<!-- SECTION:NOTES:END -->
