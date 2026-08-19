@@ -3,11 +3,11 @@ id: TASK-0167
 title: >-
   CL-3: copy_data drops batch markers relative to the last Execute, not the one
   that started the copy
-status: To Do
+status: Done
 assignee:
   - TASK-0179
 created_date: '2026-08-19 08:32'
-updated_date: '2026-08-19 09:01'
+updated_date: '2026-08-19 10:04'
 labels:
   - code-review-rust
   - protocol
@@ -37,6 +37,6 @@ reachable with an unusual pipeline shape.
 
 ## Acceptance Criteria
 <!-- AC:BEGIN -->
-- [ ] #1 The Execute that started the copy is identified explicitly rather than inferred as the last one
-- [ ] #2 A test pipelines a batch behind a COPY ... FROM STDIN Execute and asserts the second batch's marker survives
+- [x] #1 The Execute that started the copy is identified explicitly rather than inferred as the last one
+- [x] #2 A test pipelines a batch behind a COPY ... FROM STDIN Execute and asserts the second batch's marker survives
 <!-- AC:END -->
