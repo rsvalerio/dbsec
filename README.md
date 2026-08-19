@@ -119,10 +119,14 @@ ErrorResponse. Read-path verification is the exception and is never relaxed.
 
 The key column must be a type the proxy can canonicalise — integer, text or
 uuid — and must not itself be protected. Both are refused at startup, naming the
-column. Only `transform = "encrypt"` binds a row: `fpe` and `token` store the
-same bytes for a plaintext in every row by design, which is what makes them
-searchable, so a `row_key` on a table with no encrypt column is refused rather
-than left looking like coverage.
+column. `char(n)` is not one of them: the server blank-pads it on output and the
+client does not on input, so `'abc'` would seal against one form and read back as
+the other. The key's *value* is what binds, not the spelling it was written in —
+`0007`, `+7` and `7` are the same row, as are an upper-case, braced or
+unhyphenated `uuid`. Only `transform = "encrypt"` binds a row: `fpe` and `token`
+store the same bytes for a plaintext in every row by design, which is what makes
+them searchable, so a `row_key` on a table with no encrypt column is refused
+rather than left looking like coverage.
 
 Adopting it needs no migration. Values written before the change keep opening —
 the stored value decides which binding verifies it — so re-encrypt only when you
