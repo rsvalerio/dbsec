@@ -3,11 +3,11 @@ id: TASK-0161
 title: >-
   TEST-6: the 'drives every site' invariant is documented but false for 6 of 18
   Unprotected variants
-status: To Do
+status: In Progress
 assignee:
   - TASK-0181
 created_date: '2026-08-19 08:31'
-updated_date: '2026-08-19 09:01'
+updated_date: '2026-08-19 09:44'
 labels:
   - code-review-rust
   - test-coverage
@@ -49,3 +49,14 @@ moment a variant was added without touching it — which has now happened twice 
 - [ ] #2 Adding a variant without adding a driver fails the build — e.g. an exhaustive match over a constructed value of every variant inside the test
 - [ ] #3 The module doc is accurate as written afterwards
 <!-- AC:END -->
+
+## Implementation Notes
+
+<!-- SECTION:NOTES:BEGIN -->
+Note from TASK-0173 (wave27): the count is now 7 of 19. `Unprotected::RowKeyReassigned`
+was added in `code-review/TASK-0173` (assignment list on a row-bound table that writes the
+row key column) and is in the same position as `RowKeyMissing` — unreachable from
+`no_event_from_the_write_path_carries_a_plaintext_value`, whose rewriter is built with no
+`RowContext`, so no row-key site can fire. Covering the row-key sites means giving that
+test a row-bound rewriter, not just more SQL.
+<!-- SECTION:NOTES:END -->
