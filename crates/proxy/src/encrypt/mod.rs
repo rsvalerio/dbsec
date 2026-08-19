@@ -663,7 +663,7 @@ pub(in crate::encrypt) mod tests {
     /// [`rewriter`] passes no read context, and `row_key_spec` reads the
     /// declarations out of that context — so without one every table is
     /// cell-bound and the row-key sites cannot fire at all.
-    fn row_bound_rewriter() -> QueryRewriter {
+    pub(in crate::encrypt) fn row_bound_rewriter() -> QueryRewriter {
         use crate::rows::{Resolved, ResolvedRowKey, RowContext, DEFAULT_MAX_PROTECTED_VALUE_LEN};
 
         let spec = ResolvedRowKey {

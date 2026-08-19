@@ -343,32 +343,40 @@ impl QueryRewriter {
         let key_position = spec.as_ref().and_then(|spec| {
             insert.columns.iter().position(|ident| normalize(ident) == spec.name.to_lowercase())
         });
+        // Reported, then sealed cell-only — never returned unsealed. See
+        // [`Self::row_of`] for why `warn` falls back to the weaker binding
+        // rather than to none at all.
         if let (Some(spec), None) = (spec.as_ref(), key_position) {
             self.row_key_missing(
                 &qualified,
                 &spec.name,
                 "INSERT without the row key in its column list",
             )?;
-            return Ok(SealedValues::default());
         }
 
         let mut sealed = SealedValues::default();
+        // One report per statement, not per row: a multi-row VALUES list whose
+        // rows are all unnamed describes one gap, and a thousand-row INSERT
+        // should not write a thousand warnings about it.
+        let mut reported = false;
         for row in &mut values.rows {
             // Read before the mutable borrows below: every protected value in
             // this row binds to this row's key.
             let row_source = match (spec.as_ref(), key_position) {
                 (Some(spec), Some(position)) => {
-                    let Some(source) =
-                        row.get(position).and_then(|expr| self.row_key_source(expr, spec))
-                    else {
-                        self.row_key_missing(
-                            &qualified,
-                            &spec.name,
-                            "INSERT whose row key is not a literal or a parameter",
-                        )?;
-                        return Ok(SealedValues::default());
-                    };
-                    source
+                    match row.get(position).and_then(|expr| self.row_key_source(expr, spec)) {
+                        Some(source) => source,
+                        None => {
+                            if !std::mem::replace(&mut reported, true) {
+                                self.row_key_missing(
+                                    &qualified,
+                                    &spec.name,
+                                    "INSERT whose row key is not a literal or a parameter",
+                                )?;
+                            }
+                            RowKeySource::None
+                        }
+                    }
                 }
                 _ => RowKeySource::None,
             };
@@ -812,6 +820,48 @@ mod tests {
         let mut rewriter = rewriter(catalog);
         let body = query_frame("INSERT INTO users (pin) VALUES ('1234')");
         assert!(rewriter.on_frame(b'Q', &body).is_err());
+    }
+
+    /// An `INSERT` into a row-bound table that cannot say which row it writes
+    /// is a gap in the *binding*, not a licence to store plaintext. Under
+    /// `warn` both such sites seal cell-only — a `DBS2` envelope, the binding
+    /// the table had before it declared a row key — so adopting `row_key`
+    /// never makes a statement less protected than it was.
+    #[test]
+    fn an_insert_that_cannot_name_its_row_seals_cell_only_under_warn() {
+        use dbsec_core::envelope::{MAGIC, MAGIC_V3};
+
+        // Both shapes: the key absent from the column list, and a key whose
+        // value is neither a literal nor a parameter.
+        for sql in [
+            "INSERT INTO users (email) VALUES ('alice@secret.test')",
+            "INSERT INTO users (id, email) VALUES (nextval('users_id_seq'), 'alice@secret.test')",
+        ] {
+            let mut rewriter = row_bound_rewriter();
+            let rewritten = rewritten_query(&mut rewriter, sql).expect("rewritten");
+            assert!(!rewritten.contains("alice@secret.test"), "plaintext left on the wire: {sql}");
+
+            let stored = hex::decode(sealed_hex(&rewritten).expect("a sealed literal")).unwrap();
+            let (_, envelope) = blind_index::split(&stored).expect("searchable column");
+            assert!(
+                envelope.starts_with(MAGIC),
+                "{sql} did not seal cell-only: {:?}",
+                &envelope[..4.min(envelope.len())]
+            );
+            assert_eq!(open_hex_literal(&rewritten, true), b"alice@secret.test");
+        }
+
+        // The contrast, so the fallback cannot silently become the only path:
+        // when the statement does name its row, the value is row-bound.
+        let mut rewriter = row_bound_rewriter();
+        let rewritten = rewritten_query(
+            &mut rewriter,
+            "INSERT INTO users (id, email) VALUES (7, 'alice@secret.test')",
+        )
+        .expect("rewritten");
+        let stored = hex::decode(sealed_hex(&rewritten).expect("a sealed literal")).unwrap();
+        let (_, envelope) = blind_index::split(&stored).expect("searchable column");
+        assert!(envelope.starts_with(MAGIC_V3), "a named row should seal row-bound");
     }
 
     /// Row-wise `SET (a, b) = (x, y)` is standard Postgres and parses to its

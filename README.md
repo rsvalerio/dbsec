@@ -78,12 +78,12 @@ on the default `warn` the statement is logged — one warning naming the table
 and the row key — and relayed, and only `reject` answers the client with an
 ErrorResponse. Read-path verification is the exception and is never relaxed.
 
-- **Client-generated keys only.** `INSERT` must carry `id` in its column list.
-  A `serial` key does not exist yet when the proxy rewrites the statement, so
-  there is nothing to seal the value against. This is the sharpest of the
-  sites: the rewrite gives up on the whole `VALUES` list, so under `warn` the
-  row's protected columns are written **in plaintext**, not sealed cell-only.
-  Run row-bound tables on `reject`, or read the warnings.
+- **Client-generated keys only.** `INSERT` must carry `id` in its column list,
+  and its value must be a literal or a bound parameter. A `serial` key does not
+  exist yet when the proxy rewrites the statement, so there is nothing to seal
+  the value against. Refused under `reject`; under `warn` the row's protected
+  columns are sealed cell-only, which is the binding the table had before it
+  declared a row key — never plaintext.
 - **Single-row updates.** `UPDATE users SET ssn = $1 WHERE id = $2` is fine;
   `WHERE dept = 'x'` is a site — refused under `reject`, and under `warn`
   sealed cell-only, which is the binding the table had before it declared a row

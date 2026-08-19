@@ -3,9 +3,10 @@ id: TASK-0184
 title: >-
   SEC-31: an INSERT that cannot name its row relays plaintext where an
   assignment list now seals cell-only
-status: Triage
+status: Done
 assignee: []
 created_date: '2026-08-19 09:43'
+updated_date: '2026-08-19 12:24'
 labels:
   - code-review-rust
   - security
@@ -41,7 +42,7 @@ adopting `row_key` on a table can make its `INSERT`s *less* protected than befor
 
 ## Acceptance Criteria
 <!-- AC:BEGIN -->
-- [ ] #1 An INSERT into a row-bound table that cannot name its row seals cell-only under warn rather than relaying plaintext
-- [ ] #2 The refusal under reject is unchanged
-- [ ] #3 A test asserts the stored bytes of such an INSERT start with MAGIC (DBS2) under warn
+- [x] #1 An INSERT into a row-bound table that cannot name its row seals cell-only under warn rather than relaying plaintext
+- [x] #2 The refusal under reject is unchanged
+- [x] #3 A test asserts the stored bytes of such an INSERT start with MAGIC (DBS2) under warn
 <!-- AC:END -->

@@ -1976,36 +1976,34 @@ pub mod tests {
     /// the row-key checks would have turned every row-bound `INSERT` into a
     /// plaintext write with the suite still green.
     ///
-    /// The two `INSERT` sites relay the statement **unsealed**, because the
-    /// rewrite gives up on the whole `VALUES` list; the assignment site still
-    /// seals, cell-only, which is the binding the table had before it declared
-    /// a row key. Both are pinned here so the difference is a decision rather
-    /// than an accident.
+    /// All three seal **cell-only** under `warn` — the binding the table had
+    /// before it declared a row key. The two `INSERT` sites used to relay the
+    /// statement unsealed, which turned a relocatable ciphertext into plaintext
+    /// at rest and made adopting `row_key` a downgrade; TASK-0184 gave them the
+    /// assignment site's fallback. That every site agrees is the property under
+    /// test, so a path that fails open again fails here.
     #[test]
     fn every_site_that_cannot_name_the_row_reports_itself_in_both_modes() {
         use tracing_subscriber::layer::SubscriberExt as _;
 
-        // (sql, the shape the site reports, whether warn mode still seals)
-        const SITES: [(&str, &str, bool); 3] = [
+        // (sql, the shape the site reports)
+        const SITES: [(&str, &str); 3] = [
             (
                 "INSERT INTO users (email) VALUES ('alice@secret.test')",
                 "INSERT without the row key in its column list",
-                false,
             ),
             (
                 "INSERT INTO users (id, email) VALUES (nextval('users_id_seq'), \
                  'alice@secret.test')",
                 "INSERT whose row key is not a literal or a parameter",
-                false,
             ),
             (
                 "UPDATE users SET email = 'alice@secret.test' WHERE dept = 'x'",
                 "UPDATE whose WHERE does not pin one row by its row key",
-                true,
             ),
         ];
 
-        for (sql, shape, _) in SITES {
+        for (sql, shape) in SITES {
             let (_ctx, mut rewriter, _d) = row_bound_session(OnUnprotected::Reject);
             let refusal = write(&mut rewriter, sql).expect_err(sql);
             assert!(refusal.contains("public.users"), "{sql} => {refusal}");
@@ -2020,7 +2018,7 @@ pub mod tests {
         let relayed = tracing::subscriber::with_default(subscriber, || {
             SITES
                 .iter()
-                .map(|(sql, _, _)| {
+                .map(|(sql, _)| {
                     let (_ctx, mut rewriter, _d) = row_bound_session(OnUnprotected::Warn);
                     write(&mut rewriter, sql).expect("warn relays rather than refusing")
                 })
@@ -2029,27 +2027,20 @@ pub mod tests {
 
         let events = captured.events();
         assert_eq!(events.len(), SITES.len(), "one warning per site: {events:?}");
-        for (event, (sql, shape, _)) in events.iter().zip(SITES) {
+        for (event, (sql, shape)) in events.iter().zip(SITES) {
             assert!(event.contains("public.users"), "{sql} => {event}");
             assert!(event.contains("row_key=id"), "{sql} => {event}");
             assert!(event.contains(shape), "{sql} => {event}");
             assert!(!event.contains("alice@secret.test"), "the warning must not log it: {event}");
         }
-        for (rewritten, (sql, _, seals)) in relayed.iter().zip(SITES) {
+        for (rewritten, (sql, _)) in relayed.iter().zip(SITES) {
             let sealed = sealed_literals(rewritten);
-            if seals {
-                assert_eq!(sealed.len(), 1, "{sql} => {rewritten}");
-                assert!(
-                    sealed[0].starts_with(envelope::MAGIC),
-                    "cell-only, never plaintext and never row-bound: {sql}"
-                );
-                assert!(!rewritten.contains("alice@secret.test"), "{sql} => {rewritten}");
-            } else {
-                assert!(
-                    rewritten.contains("alice@secret.test"),
-                    "warn fails open on this site, and the test says so: {sql} => {rewritten}"
-                );
-            }
+            assert_eq!(sealed.len(), 1, "{sql} => {rewritten}");
+            assert!(
+                sealed[0].starts_with(envelope::MAGIC),
+                "cell-only, never plaintext and never row-bound: {sql}"
+            );
+            assert!(!rewritten.contains("alice@secret.test"), "{sql} => {rewritten}");
         }
     }
 
