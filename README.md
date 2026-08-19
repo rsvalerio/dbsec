@@ -107,6 +107,25 @@ Adopting it needs no migration. Values written before the change keep opening �
 the stored value decides which binding verifies it — so re-encrypt only when you
 want the row binding to be retroactive.
 
+That tolerance is a migration window, not a permanent setting. While it is open,
+a value carrying no row binding is accepted in a row-bound column, and nothing in
+the stored bytes says whether it predates the `row_key` or came from a write that
+could not name its row — an upsert branch, or an `UPDATE` the proxy warned about
+under `on_unprotected = "warn"`. Either way the result is a ciphertext that can
+be copied between rows of that column undetected, for as long as the DEK lives.
+Close the window once the table's older values have been re-encrypted:
+
+```toml
+[[table]]
+table              = "users"
+row_key            = "id"
+strict_row_binding = true   # a value with no row binding is refused on read
+```
+
+The refusal reaches the client as the same ErrorResponse a missing row key
+carries, and names the remedy. Turn it back off for the duration if a migration
+has to be re-run.
+
 **Identifier names** — a `[[column]]` name is the name the catalog holds. SQL
 identifiers are folded the way PostgreSQL folds them before they are compared
 against it: unquoted names are downcased ASCII-only (a multibyte character is

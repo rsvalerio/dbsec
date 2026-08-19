@@ -476,6 +476,14 @@ fn is_refusal(error: &Error) -> bool {
             // neither is evidence the ciphertext was tampered with, so the
             // value is refused rather than the session merely failing.
             | Error::RowKeyType(_)
+            // A cell-only value in a column whose table closed its row-binding
+            // migration window. Also a policy decision about one result set:
+            // the bytes are intact, they are simply bound to less than the
+            // configuration promises, and relaying them would report
+            // protection that is not there. The remedy is the operator's —
+            // re-encrypt the value, or reopen the window — so the client is
+            // told why rather than seeing a dropped socket.
+            | Error::Wire(dbsec_core::Error::RowBindingDowngraded)
     )
 }
 
@@ -1019,9 +1027,18 @@ pub mod tests {
     }
 
     pub fn transform(searchable: bool) -> Arc<dyn FieldTransform> {
+        transform_bound(searchable, false)
+    }
+
+    /// `strict` closes the column's row-binding migration window, as
+    /// `strict_row_binding = true` on its `[[table]]` does in a real config.
+    pub fn transform_bound(searchable: bool, strict: bool) -> Arc<dyn FieldTransform> {
         let index_key = searchable.then(|| "public.users.email".to_owned());
         let ciphers = Arc::new(envelope::Ciphers::new(Arc::new(OneKey)));
-        Arc::new(dbsec_core::transform::EncryptTransform::new(ciphers, cell_context(), index_key))
+        Arc::new(
+            dbsec_core::transform::EncryptTransform::new(ciphers, cell_context(), index_key)
+                .strict_row_binding(strict),
+        )
     }
 
     fn context_with(column: ReadColumn) -> Arc<RowContext> {
@@ -1121,9 +1138,19 @@ pub mod tests {
     /// both directions from one resolution — which is the point: the write path
     /// finds the key by name and the read path by OID, and they have to agree.
     fn row_bound_session() -> (Arc<RowContext>, crate::encrypt::QueryRewriter, RowDecryptor) {
+        row_bound_session_strict(false)
+    }
+
+    /// The same session with the table's row-binding migration window closed:
+    /// a stored value carrying no row binding is then a downgrade, not an old
+    /// value.
+    fn row_bound_session_strict(
+        strict: bool,
+    ) -> (Arc<RowContext>, crate::encrypt::QueryRewriter, RowDecryptor) {
         use crate::columns::ProtectedColumn;
 
         const TABLE: u32 = 1234;
+        let tf = transform_bound(false, strict);
         let spec =
             ResolvedRowKey { attnum: 1, type_oid: crate::rowkey::oid::INT4, name: "id".into() };
         let mut columns = ColumnMap::new();
@@ -1131,7 +1158,7 @@ pub mod tests {
             (TABLE, 2),
             ReadColumn {
                 name: "public.users.email".into(),
-                transform: Some(transform(false)),
+                transform: Some(tf.clone()),
                 mask: None,
             },
         );
@@ -1154,7 +1181,7 @@ pub mod tests {
                 schema: "public".into(),
                 table: "users".into(),
                 column: "email".into(),
-                transform: Some(transform(false)),
+                transform: Some(tf),
                 searchable: false,
                 readable: true,
                 mask: None,
@@ -1338,6 +1365,36 @@ pub mod tests {
             decryptor.on_frame(b'D', &plaintext).unwrap().body().is_none(),
             "a value that opens without a row key must not be refused by the key it never used"
         );
+    }
+
+    /// What `strict_row_binding` buys, from the client's side. A cell-only
+    /// value in a row-bound column is what every write-path degradation leaves
+    /// behind — an upsert branch, an `UPDATE` that could not name one row — and
+    /// while the migration window is open it opens like any pre-`row_key`
+    /// value, so the degradation is invisible. Closed, the same bytes are
+    /// refused with a reason the operator can act on.
+    #[test]
+    fn a_value_with_no_row_binding_is_refused_once_the_migration_window_closes() {
+        let degraded =
+            envelope::encrypt(&KEY, &KEY_ID, &Binding::cell(&cell_context()), b"alice@secret.test")
+                .unwrap();
+        let row = data_row(&[Some(b"7"), Some(&degraded)]);
+
+        // Window open: it opens, and the projected row key binds nothing.
+        let (_ctx, _r, mut decryptor) = row_bound_session_strict(false);
+        decryptor.on_frame(b'T', &row_bound_description(0)).unwrap();
+        let opened = decryptor.on_frame(b'D', &row).unwrap().body().expect("rewritten");
+        assert_eq!(pgwire::parse_data_row(&opened).unwrap()[1], Some(&b"alice@secret.test"[..]));
+
+        // Window closed: the client is answered rather than the session merely
+        // failing, because the remedy — re-encrypt the value, or reopen the
+        // window — is the operator's and the reason has to reach them.
+        let (_ctx, _r, mut decryptor) = row_bound_session_strict(true);
+        decryptor.on_frame(b'T', &row_bound_description(0)).unwrap();
+        let frames = refused(decryptor.on_frame(b'D', &row).unwrap());
+        let text = String::from_utf8_lossy(&frames);
+        assert!(text.contains("42501"), "the client gets a SQLSTATE: {text}");
+        assert!(text.contains("strict_row_binding"), "and the setting to act on: {text}");
     }
 
     /// The same row, described in binary format: a row written through a

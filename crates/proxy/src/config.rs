@@ -476,6 +476,22 @@ pub struct TableConfig {
     /// "some row in this group", which is why this is documented as the
     /// operator's assertion.
     pub row_key: String,
+    /// Whether a stored value in this table's encrypted columns that carries
+    /// *no* row binding is an error on read rather than back-compat.
+    ///
+    /// Off by default, which is what makes adopting `row_key` migration-free:
+    /// values written before the key was declared keep opening. That tolerance
+    /// is also what makes a degraded write invisible — an upsert branch or an
+    /// `UPDATE` that could not name one row seals cell-only, and the result is
+    /// a ciphertext relocatable between rows for as long as the DEK lives,
+    /// indistinguishable in the stored bytes from a pre-migration value.
+    ///
+    /// Turn this on once the table's pre-`row_key` values have been
+    /// re-encrypted: back-compat then becomes a stated migration window rather
+    /// than a permanent hole, and any later degradation is refused on the next
+    /// read instead of going unnoticed.
+    #[serde(default)]
+    pub strict_row_binding: bool,
 }
 
 impl TableConfig {
@@ -1207,6 +1223,23 @@ mod tests {
         assert_eq!(cfg.tables.len(), 1);
         assert_eq!(cfg.tables[0].schema_and_table(), ("public", "users"));
         assert_eq!(cfg.tables[0].row_key, "id");
+        assert!(
+            !cfg.tables[0].strict_row_binding,
+            "the migration window is open by default, so adoption needs no re-encryption"
+        );
+    }
+
+    /// Closing the migration window is a per-table opt-in on top of `row_key`.
+    #[test]
+    fn strict_row_binding_is_opt_in_per_table() {
+        let cfg: Config = toml::from_str(
+            "keys_file = \"k.toml\"\ncontrol_dsn = \"postgres://u@h/d\"\n\
+             [[column]]\ntable = \"users\"\ncolumn = \"ssn\"\ntransform = \"encrypt\"\n\
+             [[table]]\ntable = \"users\"\nrow_key = \"id\"\nstrict_row_binding = true\n",
+        )
+        .expect("parses");
+        assert!(cfg.tables[0].strict_row_binding);
+        cfg.validated().expect("strict binding needs no extra validation");
     }
 
     /// Every one of these would leave an operator believing cross-row

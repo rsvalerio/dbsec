@@ -93,11 +93,38 @@ pub struct EncryptTransform {
     index_key_name: Option<String>,
     /// The index key itself, resolved on first use and reused per value.
     index_key: OnceLock<Key>,
+    /// Whether the read path refuses a cell-only envelope in this column when
+    /// a row key is in hand. Off by default so adopting a `row_key` needs no
+    /// migration; see [`Self::strict_row_binding`].
+    strict: bool,
 }
 
 impl EncryptTransform {
     pub fn new(ciphers: Arc<Ciphers>, context: CellContext, index_key: Option<String>) -> Self {
-        Self { ciphers, context, index_key_name: index_key, index_key: OnceLock::new() }
+        Self {
+            ciphers,
+            context,
+            index_key_name: index_key,
+            index_key: OnceLock::new(),
+            strict: false,
+        }
+    }
+
+    /// Closes the row-binding migration window for this column: a stored value
+    /// carrying no row binding then reports
+    /// [`Error::RowBindingDowngraded`](crate::Error::RowBindingDowngraded)
+    /// rather than opening, so a write path that degraded to a cell-only seal
+    /// is caught on the next read instead of leaving a ciphertext that can be
+    /// moved between rows undetected.
+    ///
+    /// A builder method rather than a `new` parameter because it is only
+    /// meaningful alongside a table `row_key`, which this type never sees: with
+    /// `row` arriving as `None` it is a no-op, exactly as it must be for a
+    /// column whose table declares no key.
+    #[must_use]
+    pub fn strict_row_binding(mut self, strict: bool) -> Self {
+        self.strict = strict;
+        self
     }
 
     pub fn searchable(&self) -> bool {
@@ -124,7 +151,9 @@ impl EncryptTransform {
 
 impl FieldTransform for EncryptTransform {
     fn seal(&self, plaintext: &[u8], row: Option<&RowKey>) -> Result<Vec<u8>, Error> {
-        let binding = Binding { context: &self.context, row };
+        // Strictness is a read-path policy: which version is *written* is
+        // decided by `row` alone, so it is deliberately not passed here.
+        let binding = Binding { context: &self.context, row, strict: false };
         let sealed = self.ciphers.seal(&binding, plaintext)?;
         match self.blind_index(plaintext)? {
             Some(index) => Ok(blind_index::prepend(&index, &sealed)),
@@ -148,7 +177,8 @@ impl FieldTransform for EncryptTransform {
             // Neither stored form: pre-migration plaintext, passed through.
             None => return Ok(None),
         };
-        self.ciphers.open(&Binding { context: &self.context, row }, enveloped).map(Some)
+        let binding = Binding { context: &self.context, row, strict: self.strict };
+        self.ciphers.open(&binding, enveloped).map(Some)
     }
 
     fn search_index(&self, plaintext: &[u8]) -> Result<Option<Vec<u8>>, Error> {
@@ -326,6 +356,28 @@ mod tests {
         assert!(envelope::is_enveloped(&stored));
         assert_eq!(t.open(&stored, None).unwrap().unwrap(), b"alice@example.com");
         assert_eq!(t.open(b"plain old data", None).unwrap(), None);
+    }
+
+    /// Strictness is a read-path policy carried by the transform, so the write
+    /// path is unchanged (a `None` row still seals cell-only) and the refusal
+    /// lands where a degraded write would otherwise go unnoticed. It stays a
+    /// no-op for a column whose table declares no row key.
+    #[test]
+    fn strict_row_binding_refuses_a_cell_only_value_in_a_row_bound_column() {
+        let shared = ciphers();
+        let lax = EncryptTransform::new(shared.clone(), email(), None);
+        let strict = EncryptTransform::new(shared, email(), None).strict_row_binding(true);
+        let key = RowKey::new(b"42".to_vec());
+
+        let cell_only = lax.seal(b"alice@example.com", None).unwrap();
+        assert_eq!(lax.open(&cell_only, Some(&key)).unwrap().unwrap(), b"alice@example.com");
+        assert!(matches!(strict.open(&cell_only, Some(&key)), Err(Error::RowBindingDowngraded),));
+
+        // Row-bound values are unaffected, and a table with no row key never
+        // reaches the check.
+        let bound = strict.seal(b"alice@example.com", Some(&key)).unwrap();
+        assert_eq!(strict.open(&bound, Some(&key)).unwrap().unwrap(), b"alice@example.com");
+        assert_eq!(strict.open(&cell_only, None).unwrap().unwrap(), b"alice@example.com");
     }
 
     #[test]
