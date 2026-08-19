@@ -6,12 +6,23 @@
 # so the files are always compared against the same tag the reusable workflows
 # are pinned to. Bumping the pin therefore re-points the check automatically.
 #
-# Deliberate divergence is allowed but must be *recorded*: the exact expected
-# diff lives in `.forge-sync/waivers/<file>.patch` under a `# reason:` header
+# Deliberate divergence is allowed but must be *recorded*: the expected diff
+# lives in `.forge-sync/waivers/<file>.patch` under a `# reason:` header
 # explaining it. Because the waiver is the diff and not a blanket exemption, a
 # later change on the forge side still fails the check — a whole-file skip
 # would hide it, which matters most for deny.toml, where a missed advisory
 # policy update is a security gap rather than a style one.
+#
+# The waiver is checked by *applying* it to the canonical file and requiring the
+# result to be this repo's copy, byte for byte — not by comparing its text to a
+# freshly generated diff. Two `diff` implementations describe the same change
+# with different hunk boundaries (BSD groups the header and the comment block
+# differently from GNU), so a text comparison passes on the machine that
+# recorded the waiver and fails everywhere else. It did: this check was red for
+# `CONTRIBUTING.md` while the recorded divergence was correct and the forge side
+# had not moved at all. Applying the patch answers the question the check is
+# actually asking — "is the difference still exactly the one we signed off?" —
+# and gives the same answer on every platform.
 #
 #   ./scripts/forge-sync-check.sh            # check; exit 1 on unrecorded drift
 #   ./scripts/forge-sync-check.sh --update   # record the current diff as a waiver
@@ -45,14 +56,6 @@ case ${#refs[@]} in
 1) ref=${refs[0]} ;;
 *) die "workflows pin forge at more than one ref (${refs[*]}); align them before checking drift" ;;
 esac
-
-# `ops verify` strips trailing whitespace repo-wide, which would eat the blank
-# context lines inside a recorded patch. Normalize both sides so a waiver
-# survives that, dropping the `#` header and any trailing blank lines with it.
-normalize() {
-    sed -e 's/[[:space:]]*$//' -e '/^#/d' "$1" |
-        awk '{ line[NR] = $0 } END { last = NR; while (last > 0 && line[last] == "") last--; for (i = 1; i <= last; i++) print line[i] }'
-}
 
 tmp=$(mktemp -d)
 trap 'rm -rf "$tmp"' EXIT
@@ -97,28 +100,40 @@ while read -r local_path forge_path; do
         continue
     fi
 
-    expected="$tmp/expected.patch"
+    # What this repo's copy is expected to be: the canonical file with the
+    # recorded divergence applied, or the canonical file itself when nothing is
+    # waived.
+    expected="$tmp/expected"
+    cp "$canonical" "$expected"
     if [ -f "$waiver" ]; then
         sed -n 's/^# reason: //p' "$waiver" | grep -q . ||
             die "$waiver has no '# reason:' header — a waived divergence must say why"
-        normalize "$waiver" >"$expected"
-    else
-        : >"$expected"
+        # `--fuzz=0` because a waiver that only applies with fuzz is no longer a
+        # statement about *this* divergence. `ops verify` strips trailing
+        # whitespace repo-wide, so the blank context lines inside a stored patch
+        # arrive empty rather than as a single space; patch reads them the same
+        # way, which is why the recorded diff survives that rewriting.
+        if ! patch -s --fuzz=0 -r "$tmp/reject" "$expected" <"$waiver" >"$tmp/patch.err" 2>&1; then
+            drifted+=("$local_path")
+            echo
+            echo "=== the recorded divergence for $local_path no longer applies to forge/$forge_path@$ref ==="
+            echo "forge changed a part of the file the waiver describes. Take the change,"
+            echo "then re-record: ./scripts/forge-sync-check.sh --update"
+            sed 's/^/  /' "$tmp/patch.err"
+            continue
+        fi
     fi
 
-    normalize "$actual" >"$tmp/actual.norm"
-    if ! diff -q "$tmp/actual.norm" "$expected" >/dev/null; then
+    if ! diff -q "$expected" "$local_path" >/dev/null; then
         drifted+=("$local_path")
         echo
         echo "=== $local_path has drifted from forge/$forge_path@$ref ==="
-        if [ -s "$actual" ]; then
-            cat "$actual"
-        else
+        if [ ! -s "$actual" ] && [ -f "$waiver" ]; then
             echo "(the local copy matches forge again, but $waiver still records a divergence)"
-        fi
-        if [ -f "$waiver" ]; then
-            echo "--- recorded divergence ($waiver) ---"
-            cat "$waiver"
+        else
+            echo "Beyond the recorded divergence, this repo's copy differs by:"
+            diff -u --label "expected ($forge_path + waiver)" --label "$local_path" \
+                "$expected" "$local_path" || true
         fi
     fi
 done <"$manifest"

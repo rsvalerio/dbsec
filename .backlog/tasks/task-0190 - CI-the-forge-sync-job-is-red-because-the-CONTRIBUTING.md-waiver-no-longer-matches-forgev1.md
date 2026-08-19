@@ -3,9 +3,10 @@ id: TASK-0190
 title: >-
   CI: the forge-sync job is red because the CONTRIBUTING.md waiver no longer
   matches forge@v1
-status: Triage
+status: Done
 assignee: []
 created_date: '2026-08-19 13:06'
+updated_date: '2026-08-19 13:17'
 labels:
   - code-review-rust
   - ci
@@ -47,5 +48,17 @@ commit.
 
 ## Acceptance Criteria
 <!-- AC:BEGIN -->
-- [ ] #1 scripts/forge-sync-check.sh exits 0, with any genuinely shared upstream change taken into CONTRIBUTING.md rather than waived
+- [x] #1 scripts/forge-sync-check.sh exits 0, with any genuinely shared upstream change taken into CONTRIBUTING.md rather than waived
 <!-- AC:END -->
+
+## Implementation Notes
+
+<!-- SECTION:NOTES:BEGIN -->
+Root cause was not an upstream change. Verified by reverse-applying the recorded waiver to this repo's `CONTRIBUTING.md`: the result is byte-identical to `templates/CONTRIBUTING.md@v1` as it stands today, so forge had not moved, and `CONTRIBUTING.md` and its waiver are both unchanged since 49639ad recorded them.
+
+What differed was the *patch text*. The check compared the stored waiver against a freshly generated `diff -u`, and two diff implementations describe the same change with different hunk boundaries — BSD groups the title line and the following comment block differently from GNU, giving `@@ -1,24` where the other gives `@@ -1,26`. So the comparison passed only on whichever platform recorded the waiver and failed everywhere else.
+
+Fixed by comparing the waiver's *effect* rather than its text: the canonical file plus the recorded patch (`patch --fuzz=0`) must reproduce this repo's copy byte for byte. That is implementation-independent and keeps the detection the check exists for — a forge-side edit inside a waived region makes the patch fail to apply, and one outside it makes the result differ from the local copy. Both paths were exercised, and the drift report now shows only what differs beyond the recorded divergence instead of dumping the whole patch.
+
+No re-record was needed, so the waiver still carries its original reason.
+<!-- SECTION:NOTES:END -->
