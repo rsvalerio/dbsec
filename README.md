@@ -117,6 +117,15 @@ ErrorResponse. Read-path verification is the exception and is never relaxed.
   whichever `id` came first; query each instance separately. An unconditional
   refusal too, for the same reason.
 
+  Projecting the key *once* — `SELECT a.id, a.ssn, b.ssn` — is the same problem
+  seen from the other side, and it is not detectable in advance: it describes
+  identically to `SELECT id, ssn, ssn FROM users`, where both fields do name the
+  same row and open correctly. So it is not refused on sight. The values are
+  opened, and if one cannot authenticate against the single key on offer the
+  refusal names the table and says to query each instance separately. The
+  message also carries the other reading — a value that really does belong to
+  another row — because at that point the two are indistinguishable.
+
 The key column must be a type the proxy can canonicalise — integer, text or
 uuid — and must not itself be protected. Both are refused at startup, naming the
 column. `char(n)` is not one of them: the server blank-pads it on output and the

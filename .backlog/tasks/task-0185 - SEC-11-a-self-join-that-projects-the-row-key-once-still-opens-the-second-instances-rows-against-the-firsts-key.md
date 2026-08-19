@@ -3,9 +3,10 @@ id: TASK-0185
 title: >-
   SEC-11: a self-join that projects the row key once still opens the second
   instance's rows against the first's key
-status: Triage
+status: Done
 assignee: []
 created_date: '2026-08-19 09:44'
+updated_date: '2026-08-19 12:28'
 labels:
   - code-review-rust
   - security
@@ -42,6 +43,6 @@ ordinary SQL, and a torn-down session rather than a client-visible refusal.
 
 ## Acceptance Criteria
 <!-- AC:BEGIN -->
-- [ ] #1 A self-join that projects a row-keyed table's key once and a protected column of that table more than once either decrypts each instance correctly or is refused with a client-visible error naming the table
-- [ ] #2 A single-instance query that projects the same protected column twice (SELECT ssn, ssn FROM users) still decrypts, and a test pins that it is not caught by the chosen rule
+- [x] #1 A self-join that projects a row-keyed table's key once and a protected column of that table more than once either decrypts each instance correctly or is refused with a client-visible error naming the table
+- [x] #2 A single-instance query that projects the same protected column twice (SELECT ssn, ssn FROM users) still decrypts, and a test pins that it is not caught by the chosen rule
 <!-- AC:END -->

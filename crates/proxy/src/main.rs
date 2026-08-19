@@ -335,6 +335,25 @@ pub enum Error {
          once, or query each instance of the table separately"
     )]
     AmbiguousRowKey { table: String, column: String },
+    /// The complement of [`Self::AmbiguousRowKey`]: the row key is projected
+    /// *once* and a protected column of the same table more than once, which is
+    /// what a self-join that selects one instance's key looks like. Nothing in
+    /// RowDescription tells two instances of one relation apart, so this is not
+    /// detectable from the description — only from a value that then fails to
+    /// authenticate against the one key on offer.
+    ///
+    /// Reported instead of [`Self::RowBindingFailed`] for that shape, and as a
+    /// refusal rather than a fatal error, because here the client *can* fix it
+    /// by rewriting the query. The message keeps the relocation reading too:
+    /// the two are genuinely indistinguishable at this point, and saying so is
+    /// better than picking one and being confidently wrong.
+    #[error(
+        "protected column {column} came back at more than one position and did not authenticate \
+         against the single row key this result set projects for {table}; a self-join cannot say \
+         which instance a value came from, so query each instance of {table} separately — or, if \
+         this is not a self-join, the stored value belongs to another row"
+    )]
+    AmbiguousRowInstance { table: String, column: String },
     #[error(transparent)]
     Wire(#[from] dbsec_core::Error),
     #[error(transparent)]

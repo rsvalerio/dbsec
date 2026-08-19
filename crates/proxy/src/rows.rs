@@ -47,18 +47,22 @@
 //! The middle three are gated on `on_unprotected = "reject"`; the size ceiling,
 //! like the undescribed row, is not.
 //!
-//! Four more come from row binding and from the size ceiling's sibling: a row
+//! Five more come from row binding and from the size ceiling's sibling: a row
 //! whose rewrite outgrows what a frame header can express
 //! ([`Error::FrameTooLarge`], the other half of the same memory policy), a
 //! row-bound value whose row key the query never projected
 //! ([`dbsec_core::Error::RowKeyMissing`]), a projected row key the proxy
 //! cannot canonicalise — NULL, not UTF-8, a wrong-width binary integer
-//! ([`Error::RowKeyType`]), and a result set projecting one row-keyed table's
-//! key *more than once* ([`Error::AmbiguousRowKey`]), which a self-join does
-//! and which no RowDescription can disambiguate — refused because the
-//! alternative is opening one row's value against another row's key (SEC-11).
-//! All four are the client's to fix, which is what makes them refusals rather
-//! than session failures; [`is_refusal`] is the single list. They hand the
+//! ([`Error::RowKeyType`]), and the two halves of the self-join problem, which
+//! no RowDescription can disambiguate (SEC-11): a result set projecting one
+//! row-keyed table's key *more than once* ([`Error::AmbiguousRowKey`]),
+//! refused on sight because the alternative is opening one row's value against
+//! another row's key; and one projecting the key once and a protected column
+//! more than once ([`Error::AmbiguousRowInstance`]), which is indistinguishable
+//! from `SELECT ssn, ssn FROM users` until a value fails to authenticate, and
+//! so is refused only then. All five are the client's to fix, which is what
+//! makes them refusals rather than session failures; [`is_refusal`] is the
+//! single list. They hand the
 //! client a PostgreSQL
 //! ErrorResponse (SQLSTATE 42501, the same one a refused write carries) and
 //! then end the session — see [`RowDecryptor::on_frame`] for why the read path
@@ -505,6 +509,11 @@ fn is_refusal(error: &Error) -> bool {
             // A result set that projects one row-keyed table twice, which the
             // client fixes by projecting the key once — its query, its repair.
             | Error::AmbiguousRowKey { .. }
+            // The same repair from the other side: the key came back once and
+            // the protected column more than once, so the query is a self-join
+            // the description cannot resolve. Refused rather than fatal because
+            // the fix is again the client's — query each instance separately.
+            | Error::AmbiguousRowInstance { .. }
             // A row-bound value whose row key the query did not project. The
             // client is answered rather than the session merely failing,
             // because the fix is theirs: select the table's row key. Relaying
@@ -863,6 +872,22 @@ impl RowDecryptor {
                 RowKeyRef::Absent | RowKeyRef::Slot { .. } => {}
             }
         }
+        // Which protected columns came back at more than one position. Two
+        // instances of a self-joined table share a `(table_oid, attnum)` and so
+        // resolve to one `ReadColumn`, which makes this the only trace of the
+        // shape that survives into the row — see [`Error::AmbiguousRowInstance`].
+        // It is not a refusal on its own: `SELECT ssn, ssn FROM users` is the
+        // same signal on one row, and it opens correctly.
+        let repeated: HashSet<&str> = positions
+            .iter()
+            .map(|(_, column, _)| &*column.name)
+            .fold((HashSet::new(), HashSet::new()), |(mut seen, mut twice), name| {
+                if !seen.insert(name) {
+                    twice.insert(name);
+                }
+                (seen, twice)
+            })
+            .1;
         let mut values: Vec<Option<Cow<'_, [u8]>>> =
             pgwire::parse_data_row(body)?.into_iter().map(|v| v.map(Cow::Borrowed)).collect();
         // `body` is exactly the encoding of `values`, so it is also the
@@ -908,8 +933,10 @@ impl RowDecryptor {
                 };
                 let opened = match &column.transform {
                     Some(transform) => {
-                        let attribute =
-                            |error, key| attribute_open_failure(error, column, *position, key);
+                        let repeated = repeated.contains(&*column.name);
+                        let attribute = |error, key| {
+                            attribute_open_failure(error, column, *position, key, repeated)
+                        };
                         let at = match key {
                             RowKeyRef::Slot { index, .. } => {
                                 row_keys.iter().position(|once| once.index == *index)
@@ -1082,8 +1109,18 @@ fn attribute_open_failure(
     column: &ReadColumn,
     position: usize,
     row_key: Option<&RowKey>,
+    repeated: bool,
 ) -> Error {
     match (&error, row_key) {
+        // The self-join shape (SEC-11), which is only ever visible here: the
+        // description resolved one key for this table and the same protected
+        // column came back at several positions, so at most one of them can be
+        // the instance that key names. Told apart from a genuine relocation by
+        // nothing at all — hence one message that carries both readings.
+        (dbsec_core::Error::Decrypt, Some(_)) if repeated => Error::AmbiguousRowInstance {
+            table: table_of(&column.name).to_owned(),
+            column: column.name.to_string(),
+        },
         (dbsec_core::Error::Decrypt, Some(row_key)) => Error::RowBindingFailed {
             column: column.name.to_string(),
             row_key: String::from_utf8_lossy(row_key.as_bytes()).into_owned(),
@@ -1091,6 +1128,15 @@ fn attribute_open_failure(
         },
         _ => error.into(),
     }
+}
+
+/// The `schema.table` half of a configured column's qualified name.
+///
+/// Falls back to the whole name rather than panicking: it is only ever used in
+/// a message, and a name without a dot would mean the resolver produced
+/// something this path does not otherwise depend on.
+fn table_of(qualified: &str) -> &str {
+    qualified.rsplit_once('.').map_or(qualified, |(table, _)| table)
 }
 
 /// Decodes one column value's wire representation into its stored form.
@@ -1796,6 +1842,51 @@ pub mod tests {
         };
         let message = String::from_utf8_lossy(&body);
         assert!(message.contains("public.users.id"), "the refusal must name the key: {message}");
+    }
+
+    /// The complement of the shape above, and the harder half: a self-join that
+    /// projects the row key **once** — `SELECT a.id, a.email, b.email FROM
+    /// users a JOIN users b …`. The description resolves cleanly, so nothing is
+    /// refused up front, and `b.email` is then opened against `a.id`'s key.
+    ///
+    /// RowDescription cannot separate this from `SELECT id, email, email FROM
+    /// users`, where both fields genuinely name the same row: the two produce
+    /// *byte-identical* descriptions, which is why the pair below is asserted
+    /// against one `description`. So the shape is not refused on sight — the
+    /// value is opened, and only a failure to authenticate, on a column that
+    /// came back more than once, distinguishes them. Refusing on the
+    /// description alone would have broken the legitimate query (SEC-11).
+    #[test]
+    fn a_self_join_projecting_the_row_key_once_is_refused_when_a_value_belongs_elsewhere() {
+        // `SELECT a.id, a.email, b.email FROM users a JOIN users b …` — and
+        // also `SELECT id, email, email FROM users`. Same three fields.
+        let description = [ROW_BOUND_ID, ROW_BOUND_EMAIL, ROW_BOUND_EMAIL];
+        let row_seven = sealed("INSERT INTO users (id, email) VALUES (7, 'alice@x.io')");
+        let row_eight = sealed("INSERT INTO users (id, email) VALUES (8, 'bob@x.io')");
+
+        // The self-join: the third field is row 8's value, read under row 7's
+        // key. It cannot open, and the client is told what to do about it.
+        let (_ctx, _r, mut decryptor) = row_bound_session(OnUnprotected::Reject);
+        decryptor.on_frame(b'T', &described_fields(&description)).unwrap();
+        let row = data_row(&[Some(b"7"), Some(&row_seven), Some(&row_eight)]);
+        let FrameAction::RefuseAndClose(body) = decryptor.on_frame(b'D', &row).unwrap() else {
+            panic!("a value that cannot belong to the projected row must not be relayed")
+        };
+        let message = String::from_utf8_lossy(&body);
+        assert!(message.contains("42501"), "the client gets a SQLSTATE: {message}");
+        assert!(message.contains("public.users"), "the refusal must name the table: {message}");
+        assert!(message.contains("separately"), "and say how to fix it: {message}");
+        assert!(!message.contains("bob@x.io"), "and never the plaintext: {message}");
+
+        // AC#2: the same description, both values genuinely row 7's. Nothing
+        // about the repetition is a refusal on its own.
+        let (_ctx, _r, mut decryptor) = row_bound_session(OnUnprotected::Reject);
+        decryptor.on_frame(b'T', &described_fields(&description)).unwrap();
+        let row = data_row(&[Some(b"7"), Some(&row_seven), Some(&row_seven)]);
+        let opened = decryptor.on_frame(b'D', &row).unwrap().body().expect("rewritten");
+        let values = pgwire::parse_data_row(&opened).unwrap();
+        assert_eq!(values[1], Some(&b"alice@x.io"[..]), "the first instance opens");
+        assert_eq!(values[2], Some(&b"alice@x.io"[..]), "and so does the repeat");
     }
 
     /// The sealed literals of a rewritten statement, in the order they appear.
