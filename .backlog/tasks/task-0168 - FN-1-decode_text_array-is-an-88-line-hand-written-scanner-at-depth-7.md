@@ -1,11 +1,11 @@
 ---
 id: TASK-0168
 title: 'FN-1: decode_text_array is an 88-line hand-written scanner at depth 7'
-status: To Do
+status: Done
 assignee:
   - TASK-0180
 created_date: '2026-08-19 08:32'
-updated_date: '2026-08-19 09:01'
+updated_date: '2026-08-19 10:23'
 labels:
   - code-review-rust
   - complexity
@@ -32,6 +32,12 @@ cognitive load exactly here, and the two element parsers are independent and ext
 
 ## Acceptance Criteria
 <!-- AC:BEGIN -->
-- [ ] #1 decode_text_array is <= 50 lines by extracting quoted_element and unquoted_element helpers
-- [ ] #2 Max nesting in each is <= 4 and the existing proptests pass unchanged
+- [x] #1 decode_text_array is <= 50 lines by extracting quoted_element and unquoted_element helpers
+- [x] #2 Max nesting in each is <= 4 and the existing proptests pass unchanged
 <!-- AC:END -->
+
+## Implementation Notes
+
+<!-- SECTION:NOTES:BEGIN -->
+decode_text_array is now 29 lines; quoted_element (21) and unquoted_element (32) were extracted, plus skip_whitespace for the separator scan. Max brace depth in each is 4: the trailing-whitespace bookkeeping that would have made unquoted_element depth 5 became a kept marker (the length through the last escaped byte) plus one take_while trim, which is the same rule stated once. All existing array proptests pass unchanged.
+<!-- SECTION:NOTES:END -->

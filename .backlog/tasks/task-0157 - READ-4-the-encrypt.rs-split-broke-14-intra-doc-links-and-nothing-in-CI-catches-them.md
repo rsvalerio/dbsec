@@ -3,11 +3,11 @@ id: TASK-0157
 title: >-
   READ-4: the encrypt.rs split broke 14 intra-doc links, and nothing in CI
   catches them
-status: To Do
+status: Done
 assignee:
   - TASK-0180
 created_date: '2026-08-19 08:29'
-updated_date: '2026-08-19 09:01'
+updated_date: '2026-08-19 10:15'
 labels:
   - code-review-rust
   - readability
@@ -50,7 +50,13 @@ accumulates on every future move.
 
 ## Acceptance Criteria
 <!-- AC:BEGIN -->
-- [ ] #1 cargo doc --no-deps --document-private-items emits zero unresolved-link warnings for the workspace
-- [ ] #2 Each link is fixed with a real path, not by unlinking the text
-- [ ] #3 rustdoc::broken_intra_doc_links = deny is added to workspace lints so the next move fails the build
+- [x] #1 cargo doc --no-deps --document-private-items emits zero unresolved-link warnings for the workspace
+- [x] #2 Each link is fixed with a real path, not by unlinking the text
+- [x] #3 rustdoc::broken_intra_doc_links = deny is added to workspace lints so the next move fails the build
 <!-- AC:END -->
+
+## Implementation Notes
+
+<!-- SECTION:NOTES:BEGIN -->
+Fixed all 16 unresolved intra-doc links with real paths (super::/module-qualified, std::ops::Deref). Two link targets were file-private and unreachable from the linking scope: crates/proxy/src/encrypt/unprotected.rs parser_error_kind is now pub(super) (rationale documented on the fn) and crates/proxy/src/config.rs describe_parse_error is now pub(crate). Also cleared the one rustdoc::redundant_explicit_links warning in crates/core/src/transform.rs so cargo doc is warning-free. Added [workspace.lints.rustdoc] broken_intra_doc_links = "deny" to Cargo.toml.
+<!-- SECTION:NOTES:END -->
