@@ -11,10 +11,10 @@ use std::borrow::Cow;
 
 use super::*;
 use crate::columns::ProtectedColumn;
-use crate::rowkey;
 use crate::rows::tests::transform;
 use crate::session::FrameAction;
-use dbsec_core::pgwire;
+use dbsec_core::rowkey;
+use dbsec_pgwire as pgwire;
 
 pub(in crate::encrypt) fn column(
     name: &str,

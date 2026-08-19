@@ -1,9 +1,12 @@
 //! Canonicalising a row's declared key so both data paths agree on it.
 //!
 //! A row key is bound into every row-bound envelope
-//! ([`dbsec_core::envelope::RowKey`]), which means the write path and the read
-//! path must derive *identical* bytes for the same row — across drivers, across
-//! wire formats, and across the two directions.
+//! ([`crate::envelope::RowKey`]), which means every writer and every reader of
+//! a row-bound column must derive *identical* bytes for the same row — across
+//! drivers, across wire formats, and across the two directions. That holds for
+//! the proxy's two data paths and, equally, for an application calling this
+//! crate directly: a value sealed by one and opened by the other has to agree
+//! on the row it names.
 //!
 //! That is harder than it looks, and it is the reason this module exists rather
 //! than the row key being passed around as raw wire bytes. PostgreSQL sends the
@@ -25,12 +28,11 @@
 //! exactly, in both formats. That is a surface the proxy has deliberately
 //! avoided elsewhere — the read path sniffs a `\x` prefix rather than consult a
 //! type OID — so it is kept to the types people actually declare keys on, and
-//! anything else is refused at startup with a message naming the column. An
-//! unsupported type is a configuration error the operator can see, never a
-//! silent fallback to raw bytes.
+//! anything else is refused with a message naming the column. An unsupported
+//! type is a configuration error the caller can see, never a silent fallback to
+//! raw bytes.
 
-use dbsec_core::envelope::RowKey;
-
+use crate::envelope::RowKey;
 use crate::Error;
 
 /// PostgreSQL type OIDs this module can canonicalise. From
@@ -45,30 +47,23 @@ pub mod oid {
     pub const UUID: u32 = 2950;
 }
 
-/// The wire format one value arrived in: 0 text, 1 binary, per the protocol's
-/// format codes.
+/// Which shape a row key's bytes arrived in: its ordinary text rendering, or
+/// the type's fixed-width binary encoding.
+///
+/// Deliberately not constructed from a PostgreSQL format code here. The `i16`
+/// codes belong to the wire protocol, which this crate does not speak — a
+/// caller that holds values rather than frames knows which of these two it
+/// has, and one that reads frames decodes the code where it reads them
+/// (`proxy::portal::value_format`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Format {
     Text,
     Binary,
 }
 
-impl Format {
-    /// The protocol sends format codes as `i16`. Anything but 0 or 1 is
-    /// undefined, and guessing at it would be guessing at the bytes of a value
-    /// that decides where a ciphertext belongs.
-    pub fn from_code(code: i16) -> Result<Self, Error> {
-        match code {
-            0 => Ok(Self::Text),
-            1 => Ok(Self::Binary),
-            other => Err(Error::RowKeyType(format!("unknown wire format code {other}"))),
-        }
-    }
-}
-
-/// Whether the proxy can canonicalise a key of this type. Checked once at
-/// resolution time so the refusal names the column and happens at startup,
-/// rather than once per row on the data path.
+/// Whether a key of this type can be canonicalised. Worth checking once,
+/// where a column is configured, so the refusal names the column and happens
+/// at startup rather than once per row on the data path.
 ///
 /// `bpchar` (`char(n)`) is deliberately absent. PostgreSQL blank-pads it to
 /// `n` on *output* but the client's own input is not padded, so `'abc'` would
@@ -255,7 +250,6 @@ mod tests {
             canonical(1114, Format::Text, Some(b"2026-08-19 08:00:00")),
             Err(Error::RowKeyType(_))
         ));
-        assert!(matches!(Format::from_code(7), Err(Error::RowKeyType(_))));
     }
 
     /// The write path hands `canonical` a client's spelling, not the server's

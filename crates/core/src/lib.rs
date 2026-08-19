@@ -1,11 +1,27 @@
-//! dbsec-core: field-level encryption, pseudonymization and masking primitives
-//! for PostgreSQL wire traffic. See plans/PLAN.md for the roadmap.
+//! dbsec-core: field-level encryption, pseudonymization and masking for
+//! PostgreSQL columns.
+//!
+//! The crate is deliberately protocol-free: it transforms values, and says
+//! nothing about how they reach the database. That is what lets the same
+//! primitives serve an application sealing a field before it hands it to its
+//! own driver and the `dbsec` proxy sealing the same field mid-flight — both
+//! write the identical envelope. The PostgreSQL wire codec the proxy needs
+//! lives in `dbsec-pgwire`, and the `i16` format codes stay there with it.
+//!
+//! It is not I/O-free, and the exception is exactly one type:
+//! [`keys::FileKeySource`] reads a TOML keyfile, which is why
+//! [`Error::KeyFileRead`], [`Error::KeyFileWrite`] and [`Error::KeyFileParse`]
+//! exist and why `toml` is in the dependency graph. That is a dev and test key
+//! source; an application shipping its own [`keys::KeySource`] should not have
+//! to compile a TOML parser to get an envelope, so the type is to move behind
+//! a `keyfile` feature (TASK-0192.06). See plans/PLAN.md for the roadmap.
 
 pub mod blind_index;
 pub mod envelope;
+pub mod ident;
 pub mod keys;
 pub mod mask;
-pub mod pgwire;
+pub mod rowkey;
 pub mod sync;
 pub mod transform;
 
@@ -49,22 +65,18 @@ pub enum Error {
     RowBindingFieldTooLong { field: &'static str, len: usize },
     #[error("encryption failed")]
     Encrypt,
+    /// A declared row key could not be canonicalised, so nothing can be bound
+    /// to the row it names: the value is NULL, not valid UTF-8, the wrong
+    /// width for its type, of a type [`rowkey::supported`] refuses, or carried
+    /// under an unknown wire format code. Kept apart from a decryption
+    /// failure — the ciphertext is intact, the caller simply cannot say which
+    /// row it belongs to.
+    #[error("row key cannot be canonicalised: {0}")]
+    RowKeyType(String),
     /// The active DEK has spent its random-nonce invocation budget and the key
     /// source had no fresh key to roll to (see `envelope::MAX_ENCRYPTIONS_PER_KEY`).
     #[error("key {0} has spent its AES-GCM invocation budget; rotate the active DEK")]
     KeyExhausted(String),
-    #[error("invalid wire message length {0}")]
-    BadMessageLength(i32),
-    /// A startup packet whose length prefix exceeds
-    /// [`pgwire::MAX_STARTUP_MESSAGE_LEN`]. Distinct from
-    /// [`Error::BadMessageLength`] because the length is well-formed — it is
-    /// the pre-authentication allocation bound that refuses it.
-    #[error("startup message is {len} bytes, over the {max} byte limit")]
-    StartupMessageTooLarge { len: usize, max: usize },
-    #[error("message field does not fit the wire protocol's fixed-width encoding")]
-    WireFieldOverflow,
-    #[error("malformed backend message")]
-    MalformedBackend,
     #[error("unknown key: {0}")]
     UnknownKey(String),
     #[error("FPE requires at least {} digits", transform::MIN_FPE_DIGITS)]

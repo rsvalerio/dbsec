@@ -24,7 +24,7 @@
 //!   read one way by the server and another by the proxy.
 //! - **Identifier folding.** A `[[column]]` name is the name the catalog
 //!   holds. The write path folds a SQL identifier the way PostgreSQL does
-//!   before comparing it (see [`fold_identifier`]), so a configured name that
+//!   before comparing it (see [`dbsec_core::ident::fold_identifier`]), so a configured name that
 //!   is not itself in folded form only ever matches a double-quoted SQL
 //!   reference, and one longer than [`MAX_IDENTIFIER_BYTES`] matches nothing
 //!   at all — which validation refuses rather than leaving to be discovered at
@@ -44,11 +44,11 @@
 //!   `warn`, refused under `reject`. Drivers reach it only through libpq's
 //!   large-object API.
 
-use std::borrow::Cow;
 use std::fmt;
 use std::ops::Range;
 use std::path::{Path, PathBuf};
 
+use dbsec_core::ident::{fold_identifier, MAX_IDENTIFIER_BYTES};
 use serde::Deserialize;
 use zeroize::Zeroizing;
 
@@ -720,52 +720,6 @@ impl ColumnConfig {
     }
 }
 
-/// PostgreSQL's `NAMEDATALEN - 1`: the most bytes of an identifier the server
-/// keeps. Anything longer is truncated on the way into the catalog, and every
-/// later reference to the long name resolves to the truncated one.
-pub const MAX_IDENTIFIER_BYTES: usize = 63;
-
-/// Folds a SQL identifier the way PostgreSQL does, so that a name written in a
-/// query and the same name written in a `[[column]]` entry compare equal.
-///
-/// Both halves of this are places where Rust's own string handling would give
-/// a different answer than the server, and a mismatch here is not a parse
-/// error: it makes a protected column look unprotected, and the write path
-/// relays the plaintext.
-///
-/// - An *unquoted* identifier is downcased **ASCII-only**. `str::to_lowercase`
-///   applies full Unicode case folding — `Ä` to `ä`, the Kelvin sign `K`
-///   (U+212A) to `k` — while PostgreSQL under a UTF-8 server encoding leaves
-///   every multibyte character exactly as written. A quoted identifier is not
-///   folded at all.
-/// - Every identifier, quoted or not, is clipped to
-///   [`MAX_IDENTIFIER_BYTES`] on a character boundary (the server's
-///   `pg_mbcliplen`).
-///
-/// The write path calls this on identifiers it reads out of SQL and
-/// [`Config::validate`] calls it on the configured names, so the two cannot
-/// drift apart.
-pub fn fold_identifier(value: &str, quoted: bool) -> Cow<'_, str> {
-    let clipped = truncate_identifier(value);
-    if quoted || !clipped.bytes().any(|byte| byte.is_ascii_uppercase()) {
-        return Cow::Borrowed(clipped);
-    }
-    Cow::Owned(clipped.to_ascii_lowercase())
-}
-
-/// Clips an identifier to the bytes PostgreSQL keeps, never splitting a
-/// character.
-fn truncate_identifier(value: &str) -> &str {
-    if value.len() <= MAX_IDENTIFIER_BYTES {
-        return value;
-    }
-    let mut end = MAX_IDENTIFIER_BYTES;
-    while !value.is_char_boundary(end) {
-        end -= 1;
-    }
-    &value[..end]
-}
-
 #[derive(Debug, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct TlsSection {
@@ -950,7 +904,7 @@ impl Config {
         // frame limit could never be reached — a value cannot outgrow the
         // DataRow carrying it — so both are configuration mistakes rather than
         // choices, and both are worth saying so at load time (ERR-11).
-        let max_frame = dbsec_core::pgwire::MAX_MESSAGE_LEN;
+        let max_frame = dbsec_pgwire::MAX_MESSAGE_LEN;
         if self.max_protected_value_bytes == 0 || self.max_protected_value_bytes > max_frame {
             return Err(Error::InvalidConfig(format!(
                 "max_protected_value_bytes must be between 1 and {max_frame} (the frame limit)"
@@ -1201,7 +1155,7 @@ mod tests {
         cfg.validate().unwrap();
         assert_eq!(cfg.max_protected_value_bytes, 64 * 1024 * 1024);
 
-        for invalid in ["0".to_owned(), (dbsec_core::pgwire::MAX_MESSAGE_LEN + 1).to_string()] {
+        for invalid in ["0".to_owned(), (dbsec_pgwire::MAX_MESSAGE_LEN + 1).to_string()] {
             let cfg: Config =
                 toml::from_str(&format!("max_protected_value_bytes = {invalid}")).unwrap();
             assert!(
@@ -1384,22 +1338,6 @@ mod tests {
         )
         .unwrap();
         cfg.validate().unwrap();
-    }
-
-    #[test]
-    fn identifiers_fold_the_way_postgres_folds_them() {
-        // ASCII-only downcase: `str::to_lowercase` would map `Ä` to `ä` and
-        // the Kelvin sign to `k`, where the server leaves both alone.
-        assert_eq!(fold_identifier("EMail", false), "email");
-        assert_eq!(fold_identifier("ÄMAIL", false), "Ämail");
-        assert_eq!(fold_identifier("\u{212a}elvin", false), "\u{212a}elvin");
-        // A quoted identifier is not folded at all.
-        assert_eq!(fold_identifier("EMail", true), "EMail");
-        // Both are clipped to what the catalog holds, on a character boundary.
-        let long = "é".repeat(MAX_IDENTIFIER_BYTES);
-        let folded = fold_identifier(&long, false);
-        assert_eq!(folded, "é".repeat(MAX_IDENTIFIER_BYTES / 2));
-        assert!(folded.len() <= MAX_IDENTIFIER_BYTES);
     }
 
     #[test]

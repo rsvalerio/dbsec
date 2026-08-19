@@ -53,6 +53,7 @@ use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex, MutexGuard};
 
 use dbsec_core::envelope::RowKey;
+use dbsec_core::rowkey::Format;
 use dbsec_core::sync::Unpoisoned as _;
 use dbsec_core::transform::FieldTransform;
 
@@ -98,7 +99,7 @@ pub type Positions = Arc<Described>;
 /// every Execute of that statement, and two portals of one statement may have
 /// chosen differently. The read path has to *interpret* one value rather than
 /// relay it — the row key, canonicalised through its type before it is bound
-/// ([`crate::rowkey`]) — so reading an `int4` `42` as the text `42` or as four
+/// ([`dbsec_core::rowkey`]) — so reading an `int4` `42` as the text `42` or as four
 /// big-endian bytes is the difference between a value that opens and a session
 /// torn down by a decrypt failure (SEC-31).
 ///
@@ -118,9 +119,25 @@ impl ResultFormats {
     /// The format code (0 = text, 1 = binary) of result column `index`.
     pub fn for_column(&self, index: usize) -> i16 {
         match &self.0 {
-            Some(codes) => dbsec_core::pgwire::format_code(codes, index),
+            Some(codes) => dbsec_pgwire::format_code(codes, index),
             None => 0,
         }
+    }
+}
+
+/// Decodes a wire format code into the shape [`dbsec_core::rowkey`] expects.
+///
+/// This is the boundary the library will not cross: the `i16` codes are the
+/// protocol's, so the mapping lives here with the other frame reading rather
+/// than inside a crate that never sees a frame. Anything but 0 or 1 is
+/// undefined, and guessing at it would be guessing at the bytes of a value
+/// that decides where a ciphertext belongs — so it is refused, as the same
+/// `RowKeyType` the rest of row-key canonicalisation reports.
+pub fn value_format(code: i16) -> Result<Format, dbsec_core::Error> {
+    match code {
+        0 => Ok(Format::Text),
+        1 => Ok(Format::Binary),
+        other => Err(dbsec_core::Error::RowKeyType(format!("unknown wire format code {other}"))),
     }
 }
 
@@ -157,7 +174,7 @@ pub enum RowKeySource {
     Literal(RowKey),
     /// The row key is another placeholder, canonicalised at Bind from that
     /// parameter's bytes. The type is carried because those bytes cannot be
-    /// interpreted without it (see `crate::rowkey`), and the column name
+    /// interpreted without it (see [`dbsec_core::rowkey`]), and the column name
     /// because canonicalising the client's own bytes can fail — a NULL key,
     /// non-UTF-8 text, a wrong-width integer — and the refusal that follows is
     /// only actionable if it says which column the placeholder was supposed to
@@ -1085,5 +1102,20 @@ mod tests {
             Err(Error::ConflictingParameter { placeholder: 1 })
         ));
         assert_eq!(params.iter().count(), 1);
+    }
+
+    /// The `i16` a client puts on the wire decides how a row key's bytes are
+    /// read, so an undefined code is refused rather than guessed at — the row
+    /// binding is only worth anything if both directions agree on the value.
+    #[test]
+    fn only_the_two_defined_format_codes_are_accepted() {
+        assert_eq!(value_format(0).unwrap(), Format::Text);
+        assert_eq!(value_format(1).unwrap(), Format::Binary);
+        for undefined in [-1, 2, i16::MAX] {
+            assert!(
+                matches!(value_format(undefined), Err(dbsec_core::Error::RowKeyType(_))),
+                "format code {undefined} was accepted"
+            );
+        }
     }
 }

@@ -21,7 +21,9 @@ use dbsec_core::transform::FieldTransform;
 use sqlparser::ast::{Ident, ObjectName};
 
 use crate::columns::ProtectedColumn;
-use crate::config::{fold_identifier, OnUnprotected};
+use dbsec_core::ident::fold_identifier;
+
+use crate::config::OnUnprotected;
 
 /// The protected columns of one table, keyed by column name.
 pub(super) type Columns = HashMap<String, Arc<dyn FieldTransform>>;
@@ -161,7 +163,7 @@ pub(super) fn resolved_name(name: &ObjectName) -> Option<(String, String)> {
 }
 
 /// One SQL identifier as the catalog holds it — folded by the same
-/// [`crate::config::fold_identifier`] that config validation checks the
+/// [`fold_identifier`] that config validation checks the
 /// configured names against, so the two sides of every name comparison cannot
 /// drift apart. See that function for the two rules and why Rust's own answer
 /// differs from the server's.
@@ -202,7 +204,7 @@ mod tests {
     /// name meant the write was treated as unprotected.
     #[test]
     fn an_over_long_identifier_matches_the_name_postgres_truncated_it_to() {
-        let stored = "e".repeat(crate::config::MAX_IDENTIFIER_BYTES);
+        let stored = "e".repeat(dbsec_core::ident::MAX_IDENTIFIER_BYTES);
         let catalog = Arc::new(WriteCatalog::new(
             &[column(&stored, transform(false), false)],
             OnUnprotected::Warn,

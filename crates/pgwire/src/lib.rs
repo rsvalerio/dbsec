@@ -1,13 +1,37 @@
 //! Sans-io framing for the PostgreSQL v3 wire protocol.
 //!
-//! Only what the proxy needs: startup-phase classification and regular message
+//! Only what a proxy needs: startup-phase classification and regular message
 //! headers. Kept free of I/O so it can be property-tested and fuzzed directly
-//! (milestone 10).
+//! (milestone 10), and kept out of `dbsec-core` so that an application using
+//! the library for field-level encryption never compiles a wire protocol it
+//! does not speak — it hands values to its own driver.
 //!
 //! Startup messages have no type byte: `i32 length (incl. itself) | i32 code | ...`.
 //! Every later message is `u8 type | i32 length (incl. itself, excl. type) | body`.
 
-use crate::Error;
+/// A frame that cannot be parsed or encoded.
+///
+/// These live here rather than in `dbsec-core` because every one of them is a
+/// statement about the wire, not about the crypto: nothing outside this crate
+/// constructs one, and a caller that never speaks the protocol can never
+/// receive one. Marked `#[non_exhaustive]` so a later parser can report a new
+/// shape of malformed frame without breaking downstream matches.
+#[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
+pub enum Error {
+    #[error("invalid wire message length {0}")]
+    BadMessageLength(i32),
+    /// A startup packet whose length prefix exceeds
+    /// [`MAX_STARTUP_MESSAGE_LEN`]. Distinct from
+    /// [`Error::BadMessageLength`] because the length is well-formed — it is
+    /// the pre-authentication allocation bound that refuses it.
+    #[error("startup message is {len} bytes, over the {max} byte limit")]
+    StartupMessageTooLarge { len: usize, max: usize },
+    #[error("message field does not fit the wire protocol's fixed-width encoding")]
+    WireFieldOverflow,
+    #[error("malformed backend message")]
+    MalformedBackend,
+}
 
 pub const PROTOCOL_V3: i32 = 3 << 16;
 pub const SSL_REQUEST: i32 = 80877103;

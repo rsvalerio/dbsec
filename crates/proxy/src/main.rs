@@ -9,7 +9,6 @@ mod encrypt;
 mod hardening;
 mod portal;
 mod resolve;
-mod rowkey;
 mod rows;
 mod session;
 mod tls;
@@ -263,11 +262,6 @@ pub enum Error {
     UpstreamTlsRefused { addr: String },
     #[error("invalid config: {0}")]
     InvalidConfig(String),
-    /// A declared row key could not be canonicalised, so nothing can be bound
-    /// to the row it names. Kept apart from a decryption failure: the value is
-    /// intact, the proxy just cannot say which row it belongs to.
-    #[error("row key cannot be canonicalised: {0}")]
-    RowKeyType(String),
     #[error("binding listen address {addr}: {source}")]
     Listen {
         addr: String,
@@ -393,6 +387,12 @@ pub enum Error {
     AmbiguousRowInstance { table: String, column: String },
     #[error(transparent)]
     Wire(#[from] dbsec_core::Error),
+    /// A frame that could not be parsed or encoded. Separate from
+    /// [`Error::Wire`] since the protocol codec moved to its own crate: a
+    /// malformed frame is a statement about the client's bytes, where a
+    /// `Wire` error is one about the crypto.
+    #[error(transparent)]
+    Pgwire(#[from] dbsec_pgwire::Error),
     #[error(transparent)]
     Io(#[from] io::Error),
 }
@@ -1077,7 +1077,7 @@ mod tests {
     /// used here as proof that a connection reached a session task.
     fn ssl_request() -> Vec<u8> {
         let mut msg = 8i32.to_be_bytes().to_vec();
-        msg.extend_from_slice(&dbsec_core::pgwire::SSL_REQUEST.to_be_bytes());
+        msg.extend_from_slice(&dbsec_pgwire::SSL_REQUEST.to_be_bytes());
         msg
     }
 

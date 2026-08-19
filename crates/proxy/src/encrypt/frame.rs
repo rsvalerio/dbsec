@@ -16,13 +16,13 @@ use std::borrow::Cow;
 use std::sync::atomic::Ordering;
 
 use dbsec_core::envelope::RowKey;
-use dbsec_core::pgwire;
 use dbsec_core::transform::WireForm;
+use dbsec_pgwire as pgwire;
 
 use crate::portal::{ParamAction, ParamTransforms, ResultFormats, RowKeySource, Target};
-use crate::rowkey;
 use crate::session::FrameAction;
 use crate::Error;
+use dbsec_core::rowkey;
 
 use super::array::index_array;
 use super::unprotected::{error_response, frame, Unprotected};
@@ -91,18 +91,18 @@ fn bind_row_key(
         RowKeySource::Literal(key) => return Ok(Some(key.clone())),
         RowKeySource::Param { index, type_oid, column } => (*index, *type_oid, column),
     };
-    let resolved = rowkey::Format::from_code(bind.param_format(index)).and_then(|format| {
+    let resolved = crate::portal::value_format(bind.param_format(index)).and_then(|format| {
         rowkey::canonical(type_oid, format, bind.params.get(index).copied().flatten())
     });
     match resolved {
         Ok(key) => Ok(Some(key)),
-        Err(Error::RowKeyType(why)) => Err(Rejection::Refused(format!(
+        Err(dbsec_core::Error::RowKeyType(why)) => Err(Rejection::Refused(format!(
             "dbsec refused this statement: placeholder ${} supplies the row key {column} that \
              this statement's protected values are sealed against, but {why}; bind a usable \
              {column} for the row being written",
             index.saturating_add(1)
         ))),
-        Err(other) => Err(Rejection::Fatal(Box::new(other))),
+        Err(other) => Err(Rejection::Fatal(Box::new(Error::from(other)))),
     }
 }
 
@@ -116,7 +116,7 @@ impl QueryRewriter {
         match msg_type {
             b'Q' => {
                 let mut sql = body;
-                let query = pgwire::take_cstr(&mut sql).map_err(Error::Wire)?;
+                let query = pgwire::take_cstr(&mut sql)?;
                 match self.rewrite_sql(query)? {
                     // Refused here, so the backend never sees it and owes no
                     // ReadyForQuery: the proxy answers with its own, and no

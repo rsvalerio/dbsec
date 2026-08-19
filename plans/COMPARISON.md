@@ -136,7 +136,9 @@ What a framework author must reimplement today, all of it security-critical:
 
 And the split runs the wrong way in two places: `pgwire` (the PostgreSQL wire
 codec, ~540 LOC) sits in the *library* where only the proxy uses it, while the
-KMS integration sits in the *binary*.
+KMS integration sits in the *binary*. *(The wire codec moved out to
+`dbsec-pgwire` in TASK-0192.04; row-key canonicalization and identifier folding
+moved into `dbsec-core` in TASK-0192.01.)*
 
 The refactor that closes this is tracked as TASK-0192 and its children
 (TASK-0192.01 … TASK-0192.07).

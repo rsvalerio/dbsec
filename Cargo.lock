@@ -391,6 +391,7 @@ version = "0.5.0"
 dependencies = [
  "base64",
  "dbsec-core",
+ "dbsec-pgwire",
  "futures-util",
  "hex",
  "proptest",
@@ -434,6 +435,14 @@ dependencies = [
  "toml",
  "tracing",
  "zeroize",
+]
+
+[[package]]
+name = "dbsec-pgwire"
+version = "0.5.0"
+dependencies = [
+ "proptest",
+ "thiserror 2.0.20",
 ]
 
 [[package]]
