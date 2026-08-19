@@ -1,12 +1,12 @@
 ---
 id: TASK-0190
 title: >-
-  CI: the forge-sync job is red because the CONTRIBUTING.md waiver no longer
-  matches forge@v1
+  CI: the forge-sync waiver comparison is diff-implementation-dependent, so the
+  check fails on macOS
 status: Done
 assignee: []
 created_date: '2026-08-19 13:06'
-updated_date: '2026-08-19 13:18'
+updated_date: '2026-08-19 14:48'
 labels:
   - code-review-rust
   - ci
@@ -20,30 +20,35 @@ priority: medium
 ## Description
 
 <!-- SECTION:DESCRIPTION:BEGIN -->
-**File**: `.forge-sync/waivers/CONTRIBUTING.md.patch`
+**File**: `scripts/forge-sync-check.sh`
 
-**What**: `./scripts/forge-sync-check.sh` exits 1, so the `forge-sync` job in
-`.github/workflows/ci.yml` fails. The reported drift is exactly the content the
-waiver already covers — filling in `{{REPO}}`, the development-setup section and
-the project-layout section — but the recorded patch opens with `@@ -1,24` while
-the check now produces `@@ -1,26`. The upstream `forge/templates/CONTRIBUTING.md`
-gained two lines at `v1` after the waiver was recorded, so the stored patch no
-longer matches and every run reports the deliberate divergence as drift.
+**What**: `./scripts/forge-sync-check.sh` exits 1 for `CONTRIBUTING.md` on macOS
+while the identical tree passes in CI, so `make forge-sync` is red for any
+developer on a BSD-diff platform and green on the GNU-diff runner.
 
-The fix is most likely a re-record:
-`FORGE_SYNC_REASON='...' ./scripts/forge-sync-check.sh --update`. Confirm first
-that the two new upstream lines are in a *shared* section rather than a
-project-specific one — if they are shared, this repo's copy should take them
-before the waiver is re-recorded, which is the case the manifest comment says the
-check exists to catch.
+The check compared the stored waiver's *text* against a freshly generated
+`diff -u`. Two diff implementations describe the same change with different hunk
+boundaries — BSD groups the title line and the comment block below it
+differently from GNU, producing `@@ -1,26` where the other produces `@@ -1,24` —
+so the comparison could only pass on whichever platform's diff recorded the
+waiver. GNU recorded this one.
 
-**Why it matters**: a permanently red CI job stops being read. This one is the
-only thing that notices a forge-side edit to a shared section, so while it is red
-that detection is off — and a genuine drift would look exactly like today's noise.
+Nothing was actually out of sync: reverse-applying the waiver to this repo's
+`CONTRIBUTING.md` reproduces `templates/CONTRIBUTING.md@v1` byte for byte, and
+both files are unchanged since 49639ad recorded them. So there was no upstream
+change to take in and no re-record to make.
 
-**Origin**: noticed during TASK-0189 while adding the `cargo doc` CI gate. It
-predates that work: the check also exits 1 at 562289d, this session's starting
-commit.
+**Why it matters**: a check that is permanently red on a developer's machine
+stops being run before a push, and this is the only thing that notices a
+forge-side edit to a shared section — `deny.toml`'s advisory policy included,
+where a missed update is a security gap rather than a style one.
+
+**Origin**: noticed during TASK-0189 while adding the `cargo doc` CI gate.
+
+**Note on this record**: it was originally filed claiming the *CI job* was
+failing, which was never true — see the correction and the run identifiers in
+the notes. The title and this description have been rewritten; the filename
+still carries the original slug.
 <!-- SECTION:DESCRIPTION:END -->
 
 ## Acceptance Criteria
@@ -67,4 +72,14 @@ Correction to this task's own description: the `forge config drift` **CI job was
 The real scope: the check failed only where the local `diff` differs from the one that recorded the waiver — macOS/BSD here, GNU in CI. So `make forge-sync` was red for anyone on macOS and green in CI, for the same tree.
 
 The fix and the reasoning below are unaffected, and it is still worth having: a check that is permanently red locally stops being run before a push, and it is the only thing that notices a forge-side edit to a shared section.
+
+Dates and identifiers for the claims above, recorded 2026-08-19 so they stay checkable after archival:
+
+- `forge config drift` on `main`: passing. CI run 32236895904 (562289d, this session's starting commit), job 96018783787 — plus runs 32233197832 (e4e9801) and 32187666438 (5bf0d0b), all `success`.
+- The same job on PR #17 before any fix: run 32256722681, job 96080023726, `success`.
+- `./scripts/forge-sync-check.sh` run locally on macOS (Apple diff, based on FreeBSD diff) at 562289d and at every later commit of this branch: exit 1.
+- `templates/CONTRIBUTING.md@v1` fetched 2026-08-19 is byte-identical to the file reconstructed by reverse-applying `.forge-sync/waivers/CONTRIBUTING.md.patch` to this repo's `CONTRIBUTING.md`, so the forge side had not moved.
+- `CONTRIBUTING.md` and its waiver are unchanged since 49639ad recorded them.
+
+The title has been corrected too: it said the CI job was red, which was never true. See the correction note above.
 <!-- SECTION:NOTES:END -->
