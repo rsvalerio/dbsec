@@ -3,9 +3,11 @@ id: TASK-0164
 title: >-
   ERR-1: the per-row size bound closes the socket silently while its sibling
   answers the client
-status: Triage
-assignee: []
+status: To Do
+assignee:
+  - TASK-0177
 created_date: '2026-08-19 08:31'
+updated_date: '2026-08-19 09:01'
 labels:
   - code-review-rust
   - error-handling

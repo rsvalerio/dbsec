@@ -1,9 +1,11 @@
 ---
 id: TASK-0163
 title: 'SEC-15: unchecked as u32 narrowing in the DBS3 AAD length prefixes'
-status: Triage
-assignee: []
+status: To Do
+assignee:
+  - TASK-0178
 created_date: '2026-08-19 08:31'
+updated_date: '2026-08-19 09:01'
 labels:
   - code-review-rust
   - security

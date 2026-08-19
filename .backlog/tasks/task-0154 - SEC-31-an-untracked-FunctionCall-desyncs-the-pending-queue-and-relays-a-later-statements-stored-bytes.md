@@ -3,9 +3,11 @@ id: TASK-0154
 title: >-
   SEC-31: an untracked FunctionCall desyncs the pending queue and relays a later
   statement's stored bytes
-status: Triage
-assignee: []
+status: To Do
+assignee:
+  - TASK-0179
 created_date: '2026-08-19 08:28'
+updated_date: '2026-08-19 09:01'
 labels:
   - code-review-rust
   - protocol

@@ -3,9 +3,11 @@ id: TASK-0169
 title: >-
   DUP-3: Unprotected::RowKeyMissing is constructed three times, differing only
   in shape
-status: Triage
-assignee: []
+status: To Do
+assignee:
+  - TASK-0174
 created_date: '2026-08-19 08:32'
+updated_date: '2026-08-19 09:01'
 labels:
   - code-review-rust
   - duplication

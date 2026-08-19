@@ -3,9 +3,11 @@ id: TASK-0155
 title: >-
   SEC-31: Unprotected::ComputedColumn never fires for a mask-only column, and
   the read path cannot see it either
-status: Triage
-assignee: []
+status: To Do
+assignee:
+  - TASK-0183
 created_date: '2026-08-19 08:29'
+updated_date: '2026-08-19 09:01'
 labels:
   - code-review-rust
   - security

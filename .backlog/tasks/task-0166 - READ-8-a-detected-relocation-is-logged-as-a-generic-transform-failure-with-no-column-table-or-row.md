@@ -3,9 +3,11 @@ id: TASK-0166
 title: >-
   READ-8: a detected relocation is logged as a generic transform failure, with
   no column, table or row
-status: Triage
-assignee: []
+status: To Do
+assignee:
+  - TASK-0177
 created_date: '2026-08-19 08:31'
+updated_date: '2026-08-19 09:01'
 labels:
   - code-review-rust
   - observability

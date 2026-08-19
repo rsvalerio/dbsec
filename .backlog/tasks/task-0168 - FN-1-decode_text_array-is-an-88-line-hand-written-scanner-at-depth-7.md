@@ -1,9 +1,11 @@
 ---
 id: TASK-0168
 title: 'FN-1: decode_text_array is an 88-line hand-written scanner at depth 7'
-status: Triage
-assignee: []
+status: To Do
+assignee:
+  - TASK-0180
 created_date: '2026-08-19 08:32'
+updated_date: '2026-08-19 09:01'
 labels:
   - code-review-rust
   - complexity

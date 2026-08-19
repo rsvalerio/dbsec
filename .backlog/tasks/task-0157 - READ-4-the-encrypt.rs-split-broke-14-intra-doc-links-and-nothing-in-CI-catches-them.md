@@ -3,9 +3,11 @@ id: TASK-0157
 title: >-
   READ-4: the encrypt.rs split broke 14 intra-doc links, and nothing in CI
   catches them
-status: Triage
-assignee: []
+status: To Do
+assignee:
+  - TASK-0180
 created_date: '2026-08-19 08:29'
+updated_date: '2026-08-19 09:01'
 labels:
   - code-review-rust
   - readability

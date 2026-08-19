@@ -3,9 +3,11 @@ id: TASK-0159
 title: >-
   FN-1: rewrite_statement is 195 lines at brace depth 10 and grew 2.7x in this
   range
-status: Triage
-assignee: []
+status: To Do
+assignee:
+  - TASK-0180
 created_date: '2026-08-19 08:30'
+updated_date: '2026-08-19 09:01'
 labels:
   - code-review-rust
   - complexity

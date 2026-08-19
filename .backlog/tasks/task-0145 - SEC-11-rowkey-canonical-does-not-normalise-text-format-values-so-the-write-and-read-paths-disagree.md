@@ -3,9 +3,11 @@ id: TASK-0145
 title: >-
   SEC-11: rowkey::canonical does not normalise text-format values, so the write
   and read paths disagree
-status: Triage
-assignee: []
+status: To Do
+assignee:
+  - TASK-0175
 created_date: '2026-08-19 08:26'
+updated_date: '2026-08-19 09:01'
 labels:
   - code-review-rust
   - security

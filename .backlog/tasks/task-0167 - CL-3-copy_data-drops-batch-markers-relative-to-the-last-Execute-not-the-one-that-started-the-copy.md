@@ -3,9 +3,11 @@ id: TASK-0167
 title: >-
   CL-3: copy_data drops batch markers relative to the last Execute, not the one
   that started the copy
-status: Triage
-assignee: []
+status: To Do
+assignee:
+  - TASK-0179
 created_date: '2026-08-19 08:32'
+updated_date: '2026-08-19 09:01'
 labels:
   - code-review-rust
   - protocol

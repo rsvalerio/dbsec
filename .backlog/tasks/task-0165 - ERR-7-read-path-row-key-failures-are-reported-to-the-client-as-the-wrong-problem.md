@@ -3,9 +3,11 @@ id: TASK-0165
 title: >-
   ERR-7: read-path row-key failures are reported to the client as the wrong
   problem
-status: Triage
-assignee: []
+status: To Do
+assignee:
+  - TASK-0177
 created_date: '2026-08-19 08:31'
+updated_date: '2026-08-19 09:01'
 labels:
   - code-review-rust
   - error-handling

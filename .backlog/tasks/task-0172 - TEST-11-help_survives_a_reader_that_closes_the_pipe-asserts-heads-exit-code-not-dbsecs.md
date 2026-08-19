@@ -3,9 +3,11 @@ id: TASK-0172
 title: >-
   TEST-11: help_survives_a_reader_that_closes_the_pipe asserts head's exit code,
   not dbsec's
-status: Triage
-assignee: []
+status: To Do
+assignee:
+  - TASK-0182
 created_date: '2026-08-19 08:32'
+updated_date: '2026-08-19 09:01'
 labels:
   - code-review-rust
   - test-quality

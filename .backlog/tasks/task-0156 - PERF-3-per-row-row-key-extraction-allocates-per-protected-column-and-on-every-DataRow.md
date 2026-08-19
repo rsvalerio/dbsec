@@ -3,9 +3,11 @@ id: TASK-0156
 title: >-
   PERF-3: per-row row-key extraction allocates per protected column and on every
   DataRow
-status: Triage
-assignee: []
+status: To Do
+assignee:
+  - TASK-0175
 created_date: '2026-08-19 08:29'
+updated_date: '2026-08-19 09:01'
 labels:
   - code-review-rust
   - performance

@@ -3,9 +3,11 @@ id: TASK-0150
 title: >-
   TEST-6: every Unprotected::RowKeyMissing site is untested, and README states
   them as unconditional refusals
-status: Triage
-assignee: []
+status: To Do
+assignee:
+  - TASK-0174
 created_date: '2026-08-19 08:27'
+updated_date: '2026-08-19 09:01'
 labels:
   - code-review-rust
   - test-coverage

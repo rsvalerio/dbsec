@@ -3,9 +3,11 @@ id: TASK-0149
 title: >-
   ERR-11: a bad row-key Bind parameter kills the session instead of refusing the
   statement
-status: Triage
-assignee: []
+status: To Do
+assignee:
+  - TASK-0174
 created_date: '2026-08-19 08:27'
+updated_date: '2026-08-19 09:01'
 labels:
   - code-review-rust
   - error-handling

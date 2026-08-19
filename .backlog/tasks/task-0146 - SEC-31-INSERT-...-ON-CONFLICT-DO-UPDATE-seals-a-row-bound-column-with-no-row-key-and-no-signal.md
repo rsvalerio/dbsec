@@ -3,9 +3,11 @@ id: TASK-0146
 title: >-
   SEC-31: INSERT ... ON CONFLICT DO UPDATE seals a row-bound column with no row
   key and no signal
-status: Triage
-assignee: []
+status: To Do
+assignee:
+  - TASK-0173
 created_date: '2026-08-19 08:26'
+updated_date: '2026-08-19 09:01'
 labels:
   - code-review-rust
   - security

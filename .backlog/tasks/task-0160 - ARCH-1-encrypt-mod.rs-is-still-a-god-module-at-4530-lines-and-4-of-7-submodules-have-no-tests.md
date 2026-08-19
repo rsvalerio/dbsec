@@ -3,9 +3,11 @@ id: TASK-0160
 title: >-
   ARCH-1: encrypt/mod.rs is still a god module at 4,530 lines, and 4 of 7
   submodules have no tests
-status: Triage
-assignee: []
+status: To Do
+assignee:
+  - TASK-0180
 created_date: '2026-08-19 08:30'
+updated_date: '2026-08-19 09:01'
 labels:
   - code-review-rust
   - architecture

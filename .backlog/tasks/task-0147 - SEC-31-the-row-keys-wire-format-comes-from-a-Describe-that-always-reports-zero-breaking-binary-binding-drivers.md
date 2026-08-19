@@ -3,9 +3,11 @@ id: TASK-0147
 title: >-
   SEC-31: the row key's wire format comes from a Describe that always reports
   zero, breaking binary-binding drivers
-status: Triage
-assignee: []
+status: To Do
+assignee:
+  - TASK-0176
 created_date: '2026-08-19 08:27'
+updated_date: '2026-08-19 09:01'
 labels:
   - code-review-rust
   - security

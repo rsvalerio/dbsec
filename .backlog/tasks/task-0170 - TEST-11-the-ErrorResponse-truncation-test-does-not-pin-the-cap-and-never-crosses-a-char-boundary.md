@@ -3,9 +3,11 @@ id: TASK-0170
 title: >-
   TEST-11: the ErrorResponse truncation test does not pin the cap and never
   crosses a char boundary
-status: Triage
-assignee: []
+status: To Do
+assignee:
+  - TASK-0181
 created_date: '2026-08-19 08:32'
+updated_date: '2026-08-19 09:01'
 labels:
   - code-review-rust
   - test-quality

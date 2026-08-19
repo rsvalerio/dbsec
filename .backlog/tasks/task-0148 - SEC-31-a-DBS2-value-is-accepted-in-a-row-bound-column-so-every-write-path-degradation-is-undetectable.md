@@ -3,9 +3,11 @@ id: TASK-0148
 title: >-
   SEC-31: a DBS2 value is accepted in a row-bound column, so every write-path
   degradation is undetectable
-status: Triage
-assignee: []
+status: To Do
+assignee:
+  - TASK-0178
 created_date: '2026-08-19 08:27'
+updated_date: '2026-08-19 09:01'
 labels:
   - code-review-rust
   - security

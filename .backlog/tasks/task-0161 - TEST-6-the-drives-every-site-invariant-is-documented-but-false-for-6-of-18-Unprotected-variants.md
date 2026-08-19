@@ -3,9 +3,11 @@ id: TASK-0161
 title: >-
   TEST-6: the 'drives every site' invariant is documented but false for 6 of 18
   Unprotected variants
-status: Triage
-assignee: []
+status: To Do
+assignee:
+  - TASK-0181
 created_date: '2026-08-19 08:31'
+updated_date: '2026-08-19 09:01'
 labels:
   - code-review-rust
   - test-coverage

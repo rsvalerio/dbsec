@@ -1,9 +1,11 @@
 ---
 id: TASK-0171
 title: 'READ-4: a doc comment was detached from its test by the closed-pipe fix'
-status: Triage
-assignee: []
+status: To Do
+assignee:
+  - TASK-0182
 created_date: '2026-08-19 08:32'
+updated_date: '2026-08-19 09:01'
 labels:
   - code-review-rust
   - readability

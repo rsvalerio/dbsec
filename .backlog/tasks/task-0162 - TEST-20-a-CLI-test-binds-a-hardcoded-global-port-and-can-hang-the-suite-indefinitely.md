@@ -3,9 +3,11 @@ id: TASK-0162
 title: >-
   TEST-20: a CLI test binds a hardcoded global port and can hang the suite
   indefinitely
-status: Triage
-assignee: []
+status: To Do
+assignee:
+  - TASK-0182
 created_date: '2026-08-19 08:31'
+updated_date: '2026-08-19 09:01'
 labels:
   - code-review-rust
   - test-quality

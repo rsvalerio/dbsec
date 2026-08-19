@@ -3,9 +3,11 @@ id: TASK-0152
 title: >-
   SEC-31: an UPDATE that also assigns the row key column binds to the pre-update
   key, silently
-status: Triage
-assignee: []
+status: To Do
+assignee:
+  - TASK-0173
 created_date: '2026-08-19 08:28'
+updated_date: '2026-08-19 09:01'
 labels:
   - code-review-rust
   - security

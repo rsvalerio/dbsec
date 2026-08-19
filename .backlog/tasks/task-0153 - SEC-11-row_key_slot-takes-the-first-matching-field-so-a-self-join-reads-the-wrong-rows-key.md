@@ -3,9 +3,11 @@ id: TASK-0153
 title: >-
   SEC-11: row_key_slot takes the first matching field, so a self-join reads the
   wrong row's key
-status: Triage
-assignee: []
+status: To Do
+assignee:
+  - TASK-0176
 created_date: '2026-08-19 08:28'
+updated_date: '2026-08-19 09:01'
 labels:
   - code-review-rust
   - security
