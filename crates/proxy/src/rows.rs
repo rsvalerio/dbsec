@@ -2663,6 +2663,83 @@ pub mod tests {
         assert!(text.contains("fast path"), "and a reason: {text}");
     }
 
+    /// A FunctionCall body with no arguments: the rewriter does not parse it,
+    /// but the shape is the protocol's so the frame is not a fiction.
+    fn function_call_frame(oid: u32) -> Vec<u8> {
+        let mut body = oid.to_be_bytes().to_vec();
+        body.extend_from_slice(&0i16.to_be_bytes()); // argument format codes
+        body.extend_from_slice(&0i16.to_be_bytes()); // arguments
+        body.extend_from_slice(&0i16.to_be_bytes()); // result format code
+        body
+    }
+
+    /// `'F'` is the one client message besides Sync and a simple Query that
+    /// the backend answers with a ReadyForQuery of its own. Queueing nothing
+    /// for it let that `'Z'` settle the *next* batch's marker: the batch
+    /// pipelined behind it lost its Describe and Execute, its RowDescription
+    /// landed on a later statement, and its rows were then matched against
+    /// that statement's positions — relayed in their stored form when it
+    /// protects nothing at that position (SEC-31).
+    #[test]
+    fn a_function_call_settles_its_own_ready_for_query() {
+        let ctx = context(false);
+        let (mut rewriter, mut decryptor) = session(&ctx);
+
+        // A cached statement with nothing protected, sitting behind the batch
+        // the desync used to eat.
+        prepare(&mut rewriter, b"b", b"SELECT id, created_at FROM users WHERE id = $1");
+        decryptor.on_frame(b'T', &row_description(&[(1234, 1), (1234, 9)])).unwrap();
+        decryptor.on_frame(b'Z', b"I").unwrap();
+
+        // FunctionCall, then Parse/Describe/Bind/Execute/Sync for a statement
+        // whose second column is protected, then b's batch behind it.
+        rewriter.on_frame(b'F', &function_call_frame(2000)).unwrap();
+        rewriter
+            .on_frame(
+                b'P',
+                &pgwire::encode_parse(
+                    b"a",
+                    b"SELECT id, email FROM users WHERE id = $1",
+                    &0i16.to_be_bytes(),
+                ),
+            )
+            .unwrap();
+        rewriter.on_frame(b'D', b"Sa\0").unwrap();
+        rewriter
+            .on_frame(b'B', &pgwire::encode_bind(b"", b"a", &[], &[], &0i16.to_be_bytes()).unwrap())
+            .unwrap();
+        rewriter.on_frame(b'E', b"\0\0\0\0\0").unwrap();
+        rewriter.on_frame(b'S', b"").unwrap();
+        execute(&mut rewriter, b"b");
+
+        // The fast path's own answer, then the ReadyForQuery it owes.
+        assert!(decryptor.on_frame(b'V', b"\0\0\0\x04spam").unwrap().body().is_none());
+        decryptor.on_frame(b'Z', b"I").unwrap();
+
+        // a's RowDescription must land on a's own Execute.
+        decryptor.on_frame(b'T', &row_description(&[(1234, 1), (1234, 2)])).unwrap();
+        let ct =
+            envelope::encrypt(&KEY, &KEY_ID, &Binding::cell(&cell_context()), b"alice@example.com")
+                .unwrap();
+        let rewritten = decryptor
+            .on_frame(b'D', &data_row(&[Some(b"42"), Some(&ct)]))
+            .unwrap()
+            .body()
+            .expect("the function call's ReadyForQuery must not consume the batch behind it");
+        assert_eq!(
+            pgwire::parse_data_row(&rewritten).unwrap()[1],
+            Some(b"alice@example.com".as_slice())
+        );
+        complete(&mut decryptor);
+
+        // And b's batch is still lined up behind it.
+        assert!(decryptor
+            .on_frame(b'D', &data_row(&[Some(b"42"), Some(b"2026-01-01")]))
+            .unwrap()
+            .body()
+            .is_none());
+    }
+
     /// A re-resolution reaches sessions that are already open: the mapping is
     /// read per RowDescription, not captured when the session started.
     #[test]

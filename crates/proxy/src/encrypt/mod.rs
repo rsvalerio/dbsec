@@ -562,6 +562,26 @@ impl QueryRewriter {
                 self.portals.expect_batch()?;
                 Ok(FrameAction::Relay)
             }
+            // FunctionCall: the legacy fast path, answered by
+            // FunctionCallResponse **and a ReadyForQuery** — it is the one
+            // client message outside Sync and the simple Query that closes a
+            // batch on its own. Left unrecorded it queued nothing, and its
+            // ReadyForQuery then settled the *next* batch's marker: from there
+            // every response was matched to the expectation in front of the one
+            // it answered, and a RowDescription was attributed to a following
+            // statement. The dangerous direction is a protected position the
+            // mis-attributed description does not cover, relayed in its stored
+            // form — for a mask-only column the very plaintext the mask exists
+            // to hide (SEC-31).
+            //
+            // The frame itself carries no SQL, so there is nothing to rewrite;
+            // whether its *result* may be relayed is decided on the read path,
+            // where `rows::RowDecryptor::function_call_result` answers the
+            // ordinary `on_unprotected` question about `'V'`.
+            b'F' => {
+                self.portals.expect_batch()?;
+                Ok(FrameAction::Relay)
+            }
             // CopyData, CopyDone, CopyFail. In copy-in mode these are the
             // payload, and the backend is ignoring the Sync the client already
             // pipelined. Outside it they are strays PostgreSQL discards
