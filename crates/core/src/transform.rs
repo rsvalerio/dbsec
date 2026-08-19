@@ -112,8 +112,7 @@ impl EncryptTransform {
 
     /// Closes the row-binding migration window for this column: a stored value
     /// carrying no row binding then reports
-    /// [`Error::RowBindingDowngraded`](crate::Error::RowBindingDowngraded)
-    /// rather than opening, so a write path that degraded to a cell-only seal
+    /// [`Error::RowBindingDowngraded`] rather than opening, so a write path that degraded to a cell-only seal
     /// is caught on the next read instead of leaving a ciphertext that can be
     /// moved between rows undetected.
     ///

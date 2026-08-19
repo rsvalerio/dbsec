@@ -194,7 +194,7 @@ impl ParamAction {
 /// irreversibly. [`Self::record`] therefore collapses a repeat of the same
 /// action and rejects a conflicting one, which refuses the statement rather
 /// than writing something no read path can undo (CL-3). The refusal is
-/// statement-level — see `encrypt::record_param`, which turns it into the
+/// statement-level — see `encrypt::frame::record_param`, which turns it into the
 /// ErrorResponse the client is told about.
 #[derive(Clone, Default)]
 pub struct ParamTransforms {
@@ -360,7 +360,8 @@ struct Tracked {
     /// CopyBothResponse) that no CopyDone/CopyFail or ReadyForQuery has
     /// finished yet, and which Execute it answered. Only the read path can know
     /// this — the response travels upstream→client — which is why it lives here
-    /// rather than in the write path that consumes it. See [`Self::copy_data`].
+    /// rather than in the write path that consumes it. See
+    /// [`SessionPortals::copy_data`].
     copy_in: CopyIn,
 }
 

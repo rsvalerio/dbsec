@@ -334,7 +334,7 @@ const SECRET_KEY_MARKERS: [&str; 5] = ["token", "password", "secret", "dsn", "ke
 /// configures a credential, since serde's message for a *type* mismatch quotes
 /// the offending value ("invalid type: integer 1234, expected a string") and
 /// on those lines that value is the secret.
-fn describe_parse_error(err: &toml::de::Error, raw: &str) -> String {
+pub(crate) fn describe_parse_error(err: &toml::de::Error, raw: &str) -> String {
     let Some(span) = err.span() else {
         // No position: the failure is about the document as a whole (a
         // missing table, a duplicated key reported without a span), so there
