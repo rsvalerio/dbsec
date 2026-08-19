@@ -72,34 +72,50 @@ row_key = "id"      # unique per row: a primary key, or a unique column
 
 With that, a value copied from one row's `users.ssn` into another row's
 `users.ssn` no longer decrypts. It is opt-in because it constrains the SQL the
-table can take, and each constraint is a refusal rather than a silent
-degradation:
+table can take. **Every write-path constraint below is an `on_unprotected`
+site**, so it follows that setting rather than being an unconditional refusal:
+on the default `warn` the statement is logged — one warning naming the table
+and the row key — and relayed, and only `reject` answers the client with an
+ErrorResponse. Read-path verification is the exception and is never relaxed.
 
 - **Client-generated keys only.** `INSERT` must carry `id` in its column list.
   A `serial` key does not exist yet when the proxy rewrites the statement, so
-  there is nothing to seal the value against.
+  there is nothing to seal the value against. This is the sharpest of the
+  sites: the rewrite gives up on the whole `VALUES` list, so under `warn` the
+  row's protected columns are written **in plaintext**, not sealed cell-only.
+  Run row-bound tables on `reject`, or read the warnings.
 - **Single-row updates.** `UPDATE users SET ssn = $1 WHERE id = $2` is fine;
-  `WHERE dept = 'x'` is refused. One bound parameter cannot become a different
-  ciphertext for every matching row. The key has to be named on the table being
-  written, so with an `UPDATE ... FROM other`, qualify it: `WHERE u.id = $2`.
+  `WHERE dept = 'x'` is a site — refused under `reject`, and under `warn`
+  sealed cell-only, which is the binding the table had before it declared a row
+  key. One bound parameter cannot become a different ciphertext for every
+  matching row. The key has to be named on the table being written, so with an
+  `UPDATE ... FROM other`, qualify it: `WHERE u.id = $2`.
 - **The row key is immutable once a row holds a protected value.** An `UPDATE`
   that assigns `id` moves the row out from under the key its values are sealed
   against, and they never open again — so a statement that writes both `id` and
-  a protected column of the same table is refused. That is only the case the
-  proxy can see: changing `id` on its own is refused by nothing and still
+  a protected column of the same table is a site too. That is only the case the
+  proxy can see: changing `id` on its own is reported by nothing and still
   orphans every value already stored in that row. Re-encrypt the row's protected
   columns in the same transaction if the key really has to move.
 - **Upserts conflict on the key.** `INSERT … ON CONFLICT (id) DO UPDATE SET ssn
   = $2` is fine: the conflicting row is the row with that `id`. `ON CONFLICT
   (email)`, `ON CONFLICT ON CONSTRAINT …` and a multi-row `VALUES` list are
-  refused, because the row the action updates may carry any key at all.
+  sites, because the row the action updates may carry any key at all.
+- **A row key bound as a parameter has to be usable.** A NULL `$2`, a text key
+  that is not UTF-8, or a binary integer of the wrong width refuses that one
+  statement with an ErrorResponse under either setting — the session carries on
+  — because there is no "warn and relay" answer that is not a write bound to
+  the wrong row or to none.
 - **Reads must project the key.** `SELECT ssn FROM users WHERE id = $1` does not
-  return `id`, so it cannot be verified; select `id` too.
+  return `id`, so it cannot be verified; select `id` too. Unlike the write-path
+  sites this is an unconditional refusal (SQLSTATE 42501): the alternative is
+  handing the client a stored value the proxy could not verify.
 - **Once per result set.** A self-join projects `id` twice, and the wire
   protocol identifies a result column by table OID and attribute number, which
   are identical for both instances of the table. `SELECT a.id, a.ssn, b.id,
   b.ssn FROM users a JOIN users b ...` is refused rather than opened against
-  whichever `id` came first; query each instance separately.
+  whichever `id` came first; query each instance separately. An unconditional
+  refusal too, for the same reason.
 
 The key column must be a type the proxy can canonicalise — integer, text or
 uuid — and must not itself be protected. Both are refused at startup, naming the
