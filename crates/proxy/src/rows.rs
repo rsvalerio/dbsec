@@ -220,6 +220,14 @@ pub enum RowKeyRef {
     /// value produces — on ordinary SQL. So the ambiguity is named instead
     /// (SEC-11).
     Ambiguous { table: String, column: String },
+    /// The result set describes this table's row key as a *different type*
+    /// from the one the catalog resolved. `ALTER TABLE users ALTER COLUMN id
+    /// TYPE …` is the case: the write path keeps canonicalising through the
+    /// resolved type while `RowDescription` announces the new one, so the two
+    /// directions silently derive different keys and every value already
+    /// stored stops opening. Named rather than resolved to either type
+    /// (SEC-11).
+    TypeChanged { table: String, column: String, wire: u32, resolved: u32 },
 }
 
 /// Where a table's declared row key lives, once resolved against the catalog.
@@ -270,6 +278,14 @@ impl Resolved {
             return RowKeyRef::Ambiguous {
                 table: declared.table.clone(),
                 column: declared.name.clone(),
+            };
+        }
+        if *type_oid != declared.type_oid {
+            return RowKeyRef::TypeChanged {
+                table: declared.table.clone(),
+                column: declared.name.clone(),
+                wire: *type_oid,
+                resolved: declared.type_oid,
             };
         }
         RowKeyRef::Slot { index, type_oid: *type_oid }
@@ -818,11 +834,24 @@ impl RowDecryptor {
         // self-joined table against another instance's key, and nothing this
         // row carries can settle which instance a field came from (SEC-11).
         for (_, _, key) in positions {
-            if let RowKeyRef::Ambiguous { table, column } = key {
-                return Err(Error::AmbiguousRowKey {
-                    table: table.clone(),
-                    column: column.clone(),
-                });
+            match key {
+                RowKeyRef::Ambiguous { table, column } => {
+                    return Err(Error::AmbiguousRowKey {
+                        table: table.clone(),
+                        column: column.clone(),
+                    })
+                }
+                // Same class of problem, same up-front refusal: it is settled
+                // by the description, so nothing this row carries could change
+                // the answer and every row of the result set would repeat it.
+                RowKeyRef::TypeChanged { table, column, wire, resolved } => {
+                    return Err(Error::RowKeyType(format!(
+                        "{table}.{column} came back as type oid {wire} but resolved as type oid \
+                         {resolved}; re-resolve the proxy's columns, and re-encrypt the table if \
+                         its key type really changed"
+                    )))
+                }
+                RowKeyRef::Absent | RowKeyRef::Slot { .. } => {}
             }
         }
         let mut values: Vec<Option<Cow<'_, [u8]>>> =
@@ -844,17 +873,17 @@ impl RowDecryptor {
         // matters depends on the value it would have opened: an outer join's
         // unmatched row carries a NULL key *and* a NULL protected value, and
         // has nothing to bind.
-        let mut row_keys: Vec<Option<Result<RowKey, Error>>> = positions
-            .iter()
-            .map(|(_, _, key)| match key {
-                RowKeyRef::Slot { index, type_oid } => {
-                    Some(read_row_key(*index, *type_oid, formats, &values))
-                }
-                // `Ambiguous` was refused above, before anything was read.
-                RowKeyRef::Absent | RowKeyRef::Ambiguous { .. } => None,
-            })
+        //
+        // Canonicalised once per *distinct* slot, not once per protected
+        // column: every protected column of one table shares that table's key,
+        // so a table with `k` of them used to canonicalise the identical bytes
+        // `k` times per row, each time through a fresh allocation. A row whose
+        // positions carry no slot at all does not allocate here (PERF-3).
+        let mut row_keys: Vec<RowKeyOnce> = distinct_slots(positions)
+            .into_iter()
+            .map(|(index, type_oid)| RowKeyOnce::read(index, type_oid, formats, &values))
             .collect();
-        for ((position, column, _), row_key) in positions.iter().zip(row_keys.iter_mut()) {
+        for (position, column, key) in positions {
             let Some(Some(value)) = values.get_mut(*position) else { continue };
             if value.len() > bounds.max_value {
                 return Err(Error::ProtectedValueTooLarge {
@@ -872,13 +901,22 @@ impl RowDecryptor {
                     Some(transform) => {
                         let attribute =
                             |error, key| attribute_open_failure(error, column, *position, key);
-                        match row_key.take() {
-                            None => {
+                        let at = match key {
+                            RowKeyRef::Slot { index, .. } => {
+                                row_keys.iter().position(|once| once.index == *index)
+                            }
+                            // Both were refused before the row was read.
+                            RowKeyRef::Absent
+                            | RowKeyRef::Ambiguous { .. }
+                            | RowKeyRef::TypeChanged { .. } => None,
+                        };
+                        match (at, at.and_then(|at| row_keys[at].key.as_ref())) {
+                            (_, Some(key)) => transform
+                                .open(&stored, Some(key))
+                                .map_err(|e| attribute(e, Some(key)))?,
+                            (None, None) => {
                                 transform.open(&stored, None).map_err(|e| attribute(e, None))?
                             }
-                            Some(Ok(key)) => transform
-                                .open(&stored, Some(&key))
-                                .map_err(|e| attribute(e, Some(&key)))?,
                             // The key could not be canonicalised. Whether that
                             // decides anything is the *stored value's* call:
                             // pre-migration plaintext and a `DBS2` value
@@ -887,9 +925,14 @@ impl RowDecryptor {
                             // value reports `RowKeyMissing` — which would tell
                             // the client to select the row key it already
                             // selected. The real reason replaces it (ERR-7).
-                            Some(Err(why)) => match transform.open(&stored, None) {
+                            (Some(at), None) => match transform.open(&stored, None) {
                                 Ok(opened) => opened,
-                                Err(dbsec_core::Error::RowKeyMissing) => return Err(why),
+                                Err(dbsec_core::Error::RowKeyMissing) => {
+                                    return Err(row_keys[at].why.take().expect(
+                                        "a slot that produced no key recorded why, and the row \
+                                         is abandoned the first time that reason is taken",
+                                    ))
+                                }
                                 Err(e) => return Err(attribute(e, None)),
                             },
                         }
@@ -928,7 +971,59 @@ impl RowDecryptor {
     }
 }
 
-/// The canonical row key sitting at `slot` of this result row, or why it could
+/// The row-key slots of a described result set, deduplicated by the result
+/// position they read from and in the order they first appear.
+///
+/// Every protected column of one table carries that table's slot, so a table
+/// with `k` protected columns names the same position `k` times. Canonicalising
+/// once per column meant canonicalising identical bytes `k` times per row, each
+/// through its own allocation, on the proxy's hottest path (PERF-3). A join can
+/// still contribute one slot per row-bound table, which is why this
+/// deduplicates rather than assuming a single key.
+///
+/// Returns an empty `Vec` — which does not allocate — when no position carries
+/// a slot at all, so a deployment that declares no row key pays nothing per
+/// DataRow.
+fn distinct_slots(positions: &[(usize, ReadColumn, RowKeyRef)]) -> Vec<(usize, u32)> {
+    let mut slots: Vec<(usize, u32)> = Vec::new();
+    for (_, _, key) in positions {
+        if let RowKeyRef::Slot { index, type_oid } = key {
+            if slots.iter().all(|(seen, _)| seen != index) {
+                slots.push((*index, *type_oid));
+            }
+        }
+    }
+    slots
+}
+
+/// One distinct row-key slot of a result row, canonicalised once and then
+/// shared by every protected column of that row that binds to it.
+///
+/// A `Result` split into its two halves rather than kept whole: the key is
+/// *borrowed* by each column that opens against it, while the reason is *moved*
+/// out by the one column that fails on it — the row is abandoned at that point,
+/// so there is never a second taker.
+struct RowKeyOnce {
+    index: usize,
+    key: Option<RowKey>,
+    why: Option<Error>,
+}
+
+impl RowKeyOnce {
+    fn read(
+        index: usize,
+        type_oid: u32,
+        formats: &ResultFormats,
+        values: &[Option<Cow<'_, [u8]>>],
+    ) -> Self {
+        match read_row_key(index, type_oid, formats, values) {
+            Ok(key) => Self { index, key: Some(key), why: None },
+            Err(why) => Self { index, key: None, why: Some(why) },
+        }
+    }
+}
+
+/// The canonical row key sitting at `index` of this result row, or why it could
 /// not be derived.
 ///
 /// Every failure keeps its own reason ([`Error::RowKeyType`]) instead of
@@ -1385,6 +1480,114 @@ pub mod tests {
         let start = rewritten.find("\\x").expect("sealed literal") + 2;
         let end = rewritten[start..].find('\'').unwrap() + start;
         hex::decode(&rewritten[start..end]).expect("hex literal")
+    }
+
+    /// A literal key is normalised through its type before it is sealed, so
+    /// every spelling PostgreSQL accepts on input binds to the one spelling it
+    /// emits on output.
+    ///
+    /// `0007` used to seal against the literal `0007` while the row came back
+    /// as `7`, and `-1` did not parse as a literal at all — it is
+    /// `UnaryOp{Minus, Number}`, not a signed `Number` — so an ordinary
+    /// negative key fell through to the missing-key gate (SEC-11).
+    #[test]
+    fn a_literal_row_key_binds_by_its_value_not_by_its_spelling() {
+        for (literal, key) in [("0007", &b"7"[..]), ("+7", b"7"), ("-1", b"-1")] {
+            let stored = sealed(&format!(
+                "INSERT INTO users (id, email) VALUES ({literal}, 'alice@secret.test')"
+            ));
+            assert!(stored.starts_with(envelope::MAGIC_V3), "{literal} must seal row-bound");
+
+            let (_ctx, _r, mut decryptor) = row_bound_session(OnUnprotected::Reject);
+            decryptor.on_frame(b'T', &row_bound_description()).unwrap();
+            let opened = decryptor
+                .on_frame(b'D', &data_row(&[Some(key), Some(&stored)]))
+                .unwrap_or_else(|e| panic!("{literal} must open in row {key:?}: {e}"))
+                .body()
+                .expect("rewritten");
+            let values = pgwire::parse_data_row(&opened).unwrap();
+            assert_eq!(values[1], Some(&b"alice@secret.test"[..]));
+        }
+    }
+
+    /// The read path canonicalises through the type the *catalog* resolved,
+    /// and refuses when the wire disagrees with it.
+    ///
+    /// `ALTER TABLE users ALTER COLUMN id TYPE …` is the case: the write path
+    /// keeps canonicalising through the resolved type while `RowDescription`
+    /// starts announcing the new one, so the two directions silently derive
+    /// different keys and every value already stored stops opening. Refusing
+    /// says which column moved instead (SEC-11).
+    #[test]
+    fn a_row_key_the_wire_types_differently_from_the_catalog_is_refused() {
+        let stored = sealed("INSERT INTO users (id, email) VALUES (7, 'alice@secret.test')");
+
+        let (_ctx, _r, mut decryptor) = row_bound_session(OnUnprotected::Reject);
+        let retyped: (&[u8], i16, u32) = (b"id", 1, crate::rowkey::oid::UUID);
+        decryptor.on_frame(b'T', &described_fields(&[retyped, ROW_BOUND_EMAIL])).unwrap();
+        let frames =
+            refused(decryptor.on_frame(b'D', &data_row(&[Some(b"7"), Some(&stored)])).unwrap());
+        let text = String::from_utf8_lossy(&frames).into_owned();
+        for part in ["users.id", "2950", "23"] {
+            assert!(text.contains(part), "the refusal must name {part}: {text}");
+        }
+
+        // The matching description is unaffected: this is a disagreement
+        // check, not a second type restriction.
+        let (_ctx, _r, mut decryptor) = row_bound_session(OnUnprotected::Reject);
+        decryptor.on_frame(b'T', &row_bound_description()).unwrap();
+        decryptor
+            .on_frame(b'D', &data_row(&[Some(b"7"), Some(&stored)]))
+            .expect("the resolved type still opens")
+            .body()
+            .expect("rewritten");
+    }
+
+    /// Every protected column of a table shares that table's key, so the key is
+    /// canonicalised once per row however many columns bind to it — and not at
+    /// all when nothing does (PERF-3).
+    #[test]
+    fn one_row_key_is_canonicalised_once_however_many_columns_bind_to_it() {
+        const TABLE: u32 = 1234;
+        let spec = ResolvedRowKey {
+            attnum: 1,
+            type_oid: crate::rowkey::oid::INT4,
+            name: "id".into(),
+            table: "public.users".into(),
+        };
+        let mut columns = ColumnMap::new();
+        for attnum in [2i16, 3] {
+            columns.insert(
+                (TABLE, attnum),
+                ReadColumn {
+                    name: format!("public.users.c{attnum}").into(),
+                    transform: Some(transform(false)),
+                    mask: None,
+                },
+            );
+        }
+        // SELECT id, c2, c3 FROM users
+        let fields = [
+            (TABLE, 1i16, crate::rowkey::oid::INT4),
+            (TABLE, 2, crate::rowkey::oid::TEXT),
+            (TABLE, 3, crate::rowkey::oid::TEXT),
+        ];
+
+        let bound = Resolved {
+            columns: columns.clone(),
+            row_keys: HashMap::from([(TABLE, spec)]),
+            ..Default::default()
+        };
+        let positions = bound.protected(&fields);
+        assert_eq!(positions.len(), 2, "both protected columns are found");
+        let slots = distinct_slots(&positions);
+        assert_eq!(slots.len(), 1, "two columns, one key, one canonicalisation");
+        assert_eq!(slots[0].0, 0, "and it is the key's own result position");
+
+        // A table with no declared key canonicalises nothing, so a deployment
+        // that does not use the feature pays no per-row allocation for it.
+        let unbound = Resolved { columns, ..Default::default() };
+        assert!(distinct_slots(&unbound.protected(&fields)).is_empty());
     }
 
     /// A projected row key the proxy cannot canonicalise is refused *as that*.
