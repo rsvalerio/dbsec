@@ -3,11 +3,11 @@ id: TASK-0161
 title: >-
   TEST-6: the 'drives every site' invariant is documented but false for 6 of 18
   Unprotected variants
-status: In Progress
+status: Done
 assignee:
   - TASK-0181
 created_date: '2026-08-19 08:31'
-updated_date: '2026-08-19 09:44'
+updated_date: '2026-08-19 10:09'
 labels:
   - code-review-rust
   - test-coverage
@@ -45,9 +45,9 @@ moment a variant was added without touching it — which has now happened twice 
 
 ## Acceptance Criteria
 <!-- AC:BEGIN -->
-- [ ] #1 The test drives all 18 variants, including a row-bound fixture for RowKeyMissing and a COPY (SELECT) TO STDOUT for CopyQuery
-- [ ] #2 Adding a variant without adding a driver fails the build — e.g. an exhaustive match over a constructed value of every variant inside the test
-- [ ] #3 The module doc is accurate as written afterwards
+- [x] #1 The test drives all 18 variants, including a row-bound fixture for RowKeyMissing and a COPY (SELECT) TO STDOUT for CopyQuery
+- [x] #2 Adding a variant without adding a driver fails the build — e.g. an exhaustive match over a constructed value of every variant inside the test
+- [x] #3 The module doc is accurate as written afterwards
 <!-- AC:END -->
 
 ## Implementation Notes
@@ -59,4 +59,6 @@ row key column) and is in the same position as `RowKeyMissing` — unreachable f
 `no_event_from_the_write_path_carries_a_plaintext_value`, whose rewriter is built with no
 `RowContext`, so no row-key site can fire. Covering the row-key sites means giving that
 test a row-bound rewriter, not just more SQL.
+
+Driven in TASK-0181: the test now drives all 18 sites (a row-bound rewriter for RowKeyMissing, COPY (SELECT ...) TO STDOUT for CopyQuery, COPY ... TO STDOUT for Copy{to:true}, a projection for ComputedColumn, a non-searchable catalog for UnindexedPredicate, and a backslash literal after standard_conforming_strings went off for AmbiguousLiteral), and ends in an exhaustive match over a constructed value of every variant, so a new variant fails the build. The driving pass runs twice: tracing fixes a callsite's interest at its first hit, so a site another test's thread reached first was silently dropped from the capture; the first pass registers the callsites and rebuild_interest_cache recomputes them against the capturing subscriber.
 <!-- SECTION:NOTES:END -->

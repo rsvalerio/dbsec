@@ -3,11 +3,11 @@ id: TASK-0170
 title: >-
   TEST-11: the ErrorResponse truncation test does not pin the cap and never
   crosses a char boundary
-status: To Do
+status: Done
 assignee:
   - TASK-0181
 created_date: '2026-08-19 08:32'
-updated_date: '2026-08-19 09:01'
+updated_date: '2026-08-19 10:09'
 labels:
   - code-review-rust
   - test-quality
@@ -36,6 +36,12 @@ panic in the refusal path. Neither property is defended by a test.
 
 ## Acceptance Criteria
 <!-- AC:BEGIN -->
-- [ ] #1 The truncation assertion pins the actual bound so raising the cap fails the test
-- [ ] #2 A case truncates a message whose byte 512 falls inside a multi-byte character and asserts valid UTF-8 with no panic
+- [x] #1 The truncation assertion pins the actual bound so raising the cap fails the test
+- [x] #2 A case truncates a message whose byte 512 falls inside a multi-byte character and asserts valid UTF-8 with no panic
 <!-- AC:END -->
+
+## Implementation Notes
+
+<!-- SECTION:NOTES:BEGIN -->
+Done in TASK-0181: the truncation test now pins MAX_ERROR_MESSAGE at 512 and asserts the M field is exactly the capped prefix, and a second case truncates a message whose byte 512 falls inside a 3-byte character, decoding the field with String::from_utf8 (not lossy) so a mid-character cut fails rather than being papered over.
+<!-- SECTION:NOTES:END -->
