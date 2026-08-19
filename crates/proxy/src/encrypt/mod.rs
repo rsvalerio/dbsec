@@ -157,7 +157,7 @@ use dbsec_core::transform::{FieldTransform, WireForm};
 use sqlparser::ast::{
     Expr, FunctionArg, FunctionArgExpr, GroupByExpr, Ident, Insert, JoinConstraint, JoinOperator,
     ObjectName, OnConflict, OnConflictAction, OnInsert, Query, Select, SelectItem, SetExpr,
-    Statement, TableFactor, TableWithJoins, Value,
+    Statement, TableFactor, TableWithJoins, UnaryOperator, Value,
 };
 use sqlparser::dialect::PostgreSqlDialect;
 use sqlparser::parser::{Parser, ParserError};
@@ -1594,7 +1594,7 @@ impl QueryRewriter {
                 Ok(left | right)
             }
             Expr::Nested(inner) => self.rewrite_selection(inner, scope, params),
-            Expr::UnaryOp { op: sqlparser::ast::UnaryOperator::Not, expr: inner } => {
+            Expr::UnaryOp { op: UnaryOperator::Not, expr: inner } => {
                 self.rewrite_selection(inner, scope, params)
             }
             Expr::InList { expr: column, list, .. } => {
@@ -2040,6 +2040,18 @@ fn literal_plaintext(expr: &Expr, wire: WireForm) -> Option<Vec<u8>> {
         ) => Some(text_plaintext(s, wire)),
         Expr::Value(Value::DollarQuotedString(s)) => Some(text_plaintext(&s.value, wire)),
         Expr::Value(Value::Number(n, _)) => Some(n.as_bytes().to_vec()),
+        // A signed number is a `UnaryOp` over a `Number`, never a `Number` with
+        // the sign inside it. Missing that made `WHERE id = -1` name no row key
+        // at all, so a row with an ordinary negative key fell through to the
+        // `RowKeyMissing` gate and sealed cell-only under `warn` (SEC-11).
+        Expr::UnaryOp { op: UnaryOperator::Minus, expr } => match unwrap_casts(expr) {
+            Expr::Value(Value::Number(n, _)) => Some(format!("-{n}").into_bytes()),
+            _ => None,
+        },
+        Expr::UnaryOp { op: UnaryOperator::Plus, expr } => match unwrap_casts(expr) {
+            Expr::Value(Value::Number(n, _)) => Some(n.as_bytes().to_vec()),
+            _ => None,
+        },
         _ => None,
     }
 }
