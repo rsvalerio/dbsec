@@ -374,9 +374,39 @@ mod tests {
         assert_eq!(*bytes.last().unwrap(), 0, "field list is terminated");
         let body = String::from_utf8_lossy(&bytes[5..]);
         assert!(body.contains("ERROR") && body.contains(REFUSED_SQLSTATE) && body.contains("nope"));
+        assert_eq!(message_field(&bytes), "nope");
+    }
 
-        // A message longer than the cap is truncated, not dropped.
-        let long = error_response(&"x".repeat(4096));
-        assert!(long.len() < 4096);
+    /// The 'M' field as the client reads it: the bytes between the field
+    /// marker and its terminator, decoded strictly — a truncation that split a
+    /// character would fail here rather than be papered over.
+    fn message_field(bytes: &[u8]) -> String {
+        let field = bytes[pgwire::FRAME_HEADER_LEN..]
+            .split(|byte| *byte == 0)
+            .find(|field| field.first() == Some(&b'M'))
+            .expect("an M field");
+        String::from_utf8(field[1..].to_vec()).expect("the message is valid UTF-8")
+    }
+
+    /// The cap and the boundary walk are both security properties, so both are
+    /// pinned. The cap bounds attacker-influenced text on the wire — the
+    /// message embeds client-chosen identifiers — and the walk is what stops a
+    /// multi-byte identifier truncated mid-character from panicking on the
+    /// slice, which a client could trigger at will.
+    #[test]
+    fn a_long_message_is_truncated_at_the_cap_and_on_a_char_boundary() {
+        // Pinned, not merely bounded: raising the cap puts more of a
+        // client-chosen identifier on the wire, so the number is part of the
+        // contract rather than an implementation detail.
+        assert_eq!(MAX_ERROR_MESSAGE, 512);
+        let long = message_field(&error_response(&"x".repeat(4096)));
+        assert_eq!(long, "x".repeat(MAX_ERROR_MESSAGE));
+
+        // A message whose byte `MAX_ERROR_MESSAGE` falls inside a multi-byte
+        // character: an ASCII prefix one byte short of the cap, then a
+        // three-byte character straddling it. Slicing at the cap would panic,
+        // so the walk has to step back to the boundary before it.
+        let straddling = format!("{}\u{20ac}{}", "x".repeat(MAX_ERROR_MESSAGE - 1), "y".repeat(8));
+        assert_eq!(message_field(&error_response(&straddling)), "x".repeat(MAX_ERROR_MESSAGE - 1));
     }
 }
