@@ -1,9 +1,12 @@
 //! Canonicalising a row's declared key so both data paths agree on it.
 //!
 //! A row key is bound into every row-bound envelope
-//! ([`dbsec_core::envelope::RowKey`]), which means the write path and the read
-//! path must derive *identical* bytes for the same row — across drivers, across
-//! wire formats, and across the two directions.
+//! ([`crate::envelope::RowKey`]), which means every writer and every reader of
+//! a row-bound column must derive *identical* bytes for the same row — across
+//! drivers, across wire formats, and across the two directions. That holds for
+//! the proxy's two data paths and, equally, for an application calling this
+//! crate directly: a value sealed by one and opened by the other has to agree
+//! on the row it names.
 //!
 //! That is harder than it looks, and it is the reason this module exists rather
 //! than the row key being passed around as raw wire bytes. PostgreSQL sends the
@@ -25,12 +28,11 @@
 //! exactly, in both formats. That is a surface the proxy has deliberately
 //! avoided elsewhere — the read path sniffs a `\x` prefix rather than consult a
 //! type OID — so it is kept to the types people actually declare keys on, and
-//! anything else is refused at startup with a message naming the column. An
-//! unsupported type is a configuration error the operator can see, never a
-//! silent fallback to raw bytes.
+//! anything else is refused with a message naming the column. An unsupported
+//! type is a configuration error the caller can see, never a silent fallback to
+//! raw bytes.
 
-use dbsec_core::envelope::RowKey;
-
+use crate::envelope::RowKey;
 use crate::Error;
 
 /// PostgreSQL type OIDs this module can canonicalise. From
@@ -66,9 +68,9 @@ impl Format {
     }
 }
 
-/// Whether the proxy can canonicalise a key of this type. Checked once at
-/// resolution time so the refusal names the column and happens at startup,
-/// rather than once per row on the data path.
+/// Whether a key of this type can be canonicalised. Worth checking once,
+/// where a column is configured, so the refusal names the column and happens
+/// at startup rather than once per row on the data path.
 ///
 /// `bpchar` (`char(n)`) is deliberately absent. PostgreSQL blank-pads it to
 /// `n` on *output* but the client's own input is not padded, so `'abc'` would

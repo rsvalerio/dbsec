@@ -42,7 +42,7 @@ use std::sync::Arc;
 use std::task::Poll;
 use std::time::Duration;
 
-use dbsec_core::pgwire::{self, Startup};
+use dbsec_pgwire::{self as pgwire, Startup};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::sync::{watch, Mutex};
@@ -969,7 +969,7 @@ mod tests {
             assert!(
                 matches!(
                     result,
-                    Err(Error::Wire(dbsec_core::Error::StartupMessageTooLarge {
+                    Err(Error::Pgwire(dbsec_pgwire::Error::StartupMessageTooLarge {
                         max: pgwire::MAX_STARTUP_MESSAGE_LEN,
                         ..
                     }))

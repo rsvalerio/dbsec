@@ -13,7 +13,7 @@
 //! names the remedy. Neither may carry a plaintext value — the column and the
 //! *shape* of the expression are what identify the site.
 
-use dbsec_core::pgwire;
+use dbsec_pgwire as pgwire;
 use sqlparser::ast::ObjectName;
 use sqlparser::parser::ParserError;
 

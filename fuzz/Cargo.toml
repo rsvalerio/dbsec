@@ -10,6 +10,7 @@ cargo-fuzz = true
 [dependencies]
 libfuzzer-sys = "0.4"
 dbsec-core = { path = "../crates/core" }
+dbsec-pgwire = { path = "../crates/pgwire" }
 hex = "0.4"
 
 [[bin]]

@@ -191,12 +191,12 @@ pub async fn resolve_columns(
         // Refused here rather than per row on the data path: the operator
         // learns at startup that this column cannot be a row key, instead of
         // every protected read failing later with the same reason.
-        if !crate::rowkey::supported(type_oid) {
-            return Err(Error::RowKeyType(format!(
+        if !dbsec_core::rowkey::supported(type_oid) {
+            return Err(Error::Wire(dbsec_core::Error::RowKeyType(format!(
                 "{}.{}.{} has type oid {type_oid}, which cannot be canonicalised as a row key; \
                  use an integer, text or uuid column",
                 decl.schema, decl.table, decl.column
-            )));
+            ))));
         }
         tracing::info!(
             row_key = %format!("{}.{}.{}", decl.schema, decl.table, decl.column),

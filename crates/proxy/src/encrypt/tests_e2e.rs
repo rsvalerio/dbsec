@@ -22,7 +22,7 @@ use super::*;
 use crate::rows::tests::transform;
 use crate::session::FrameAction;
 use dbsec_core::blind_index;
-use dbsec_core::pgwire;
+use dbsec_pgwire as pgwire;
 
 #[test]
 fn cast_wrapped_searchable_equality_is_rewritten() {

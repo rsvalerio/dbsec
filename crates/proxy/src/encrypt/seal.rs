@@ -26,9 +26,9 @@ use super::{
     Rejection, SealTarget, SealedValues, Unprotected,
 };
 use crate::portal::{ParamAction, ParamTransforms, RowKeySource};
-use crate::rowkey;
 use crate::rows::ResolvedRowKey;
 use crate::Error;
+use dbsec_core::rowkey;
 
 /// The parts of an `UPDATE` that decide which row its assignment list writes.
 ///
@@ -61,7 +61,7 @@ pub(super) struct UpdateTarget<'a> {
 /// to nothing: refused under `reject`, and silently sealed cell-only under
 /// `warn` — the protection quietly weaker than the configuration promises. The
 /// same divergence on protected *column* names is what
-/// [`crate::config::fold_identifier`] was written for.
+/// [`dbsec_core::ident::fold_identifier`] was written for.
 fn row_key_name(spec: &ResolvedRowKey) -> &str {
     &spec.name
 }
@@ -666,8 +666,9 @@ mod tests {
     use std::borrow::Cow;
     use std::sync::Arc;
 
+    use dbsec_core::blind_index;
     use dbsec_core::transform::FieldTransform;
-    use dbsec_core::{blind_index, pgwire};
+    use dbsec_pgwire as pgwire;
 
     use crate::config::OnUnprotected;
     use crate::encrypt::test_support::*;

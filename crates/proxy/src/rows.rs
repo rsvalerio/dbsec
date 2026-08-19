@@ -53,7 +53,7 @@
 //! row-bound value whose row key the query never projected
 //! ([`dbsec_core::Error::RowKeyMissing`]), a projected row key the proxy
 //! cannot canonicalise — NULL, not UTF-8, a wrong-width binary integer
-//! ([`Error::RowKeyType`]), and the two halves of the self-join problem, which
+//! ([`dbsec_core::Error::RowKeyType`]), and the two halves of the self-join problem, which
 //! no RowDescription can disambiguate (SEC-11): a result set projecting one
 //! row-keyed table's key *more than once* ([`Error::AmbiguousRowKey`]),
 //! refused on sight because the alternative is opening one row's value against
@@ -93,9 +93,9 @@ use std::sync::Arc;
 
 use dbsec_core::envelope::RowKey;
 use dbsec_core::mask::MaskSpec;
-use dbsec_core::pgwire;
 use dbsec_core::sync::Unpoisoned as _;
 use dbsec_core::transform::{FieldTransform, WireForm};
+use dbsec_pgwire as pgwire;
 
 use tokio::sync::Notify;
 
@@ -242,7 +242,7 @@ pub enum RowKeyRef {
 ///
 /// The type OID is carried because a row key has to be canonicalised before it
 /// can be bound, and the wire bytes alone do not say how (see
-/// [`crate::rowkey`]). The names are kept for messages: a refusal that says
+/// [`dbsec_core::rowkey`]). The names are kept for messages: a refusal that says
 /// which column of which table the client has to project (or stop projecting
 /// twice) is actionable, one that says "attnum 1 of oid 16384" is not.
 #[derive(Debug, Clone)]
@@ -531,7 +531,7 @@ fn is_refusal(error: &Error) -> bool {
             // value cannot name a row. Both are the client's to fix, and
             // neither is evidence the ciphertext was tampered with, so the
             // value is refused rather than the session merely failing.
-            | Error::RowKeyType(_)
+            | Error::Wire(dbsec_core::Error::RowKeyType(_))
             // A cell-only value in a column whose table closed its row-binding
             // migration window. Also a policy decision about one result set:
             // the bytes are intact, they are simply bound to less than the
@@ -870,11 +870,11 @@ impl RowDecryptor {
                 // by the description, so nothing this row carries could change
                 // the answer and every row of the result set would repeat it.
                 RowKeyRef::TypeChanged { table, column, wire, resolved } => {
-                    return Err(Error::RowKeyType(format!(
+                    return Err(Error::Wire(dbsec_core::Error::RowKeyType(format!(
                         "{table}.{column} came back as type oid {wire} but resolved as type oid \
                          {resolved}; re-resolve the proxy's columns, and re-encrypt the table if \
                          its key type really changed"
-                    )))
+                    ))))
                 }
                 RowKeyRef::Absent | RowKeyRef::Slot { .. } => {}
             }
@@ -1069,7 +1069,7 @@ impl RowKeyOnce {
 /// The canonical row key sitting at `index` of this result row, or why it could
 /// not be derived.
 ///
-/// Every failure keeps its own reason ([`Error::RowKeyType`]) instead of
+/// Every failure keeps its own reason ([`dbsec_core::Error::RowKeyType`]) instead of
 /// becoming an absent key: a key that is NULL, not valid UTF-8, the wrong width
 /// for its type, or carried under an unknown format code is a *different*
 /// problem from a query that never projected the key at all, and the refusal
@@ -1083,15 +1083,15 @@ fn read_row_key(
     // The description said the key is at this position, so a row too short to
     // hold it disagrees with the description it arrived under.
     let raw = values.get(index).ok_or_else(|| {
-        Error::RowKeyType(format!(
+        dbsec_core::Error::RowKeyType(format!(
             "row key is described at result position {index} of a row carrying {} values",
             values.len()
         ))
     })?;
     // From the Bind, not from the description: a Describe of a statement
     // reports zero for every column, whatever the portal later asked for.
-    let format = crate::rowkey::Format::from_code(formats.for_column(index))?;
-    crate::rowkey::canonical(type_oid, format, raw.as_deref())
+    let format = dbsec_core::rowkey::Format::from_code(formats.for_column(index))?;
+    Ok(dbsec_core::rowkey::canonical(type_oid, format, raw.as_deref())?)
 }
 
 /// Names the cell a failed `open` belongs to.
@@ -1233,7 +1233,7 @@ pub mod tests {
         let resolved = Resolved { columns, ..Default::default() };
         Arc::new(Described::new(
             &resolved,
-            fields.into_iter().map(|(oid, attnum)| (oid, attnum, crate::rowkey::oid::TEXT)),
+            fields.into_iter().map(|(oid, attnum)| (oid, attnum, dbsec_core::rowkey::oid::TEXT)),
         ))
     }
 
@@ -1373,7 +1373,7 @@ pub mod tests {
         let tf = transform_bound(false, strict);
         let spec = ResolvedRowKey {
             attnum: 1,
-            type_oid: crate::rowkey::oid::INT4,
+            type_oid: dbsec_core::rowkey::oid::INT4,
             name: "id".into(),
             table: "public.users".into(),
         };
@@ -1447,8 +1447,8 @@ pub mod tests {
 
     /// The identities of `id` and `email` as the row key resolution expects
     /// them.
-    const ROW_BOUND_ID: (&[u8], i16, u32) = (b"id", 1, crate::rowkey::oid::INT4);
-    const ROW_BOUND_EMAIL: (&[u8], i16, u32) = (b"email", 2, crate::rowkey::oid::TEXT);
+    const ROW_BOUND_ID: (&[u8], i16, u32) = (b"id", 1, dbsec_core::rowkey::oid::INT4);
+    const ROW_BOUND_EMAIL: (&[u8], i16, u32) = (b"email", 2, dbsec_core::rowkey::oid::TEXT);
 
     /// A RowDescription for `SELECT id, email FROM users`.
     fn row_bound_description() -> Vec<u8> {
@@ -1585,7 +1585,7 @@ pub mod tests {
         let stored = sealed("INSERT INTO users (id, email) VALUES (7, 'alice@secret.test')");
 
         let (_ctx, _r, mut decryptor) = row_bound_session(OnUnprotected::Reject);
-        let retyped: (&[u8], i16, u32) = (b"id", 1, crate::rowkey::oid::UUID);
+        let retyped: (&[u8], i16, u32) = (b"id", 1, dbsec_core::rowkey::oid::UUID);
         decryptor.on_frame(b'T', &described_fields(&[retyped, ROW_BOUND_EMAIL])).unwrap();
         let frames =
             refused(decryptor.on_frame(b'D', &data_row(&[Some(b"7"), Some(&stored)])).unwrap());
@@ -1613,7 +1613,7 @@ pub mod tests {
         const TABLE: u32 = 1234;
         let spec = ResolvedRowKey {
             attnum: 1,
-            type_oid: crate::rowkey::oid::INT4,
+            type_oid: dbsec_core::rowkey::oid::INT4,
             name: "id".into(),
             table: "public.users".into(),
         };
@@ -1630,9 +1630,9 @@ pub mod tests {
         }
         // SELECT id, c2, c3 FROM users
         let fields = [
-            (TABLE, 1i16, crate::rowkey::oid::INT4),
-            (TABLE, 2, crate::rowkey::oid::TEXT),
-            (TABLE, 3, crate::rowkey::oid::TEXT),
+            (TABLE, 1i16, dbsec_core::rowkey::oid::INT4),
+            (TABLE, 2, dbsec_core::rowkey::oid::TEXT),
+            (TABLE, 3, dbsec_core::rowkey::oid::TEXT),
         ];
 
         let bound = Resolved {
@@ -1922,9 +1922,9 @@ pub mod tests {
 
     /// The row key a `users` row with this `id` is sealed against.
     fn key_of(id: &str) -> RowKey {
-        crate::rowkey::canonical(
-            crate::rowkey::oid::INT4,
-            crate::rowkey::Format::Text,
+        dbsec_core::rowkey::canonical(
+            dbsec_core::rowkey::oid::INT4,
+            dbsec_core::rowkey::Format::Text,
             Some(id.as_bytes()),
         )
         .expect("canonical row key")
