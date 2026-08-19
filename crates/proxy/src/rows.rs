@@ -1191,8 +1191,16 @@ pub mod tests {
     /// A session whose `users` table declares `id` as its row key, wired on
     /// both directions from one resolution — which is the point: the write path
     /// finds the key by name and the read path by OID, and they have to agree.
-    fn row_bound_session() -> (Arc<RowContext>, crate::encrypt::QueryRewriter, RowDecryptor) {
-        row_bound_session_strict(false)
+    ///
+    /// `policy` reaches both catalogs, because every row-binding constraint is
+    /// an [`OnUnprotected`] site: under `reject` the statement is refused, and
+    /// under `warn` — the default a deployment actually runs on — it is
+    /// relayed. A fixture hard-coded to `reject` can only ever test the half
+    /// nobody is running.
+    fn row_bound_session(
+        policy: OnUnprotected,
+    ) -> (Arc<RowContext>, crate::encrypt::QueryRewriter, RowDecryptor) {
+        row_bound_session_strict(false, policy)
     }
 
     /// The same session with the table's row-binding migration window closed:
@@ -1200,6 +1208,7 @@ pub mod tests {
     /// value.
     fn row_bound_session_strict(
         strict: bool,
+        policy: OnUnprotected,
     ) -> (Arc<RowContext>, crate::encrypt::QueryRewriter, RowDecryptor) {
         use crate::columns::ProtectedColumn;
 
@@ -1231,7 +1240,7 @@ pub mod tests {
                 )]),
                 ..Default::default()
             },
-            OnUnprotected::Reject,
+            policy,
             DEFAULT_MAX_PROTECTED_VALUE_LEN,
         ));
         let catalog = Arc::new(crate::encrypt::WriteCatalog::new(
@@ -1244,7 +1253,7 @@ pub mod tests {
                 readable: true,
                 mask: None,
             }],
-            OnUnprotected::Reject,
+            policy,
         ));
         let portals = SessionPortals::new();
         let rewriter = crate::encrypt::QueryRewriter::new(
@@ -1293,7 +1302,7 @@ pub mod tests {
     /// the read path, and prove the stored bytes do not open in another row.
     #[test]
     fn a_row_bound_value_does_not_open_in_another_row() {
-        let (_ctx, mut rewriter, _decryptor) = row_bound_session();
+        let (_ctx, mut rewriter, _decryptor) = row_bound_session(OnUnprotected::Reject);
 
         let sql = "INSERT INTO users (id, email) VALUES (7, 'alice@secret.test')";
         let rewritten = match rewriter.on_frame(b'Q', &query_frame(sql)).unwrap() {
@@ -1310,7 +1319,7 @@ pub mod tests {
         // Read it back in its own row, on a fresh session: the write left a
         // pending Query response on the shared portal queue, and reusing it
         // here would test that interplay rather than the binding.
-        let (_ctx, _r, mut decryptor) = row_bound_session();
+        let (_ctx, _r, mut decryptor) = row_bound_session(OnUnprotected::Reject);
         decryptor.on_frame(b'T', &row_bound_description()).unwrap();
         let own = data_row(&[Some(b"7"), Some(&stored)]);
         let opened = decryptor.on_frame(b'D', &own).unwrap().body().expect("rewritten");
@@ -1322,7 +1331,7 @@ pub mod tests {
         // existing contract for a crypto failure and is right here: a value
         // that does not authenticate against the row it was read from is
         // tampering, not a query the client can fix by rewriting it.
-        let (_ctx, _rewriter, mut decryptor) = row_bound_session();
+        let (_ctx, _rewriter, mut decryptor) = row_bound_session(OnUnprotected::Reject);
         decryptor.on_frame(b'T', &row_bound_description()).unwrap();
         let moved = data_row(&[Some(b"8"), Some(&stored)]);
         let error = decryptor.on_frame(b'D', &moved).expect_err("a relocation must fail");
@@ -1368,7 +1377,7 @@ pub mod tests {
     /// which is the only way to get a genuinely row-bound `DBS3` value for the
     /// read path to fail against.
     fn sealed(sql: &str) -> Vec<u8> {
-        let (_ctx, mut rewriter, _d) = row_bound_session();
+        let (_ctx, mut rewriter, _d) = row_bound_session(OnUnprotected::Reject);
         let rewritten = match rewriter.on_frame(b'Q', &query_frame(sql)).unwrap() {
             FrameAction::Replace(body) => String::from_utf8_lossy(&body).into_owned(),
             other => panic!("the insert must be rewritten, got {other:?}"),
@@ -1390,7 +1399,7 @@ pub mod tests {
         let stored = sealed("INSERT INTO users (id, email) VALUES (7, 'alice@secret.test')");
 
         // The key column is projected, and NULL in this row.
-        let (_ctx, _r, mut decryptor) = row_bound_session();
+        let (_ctx, _r, mut decryptor) = row_bound_session(OnUnprotected::Reject);
         decryptor.on_frame(b'T', &row_bound_description()).unwrap();
         let frames = refused(decryptor.on_frame(b'D', &data_row(&[None, Some(&stored)])).unwrap());
         let text = String::from_utf8_lossy(&frames);
@@ -1405,7 +1414,7 @@ pub mod tests {
         // reported the same way, rather than being reinterpreted. It takes a
         // Bind to say the results come back in binary: the RowDescription of a
         // described *statement* reports zero for every column (SEC-31).
-        let (_ctx, mut rewriter, mut decryptor) = row_bound_session();
+        let (_ctx, mut rewriter, mut decryptor) = row_bound_session(OnUnprotected::Reject);
         bind_results(&mut rewriter, &mut decryptor, 1);
         let short = data_row(&[Some(&[0, 0, 7]), Some(&stored)]);
         let text = String::from_utf8_lossy(&refused(decryptor.on_frame(b'D', &short).unwrap()))
@@ -1414,7 +1423,7 @@ pub mod tests {
 
         // The projection the client really did omit still reports itself: this
         // is the refusal the case above used to be confused with.
-        let (_ctx, _r, mut decryptor) = row_bound_session();
+        let (_ctx, _r, mut decryptor) = row_bound_session(OnUnprotected::Reject);
         decryptor.on_frame(b'T', &row_description(&[(1234, 2)])).unwrap();
         let text = String::from_utf8_lossy(&refused(
             decryptor.on_frame(b'D', &data_row(&[Some(&stored)])).unwrap(),
@@ -1429,7 +1438,7 @@ pub mod tests {
     /// nothing in it is row-bound.
     #[test]
     fn an_unusable_row_key_does_not_refuse_a_value_that_needs_no_key() {
-        let (_ctx, _r, mut decryptor) = row_bound_session();
+        let (_ctx, _r, mut decryptor) = row_bound_session(OnUnprotected::Reject);
         decryptor.on_frame(b'T', &row_bound_description()).unwrap();
         let plaintext = data_row(&[None, Some(b"not-an-envelope")]);
         assert!(
@@ -1452,7 +1461,7 @@ pub mod tests {
         let row = data_row(&[Some(b"7"), Some(&degraded)]);
 
         // Window open: it opens, and the projected row key binds nothing.
-        let (_ctx, _r, mut decryptor) = row_bound_session_strict(false);
+        let (_ctx, _r, mut decryptor) = row_bound_session_strict(false, OnUnprotected::Reject);
         decryptor.on_frame(b'T', &row_bound_description()).unwrap();
         let opened = decryptor.on_frame(b'D', &row).unwrap().body().expect("rewritten");
         assert_eq!(pgwire::parse_data_row(&opened).unwrap()[1], Some(&b"alice@secret.test"[..]));
@@ -1460,7 +1469,7 @@ pub mod tests {
         // Window closed: the client is answered rather than the session merely
         // failing, because the remedy — re-encrypt the value, or reopen the
         // window — is the operator's and the reason has to reach them.
-        let (_ctx, _r, mut decryptor) = row_bound_session_strict(true);
+        let (_ctx, _r, mut decryptor) = row_bound_session_strict(true, OnUnprotected::Reject);
         decryptor.on_frame(b'T', &row_bound_description()).unwrap();
         let frames = refused(decryptor.on_frame(b'D', &row).unwrap());
         let text = String::from_utf8_lossy(&frames);
@@ -1517,7 +1526,7 @@ pub mod tests {
         let stored = sealed("INSERT INTO users (id, email) VALUES (7, 'alice@x.io')");
 
         for (format, key) in [(1i16, 7i32.to_be_bytes().to_vec()), (0, b"7".to_vec())] {
-            let (_ctx, mut rewriter, mut decryptor) = row_bound_session();
+            let (_ctx, mut rewriter, mut decryptor) = row_bound_session(OnUnprotected::Reject);
             bind_results(&mut rewriter, &mut decryptor, format);
             let row = data_row(&[Some(&key), Some(&stored)]);
             let opened = decryptor.on_frame(b'D', &row).unwrap().body().expect("rewritten");
@@ -1540,7 +1549,7 @@ pub mod tests {
     /// (SEC-11).
     #[test]
     fn a_self_join_projecting_the_row_key_twice_is_refused_by_name() {
-        let (ctx, _r, mut decryptor) = row_bound_session();
+        let (ctx, _r, mut decryptor) = row_bound_session(OnUnprotected::Reject);
         // `SELECT a.id, a.email, b.id, b.email FROM users a JOIN users b …`.
         let description = [ROW_BOUND_ID, ROW_BOUND_EMAIL, ROW_BOUND_ID, ROW_BOUND_EMAIL];
 
@@ -1618,7 +1627,7 @@ pub mod tests {
     /// not catch it either.
     #[test]
     fn an_upsert_binds_its_conflict_action_to_the_row_it_conflicts_on() {
-        let (_ctx, mut rewriter, _d) = row_bound_session();
+        let (_ctx, mut rewriter, _d) = row_bound_session(OnUnprotected::Reject);
         let rewritten = write(
             &mut rewriter,
             "INSERT INTO users (id, email) VALUES (7, 'alice@x.io') \
@@ -1655,7 +1664,7 @@ pub mod tests {
             "INSERT INTO users (id, email) VALUES (7, 'a@x.io'), (8, 'c@x.io') \
              ON CONFLICT (id) DO UPDATE SET email = 'b@x.io'",
         ] {
-            let (_ctx, mut rewriter, _d) = row_bound_session();
+            let (_ctx, mut rewriter, _d) = row_bound_session(OnUnprotected::Reject);
             let refusal = write(&mut rewriter, sql).expect_err(sql);
             assert!(refusal.contains("row key id"), "{sql} => {refusal}");
         }
@@ -1667,7 +1676,7 @@ pub mod tests {
     /// `ON CONFLICT (id)` and is refused on any other target.
     #[test]
     fn excluded_is_re_stored_only_where_the_conflicting_row_shares_the_key() {
-        let (_ctx, mut rewriter, _d) = row_bound_session();
+        let (_ctx, mut rewriter, _d) = row_bound_session(OnUnprotected::Reject);
         let rewritten = write(
             &mut rewriter,
             "INSERT INTO users (id, email) VALUES (7, 'alice@x.io') \
@@ -1677,7 +1686,7 @@ pub mod tests {
         assert!(rewritten.contains("EXCLUDED.email"), "{rewritten}");
         assert_eq!(sealed_literals(&rewritten).len(), 1, "only the VALUES row is sealed");
 
-        let (_ctx, mut rewriter, _d) = row_bound_session();
+        let (_ctx, mut rewriter, _d) = row_bound_session(OnUnprotected::Reject);
         let refusal = write(
             &mut rewriter,
             "INSERT INTO users (id, email) VALUES (7, 'alice@x.io') \
@@ -1694,7 +1703,7 @@ pub mod tests {
     /// joined relation and its predicate are the free part of the statement.
     #[test]
     fn an_update_from_binds_the_target_relations_row_key_not_the_joined_ones() {
-        let (_ctx, mut rewriter, _d) = row_bound_session();
+        let (_ctx, mut rewriter, _d) = row_bound_session(OnUnprotected::Reject);
         let rewritten = write(
             &mut rewriter,
             "UPDATE users u SET email = 'alice@x.io' FROM audit a WHERE a.id = 1 AND u.id = 99",
@@ -1720,7 +1729,7 @@ pub mod tests {
     /// than guessed.
     #[test]
     fn an_unqualified_row_key_is_refused_once_the_statement_joins() {
-        let (_ctx, mut rewriter, _d) = row_bound_session();
+        let (_ctx, mut rewriter, _d) = row_bound_session(OnUnprotected::Reject);
         let refusal = write(
             &mut rewriter,
             "UPDATE users u SET email = 'alice@x.io' FROM audit a WHERE a.id = 1 AND id = 99",
@@ -1740,9 +1749,186 @@ pub mod tests {
             "INSERT INTO users (id, email) VALUES (7, 'a@x.io') \
              ON CONFLICT (id) DO UPDATE SET email = 'b@x.io', id = 99",
         ] {
-            let (_ctx, mut rewriter, _d) = row_bound_session();
+            let (_ctx, mut rewriter, _d) = row_bound_session(OnUnprotected::Reject);
             let refusal = write(&mut rewriter, sql).expect_err(sql);
             assert!(refusal.contains("assigns id itself"), "{sql} => {refusal}");
+        }
+    }
+
+    /// Every write-path site that cannot say which row a statement writes,
+    /// under **both** settings of `on_unprotected`.
+    ///
+    /// All three route through [`crate::encrypt::Unprotected::RowKeyMissing`],
+    /// so `warn` — the default — relays the statement rather than refusing it.
+    /// None of them had a test at all, in either mode: a refactor that dropped
+    /// the row-key checks would have turned every row-bound `INSERT` into a
+    /// plaintext write with the suite still green.
+    ///
+    /// The two `INSERT` sites relay the statement **unsealed**, because the
+    /// rewrite gives up on the whole `VALUES` list; the assignment site still
+    /// seals, cell-only, which is the binding the table had before it declared
+    /// a row key. Both are pinned here so the difference is a decision rather
+    /// than an accident.
+    #[test]
+    fn every_site_that_cannot_name_the_row_reports_itself_in_both_modes() {
+        use tracing_subscriber::layer::SubscriberExt as _;
+
+        // (sql, the shape the site reports, whether warn mode still seals)
+        const SITES: [(&str, &str, bool); 3] = [
+            (
+                "INSERT INTO users (email) VALUES ('alice@secret.test')",
+                "INSERT without the row key in its column list",
+                false,
+            ),
+            (
+                "INSERT INTO users (id, email) VALUES (nextval('users_id_seq'), \
+                 'alice@secret.test')",
+                "INSERT whose row key is not a literal or a parameter",
+                false,
+            ),
+            (
+                "UPDATE users SET email = 'alice@secret.test' WHERE dept = 'x'",
+                "UPDATE whose WHERE does not pin one row by its row key",
+                true,
+            ),
+        ];
+
+        for (sql, shape, _) in SITES {
+            let (_ctx, mut rewriter, _d) = row_bound_session(OnUnprotected::Reject);
+            let refusal = write(&mut rewriter, sql).expect_err(sql);
+            assert!(refusal.contains("public.users"), "{sql} => {refusal}");
+            assert!(refusal.contains("row key id"), "{sql} => {refusal}");
+            assert!(refusal.contains(shape), "{sql} => {refusal}");
+            assert!(!refusal.contains("alice@secret.test"), "{sql} => {refusal}");
+        }
+
+        let _capture = crate::log_capture();
+        let captured = crate::CapturedEvents::default();
+        let subscriber = tracing_subscriber::registry().with(captured.clone());
+        let relayed = tracing::subscriber::with_default(subscriber, || {
+            SITES
+                .iter()
+                .map(|(sql, _, _)| {
+                    let (_ctx, mut rewriter, _d) = row_bound_session(OnUnprotected::Warn);
+                    write(&mut rewriter, sql).expect("warn relays rather than refusing")
+                })
+                .collect::<Vec<_>>()
+        });
+
+        let events = captured.events();
+        assert_eq!(events.len(), SITES.len(), "one warning per site: {events:?}");
+        for (event, (sql, shape, _)) in events.iter().zip(SITES) {
+            assert!(event.contains("public.users"), "{sql} => {event}");
+            assert!(event.contains("row_key=id"), "{sql} => {event}");
+            assert!(event.contains(shape), "{sql} => {event}");
+            assert!(!event.contains("alice@secret.test"), "the warning must not log it: {event}");
+        }
+        for (rewritten, (sql, _, seals)) in relayed.iter().zip(SITES) {
+            let sealed = sealed_literals(rewritten);
+            if seals {
+                assert_eq!(sealed.len(), 1, "{sql} => {rewritten}");
+                assert!(
+                    sealed[0].starts_with(envelope::MAGIC),
+                    "cell-only, never plaintext and never row-bound: {sql}"
+                );
+                assert!(!rewritten.contains("alice@secret.test"), "{sql} => {rewritten}");
+            } else {
+                assert!(
+                    rewritten.contains("alice@secret.test"),
+                    "warn fails open on this site, and the test says so: {sql} => {rewritten}"
+                );
+            }
+        }
+    }
+
+    /// The read-path counterpart: a result set that omits the row key cannot
+    /// verify a row-bound value, so it is refused rather than relayed in its
+    /// stored form. `row_bound_description` always projects both fields, so no
+    /// test produced this shape.
+    #[test]
+    fn a_result_set_without_the_row_key_refuses_a_row_bound_value() {
+        let stored = sealed("INSERT INTO users (id, email) VALUES (7, 'alice@secret.test')");
+        assert!(stored.starts_with(envelope::MAGIC_V3), "the fixture value is row-bound");
+
+        let (_ctx, _r, mut decryptor) = row_bound_session(OnUnprotected::Reject);
+        // `SELECT email FROM users`: the same table, without its key column.
+        decryptor.on_frame(b'T', &row_description(&[(1234, 2)])).unwrap();
+        let frames = refused(decryptor.on_frame(b'D', &data_row(&[Some(&stored)])).unwrap());
+        let text = String::from_utf8_lossy(&frames);
+        assert!(text.contains("42501"), "the client gets a SQLSTATE: {text}");
+        assert!(text.contains("does not carry"), "and is told what to select: {text}");
+        assert!(!text.contains("alice@secret.test"), "and never the plaintext: {text}");
+    }
+
+    /// Parse `sql`, then Bind `params` to it, and hand back what the proxy did
+    /// with the Bind. The row key of a bound statement only exists at Bind, so
+    /// nothing about it can be exercised through the simple protocol.
+    fn bind_params(
+        rewriter: &mut crate::encrypt::QueryRewriter,
+        sql: &str,
+        formats: &[i16],
+        params: &[Option<&[u8]>],
+    ) -> FrameAction {
+        rewriter
+            .on_frame(b'P', &pgwire::encode_parse(b"s", sql.as_bytes(), &0i16.to_be_bytes()))
+            .expect("the statement parses");
+        let params: Vec<Option<Cow<'_, [u8]>>> =
+            params.iter().map(|p| p.map(Cow::Borrowed)).collect();
+        let bind = pgwire::encode_bind(b"", b"s", formats, &params, &0i16.to_be_bytes())
+            .expect("the bind encodes");
+        rewriter.on_frame(b'B', &bind).expect("a bad row key must not fail the session")
+    }
+
+    /// A row key bound as a parameter is *client input*, and every way it can
+    /// be unusable — NULL, non-UTF-8 text, a wrong-width binary integer, an
+    /// undefined format code — used to propagate as an `Error` out of Bind,
+    /// which closed the connection with no ErrorResponse at all. `UPDATE users
+    /// SET email = $1 WHERE id = $2` with `$2` NULL is ordinary traffic, and
+    /// under a connection pool the retry took the next connection down too.
+    #[test]
+    fn an_unusable_row_key_parameter_refuses_the_statement_not_the_session() {
+        const SQL: &str = "UPDATE users SET email = $1 WHERE id = $2";
+        let email = b"alice@secret.test".as_slice();
+
+        for (formats, params, expected) in [
+            (&[][..], vec![Some(email), None], "row key is NULL"),
+            (&[0, 1][..], vec![Some(email), Some(&[0, 0, 7][..])], "expected 4"),
+            (&[0, 7][..], vec![Some(email), Some(b"7".as_slice())], "unknown wire format code 7"),
+        ] {
+            let (_ctx, mut rewriter, _d) = row_bound_session(OnUnprotected::Reject);
+            let refusal = match bind_params(&mut rewriter, SQL, formats, &params) {
+                FrameAction::Reply(bytes) => String::from_utf8_lossy(&bytes).into_owned(),
+                other => panic!("a bad row key must be refused, got {other:?}"),
+            };
+            assert!(refusal.contains("42501"), "the client gets a SQLSTATE: {refusal}");
+            assert!(refusal.contains("$2"), "the refusal must name the placeholder: {refusal}");
+            assert!(refusal.contains("row key id"), "and the row-key column: {refusal}");
+            assert!(refusal.contains(expected), "and why it is unusable: {refusal}");
+            assert!(
+                !refusal.contains("alice@secret.test"),
+                "the sealed value must not reach the client: {refusal}"
+            );
+
+            // And the session is still the client's to use: the rest of the
+            // batch is swallowed, Sync answers ReadyForQuery, and the next
+            // statement seals as if nothing had happened.
+            assert!(
+                matches!(rewriter.on_frame(b'E', b"\0\0\0\0\0").unwrap(), FrameAction::Reply(rest)
+                    if rest.is_empty()),
+                "the refused batch is owned by the proxy until Sync"
+            );
+            match rewriter.on_frame(b'S', b"").unwrap() {
+                FrameAction::Reply(ready) => assert_eq!(ready.first(), Some(&b'Z'), "{ready:?}"),
+                other => panic!("Sync must answer ReadyForQuery, got {other:?}"),
+            }
+            let rewritten =
+                write(&mut rewriter, "INSERT INTO users (id, email) VALUES (7, 'bob@x.io')")
+                    .expect("the session survived the refusal");
+            assert_eq!(
+                sealed_literals(&rewritten).len(),
+                1,
+                "the next statement still seals: {rewritten}"
+            );
         }
     }
 
