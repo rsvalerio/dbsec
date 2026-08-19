@@ -226,11 +226,41 @@ pub struct BindMessage<'a> {
 impl BindMessage<'_> {
     /// Resolves the format code (0 = text, 1 = binary) for one parameter.
     pub fn param_format(&self, index: usize) -> i16 {
-        match self.param_formats.as_slice() {
-            [] => 0,
-            [only] => *only,
-            formats => formats.get(index).copied().unwrap_or(0),
+        format_code(&self.param_formats, index)
+    }
+
+    /// The *result* format codes this Bind chose, decoded from the raw
+    /// section.
+    ///
+    /// Kept as bytes on the message because the proxy relays that section
+    /// untouched; decoded on demand because the read path has to know how the
+    /// values of this portal's rows will be encoded — which a Describe of the
+    /// *statement* cannot say, since the protocol specifies its format codes
+    /// are "not yet known and will always be zero".
+    ///
+    /// # Errors
+    ///
+    /// [`Error::MalformedBackend`] when the section is truncated.
+    pub fn result_format_codes(&self) -> Result<Vec<i16>, Error> {
+        let mut raw = self.result_formats;
+        let count = take_i16(&mut raw)?;
+        let mut codes = Vec::with_capacity(count.max(0) as usize);
+        for _ in 0..count {
+            codes.push(take_i16(&mut raw)?);
         }
+        Ok(codes)
+    }
+}
+
+/// Resolves one format code out of a protocol format-code section, which is
+/// written in the same shorthand wherever it appears: empty means every value
+/// is text, a single entry applies to every value, and otherwise there is one
+/// code per value.
+pub fn format_code(codes: &[i16], index: usize) -> i16 {
+    match codes {
+        [] => 0,
+        [only] => *only,
+        codes => codes.get(index).copied().unwrap_or(0),
     }
 }
 

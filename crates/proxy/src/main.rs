@@ -290,6 +290,12 @@ pub enum Error {
          changed"
     )]
     RowBindingFailed { column: String, row_key: String, position: usize },
+    #[error(
+        "this result set projects the row key {table}.{column} more than once, so the proxy \
+         cannot tell which instance of {table} a protected column belongs to; project the row key \
+         once, or query each instance of the table separately"
+    )]
+    AmbiguousRowKey { table: String, column: String },
     #[error(transparent)]
     Wire(#[from] dbsec_core::Error),
     #[error(transparent)]

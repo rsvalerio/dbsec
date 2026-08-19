@@ -21,6 +21,10 @@ const COPY_TABLE: &str = "users_copy";
 const PREPARED_TABLE: &str = "users_prepared";
 const RECREATE_TABLE: &str = "users_recreate";
 
+/// The row-binding case: its proxy is the only one with a `[[table]] row_key`,
+/// so it needs a table of its own too.
+const ROW_KEY_TABLE: &str = "users_row_key";
+
 #[tokio::test]
 #[ignore = "needs the Postgres from `make e2e`"]
 async fn transparent_encryption_end_to_end() {
@@ -362,4 +366,54 @@ async fn a_recreated_table_is_re_resolved_and_refused_in_strict_mode() {
         client.query_one("SELECT 1", &[]).await.is_err(),
         "a read-path refusal must end the session, not resynchronise it"
     );
+}
+
+/// Row binding across the two wire formats, against the real binary.
+///
+/// The write here is a simple-protocol statement — a text-binding client's
+/// insert, with the row key as a literal — and the read is `query`, which
+/// tokio-postgres prepares: Parse, Describe(**statement**), Bind asking for
+/// binary results, Execute. The RowDescription that answers that Describe
+/// carries format code zero for every column, because the protocol says a
+/// statement's result formats "will always be zero" — they are chosen at Bind.
+/// Canonicalising the row key with the description's format read the four
+/// big-endian bytes of `1` as text, mismatched the AAD, and tore the session
+/// down with no ErrorResponse (SEC-31). It has to come from the Bind.
+#[tokio::test]
+#[ignore = "needs the Postgres from `make e2e`"]
+async fn a_row_bound_value_written_in_text_reads_back_in_binary() {
+    let direct = common::connect_direct().await;
+    common::create_table(&direct, ROW_KEY_TABLE).await;
+
+    let dir = tempfile::tempdir().unwrap();
+    let opts = common::ProxyOpts::file_keys(common::port_row_key(), ROW_KEY_TABLE).row_key("id");
+    let _proxy = common::spawn_proxy(dir.path(), &opts).await;
+    let client = common::connect_via_proxy(dir.path(), common::port_row_key()).await;
+
+    // Text-binding write: literals sealed by the SQL rewrite, bound to row 1.
+    client
+        .simple_query(&format!(
+            "INSERT INTO {ROW_KEY_TABLE} (id, email) VALUES (1, 'grace@example.com')"
+        ))
+        .await
+        .unwrap();
+
+    // At rest the value is row-bound, not merely cell-bound.
+    let stored: Vec<u8> = direct
+        .query_one(&format!("SELECT email FROM {ROW_KEY_TABLE} WHERE id = 1"), &[])
+        .await
+        .unwrap()
+        .get(0);
+    assert_eq!(&stored[32..36], b"DBS3", "blind index then the row-bound envelope magic");
+
+    // Binary-binding read of the same row, through a prepared statement.
+    let row = client
+        .query_one(&format!("SELECT id, email FROM {ROW_KEY_TABLE} WHERE id = $1"), &[&1i32])
+        .await
+        .expect("a binary-binding driver must be able to read a row-bound value");
+    assert_eq!(row.get::<_, Vec<u8>>(1), b"grace@example.com");
+
+    // And the session is still usable, which is what fails when the row key is
+    // canonicalised in the wrong format.
+    client.query_one("SELECT 1", &[]).await.unwrap();
 }

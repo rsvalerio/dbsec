@@ -163,7 +163,9 @@ use sqlparser::parser::{Parser, ParserError};
 use sqlparser::tokenizer::{TokenWithSpan, Tokenizer};
 
 use crate::config::OnUnprotected;
-use crate::portal::{ParamAction, ParamTransforms, RowKeySource, SessionPortals, Target};
+use crate::portal::{
+    ParamAction, ParamTransforms, ResultFormats, RowKeySource, SessionPortals, Target,
+};
 use crate::rowkey;
 use crate::rows::RowContext;
 use crate::session::FrameAction;
@@ -547,8 +549,11 @@ impl QueryRewriter {
     fn bind(&mut self, body: &[u8]) -> Result<FrameAction, Error> {
         let bind = pgwire::parse_bind(body)?;
         // Recorded even when the statement is unknown to the rewriter: the
-        // read path still needs to know which statement this portal names.
-        let Some(params) = self.portals.bind(bind.portal, bind.statement)? else {
+        // read path still needs to know which statement this portal names —
+        // and, since a Describe of a statement cannot say it, which formats
+        // this Bind asked its results back in (SEC-31).
+        let result_formats = ResultFormats::new(bind.result_format_codes()?);
+        let Some(params) = self.portals.bind(bind.portal, bind.statement, result_formats)? else {
             return Ok(FrameAction::Relay);
         };
         if params.is_empty() {

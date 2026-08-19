@@ -205,7 +205,12 @@ pub async fn resolve_columns(
             type_oid,
             "row key resolved; this table's encrypted values are bound to their row"
         );
-        let spec = ResolvedRowKey { attnum, type_oid, name: decl.column.clone() };
+        let spec = ResolvedRowKey {
+            attnum,
+            type_oid,
+            name: decl.column.clone(),
+            table: format!("{}.{}", decl.schema, decl.table),
+        };
         row_keys_by_table
             .insert((decl.schema.to_lowercase(), decl.table.to_lowercase()), spec.clone());
         resolved_row_keys.insert(table_oid, spec);
