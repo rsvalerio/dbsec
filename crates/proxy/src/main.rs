@@ -841,10 +841,6 @@ mod tests {
         );
     }
 
-    /// TASK-0130: asking what the flags are is not a usage *error*. Both
-    /// spellings are recognised, and the answer is a `Startup::Help` rather
-    /// than an `Error::Usage` — which is what keeps the exit code at 0 and the
-    /// text out of a `tracing` ERROR record.
     /// A reader that hangs up mid-help — `dbsec --help | head -1` — must not
     /// turn a successful help into a panic and a non-zero exit. Deterministic
     /// here in a way a real pipe is not: the help text is far smaller than a
@@ -883,6 +879,10 @@ mod tests {
         assert!(text.contains("usage: dbsec") && text.contains(PLAIN_RELAY_FLAG), "{text}");
     }
 
+    /// TASK-0130: asking what the flags are is not a usage *error*. Both
+    /// spellings are recognised, and the answer is a `Startup::Help` rather
+    /// than an `Error::Usage` — which is what keeps the exit code at 0 and the
+    /// text out of a `tracing` ERROR record.
     #[test]
     fn help_is_a_startup_outcome_rather_than_a_usage_error() {
         for flag in HELP_FLAGS {
