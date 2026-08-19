@@ -232,7 +232,7 @@ fn read_column(column: &ProtectedColumn) -> Option<ReadColumn> {
         return None;
     }
     let transform = column.readable.then(|| column.transform.clone()).flatten();
-    Some(ReadColumn { transform, mask: column.mask })
+    Some(ReadColumn { name: column.qualified_name().into(), transform, mask: column.mask })
 }
 
 /// Connects with TLS when `[tls.upstream]` is configured (same trust root as

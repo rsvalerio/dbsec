@@ -269,6 +269,27 @@ pub enum Error {
          column, so it cannot be decrypted or masked; use SQL instead of the FunctionCall message"
     )]
     FunctionCallResult,
+    /// A row-bound value that did not authenticate against the row it was
+    /// returned in — the detection row binding exists for.
+    ///
+    /// Kept apart from the bare [`dbsec_core::Error::Decrypt`] it is built
+    /// from so the one log line the relay emits can say *which* cell fired: an
+    /// alarm reading only "decryption failed (wrong key or tampered data)" is
+    /// indistinguishable from a key-rotation mishap or a stale column map, and
+    /// is therefore an alarm an operator learns to filter (READ-8). Both
+    /// fields are non-secret — the column name is configuration, the row key
+    /// is a primary key the client itself selected and `dbsec_core::envelope`
+    /// documents as not a secret — and the plaintext is not among them
+    /// (SEC-21).
+    ///
+    /// Still fatal to the session, like every other crypto failure: the client
+    /// cannot fix this by rewriting its query.
+    #[error(
+        "protected column {column} at result position {position} did not authenticate against \
+         row key {row_key}; the stored value belongs to another row, or its key material has \
+         changed"
+    )]
+    RowBindingFailed { column: String, row_key: String, position: usize },
     #[error(transparent)]
     Wire(#[from] dbsec_core::Error),
     #[error(transparent)]

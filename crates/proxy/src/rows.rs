@@ -31,7 +31,8 @@
 //!
 //! # Refusals
 //!
-//! This path has five of them: a DataRow no described statement covers
+//! This path has eight of them. Five concern a column whose protection the
+//! proxy cannot vouch for: a DataRow no described statement covers
 //! ([`Error::UndescribedRow`]), a result column a stale mapping would
 //! under-match ([`Error::StaleColumnMap`]), a result column named like a
 //! protected one that carries no table identity at all
@@ -44,7 +45,17 @@
 //! operator says otherwise), which is refused rather than decrypted because
 //! opening it costs several times its own size in transient memory (SEC-33).
 //! The middle three are gated on `on_unprotected = "reject"`; the size ceiling,
-//! like the undescribed row, is not. They hand the client a PostgreSQL
+//! like the undescribed row, is not.
+//!
+//! Three more come from row binding and from the size ceiling's sibling: a row
+//! whose rewrite outgrows what a frame header can express
+//! ([`Error::FrameTooLarge`], the other half of the same memory policy), a
+//! row-bound value whose row key the query never projected
+//! ([`dbsec_core::Error::RowKeyMissing`]), and a projected row key the proxy
+//! cannot canonicalise — NULL, not UTF-8, a wrong-width binary integer
+//! ([`Error::RowKeyType`]). All three are the client's to fix, which is what
+//! makes them refusals rather than session failures; [`is_refusal`] is the
+//! single list. They hand the client a PostgreSQL
 //! ErrorResponse (SQLSTATE 42501, the same one a refused write carries) and
 //! then end the session — see [`RowDecryptor::on_frame`] for why the read path
 //! cannot refuse at statement level the way the write path does: its statement
@@ -119,6 +130,20 @@ struct Bounds {
 /// present and readable), then mask what the client would see.
 #[derive(Clone)]
 pub struct ReadColumn {
+    /// The configured column's qualified `schema.table.column` name.
+    ///
+    /// Carried for diagnostics, and for one diagnostic in particular: a
+    /// row-bound value that fails to authenticate is the only externally
+    /// visible product of row binding, and an alarm that cannot say which cell
+    /// fired is close to no alarm at all (READ-8). Nothing else on this path
+    /// knows the name — the mapping is keyed by `(table_oid, attnum)`, and a
+    /// RowDescription's own field label is the *result set's* alias, not the
+    /// column's identity.
+    ///
+    /// `Arc<str>` rather than `String` because a `ReadColumn` is cloned into
+    /// every [`Described`] and again on every re-derivation; the name is
+    /// fixed at resolution time and never edited.
+    pub name: Arc<str>,
     pub transform: Option<Arc<dyn FieldTransform>>,
     pub mask: Option<MaskSpec>,
 }
@@ -427,12 +452,30 @@ fn is_refusal(error: &Error) -> bool {
             | Error::ComputedProtectedColumn { .. }
             | Error::FunctionCallResult
             | Error::ProtectedValueTooLarge { .. }
+            // The other half of the same policy. `Bounds::max_value` and
+            // `Bounds::max_body` both answer "how much transient memory may
+            // one row cost", and inside `on_frame` this variant has exactly
+            // one producer: `decrypt_row` refusing a rewrite that outgrew its
+            // frame. Leaving it fatal made one bound answer the client and the
+            // other drop the socket with nothing sent — the same "policy
+            // refusal read as a network fault" this path exists to avoid
+            // (ERR-1). Both now say the same thing to the operator: a
+            // configured limit refused this result set.
+            | Error::FrameTooLarge { .. }
             // A row-bound value whose row key the query did not project. The
             // client is answered rather than the session merely failing,
             // because the fix is theirs: select the table's row key. Relaying
             // the stored bytes instead is the disclosure this whole path
             // exists to prevent.
             | Error::Wire(dbsec_core::Error::RowKeyMissing)
+            // A declared row key the proxy cannot canonicalise: NULL, not
+            // UTF-8, a binary integer of the wrong width, an unknown format
+            // code. Distinct from `RowKeyMissing`, which means the query never
+            // projected the column at all — this one means it did and the
+            // value cannot name a row. Both are the client's to fix, and
+            // neither is evidence the ciphertext was tampered with, so the
+            // value is refused rather than the session merely failing.
+            | Error::RowKeyType(_)
     )
 }
 
@@ -739,16 +782,23 @@ impl RowDecryptor {
         // same row, and sealing never rewrites it (config refuses a row key
         // that is itself protected), but taking it first keeps that
         // independent of ordering.
-        let row_keys: Vec<Option<RowKey>> = positions
+        //
+        // The failure is *kept*, not discarded. Collapsing every unreadable
+        // key to `None` made a NULL, a non-UTF-8 text key and a wrong-width
+        // binary integer all surface as `RowKeyMissing`, whose refusal tells
+        // the client to select the table's row key — which it already did
+        // (ERR-7). It is carried rather than returned here because whether it
+        // matters depends on the value it would have opened: an outer join's
+        // unmatched row carries a NULL key *and* a NULL protected value, and
+        // has nothing to bind.
+        let mut row_keys: Vec<Option<Result<RowKey, Error>>> = positions
             .iter()
             .map(|(_, _, slot)| {
                 let slot = slot.as_ref()?;
-                let raw = values.get(slot.index)?.as_deref();
-                let format = crate::rowkey::Format::from_code(slot.format).ok()?;
-                crate::rowkey::canonical(slot.type_oid, format, raw).ok()
+                Some(read_row_key(slot, &values))
             })
             .collect();
-        for ((position, column, _), row_key) in positions.iter().zip(&row_keys) {
+        for ((position, column, _), row_key) in positions.iter().zip(row_keys.iter_mut()) {
             let Some(Some(value)) = values.get_mut(*position) else { continue };
             if value.len() > bounds.max_value {
                 return Err(Error::ProtectedValueTooLarge {
@@ -763,7 +813,31 @@ impl RowDecryptor {
                     None => (Cow::Borrowed(&**value), false),
                 };
                 let opened = match &column.transform {
-                    Some(transform) => transform.open(&stored, row_key.as_ref())?,
+                    Some(transform) => {
+                        let attribute =
+                            |error, key| attribute_open_failure(error, column, *position, key);
+                        match row_key.take() {
+                            None => {
+                                transform.open(&stored, None).map_err(|e| attribute(e, None))?
+                            }
+                            Some(Ok(key)) => transform
+                                .open(&stored, Some(&key))
+                                .map_err(|e| attribute(e, Some(&key)))?,
+                            // The key could not be canonicalised. Whether that
+                            // decides anything is the *stored value's* call:
+                            // pre-migration plaintext and a `DBS2` value
+                            // written before the table declared a key open
+                            // without one and are unaffected, while a `DBS3`
+                            // value reports `RowKeyMissing` — which would tell
+                            // the client to select the row key it already
+                            // selected. The real reason replaces it (ERR-7).
+                            Some(Err(why)) => match transform.open(&stored, None) {
+                                Ok(opened) => opened,
+                                Err(dbsec_core::Error::RowKeyMissing) => return Err(why),
+                                Err(e) => return Err(attribute(e, None)),
+                            },
+                        }
+                    }
                     None => None,
                 };
                 // Mask what the client would otherwise see: the opened
@@ -795,6 +869,61 @@ impl RowDecryptor {
             return Ok(None);
         }
         Ok(Some(pgwire::encode_data_row(&values)?))
+    }
+}
+
+/// The canonical row key sitting at `slot` of this result row, or why it could
+/// not be derived.
+///
+/// Every failure keeps its own reason ([`Error::RowKeyType`]) instead of
+/// becoming an absent key: a key that is NULL, not valid UTF-8, the wrong width
+/// for its type, or carried under an unknown format code is a *different*
+/// problem from a query that never projected the key at all, and the refusal
+/// the client gets has to say which one it is (ERR-7).
+fn read_row_key(slot: &RowKeySlot, values: &[Option<Cow<'_, [u8]>>]) -> Result<RowKey, Error> {
+    // The description said the key is at this position, so a row too short to
+    // hold it disagrees with the description it arrived under.
+    let raw = values.get(slot.index).ok_or_else(|| {
+        Error::RowKeyType(format!(
+            "row key is described at result position {} of a row carrying {} values",
+            slot.index,
+            values.len()
+        ))
+    })?;
+    let format = crate::rowkey::Format::from_code(slot.format)?;
+    crate::rowkey::canonical(slot.type_oid, format, raw.as_deref())
+}
+
+/// Names the cell a failed `open` belongs to.
+///
+/// The row-bound case is what this exists for. A `DBS3` value that does not
+/// authenticate against the row it came back in is the only externally visible
+/// product of row binding, and until this it reached the relay as a bare
+/// `Error::Decrypt` — logged as "transform failed; closing session" with the
+/// direction and the frame type and nothing else, the identical line a key
+/// rotation mishap or a stale column map produces (READ-8). Detection whose
+/// alarm cannot be attributed is close to no detection.
+///
+/// Both added fields are non-secret: the qualified column name is
+/// configuration, and the row key is a primary key the client itself selected
+/// and that [`dbsec_core::envelope`] documents as not a secret. The plaintext
+/// is not in reach here and never appears (SEC-21).
+///
+/// Nothing is logged here — the error is returned and the relay logs it once,
+/// at the site that handles it (ERR-1).
+fn attribute_open_failure(
+    error: dbsec_core::Error,
+    column: &ReadColumn,
+    position: usize,
+    row_key: Option<&RowKey>,
+) -> Error {
+    match (&error, row_key) {
+        (dbsec_core::Error::Decrypt, Some(row_key)) => Error::RowBindingFailed {
+            column: column.name.to_string(),
+            row_key: String::from_utf8_lossy(row_key.as_bytes()).into_owned(),
+            position,
+        },
+        _ => error.into(),
     }
 }
 
@@ -871,7 +1000,16 @@ pub mod tests {
             (0..count).map(|attnum| (1234, i16::try_from(attnum).expect("small"))).collect();
         let columns: ColumnMap = fields
             .iter()
-            .map(|key| (*key, ReadColumn { transform: Some(transform(false)), mask: None }))
+            .map(|key| {
+                (
+                    *key,
+                    ReadColumn {
+                        name: "public.users.email".into(),
+                        transform: Some(transform(false)),
+                        mask: None,
+                    },
+                )
+            })
             .collect();
         let resolved = Resolved { columns, ..Default::default() };
         Arc::new(Described::new(
@@ -897,7 +1035,11 @@ pub mod tests {
     }
 
     fn context(searchable: bool) -> Arc<RowContext> {
-        context_with(ReadColumn { transform: Some(transform(searchable)), mask: None })
+        context_with(ReadColumn {
+            name: "public.users.email".into(),
+            transform: Some(transform(searchable)),
+            mask: None,
+        })
     }
 
     fn row_description(fields: &[(u32, i16)]) -> Vec<u8> {
@@ -985,7 +1127,14 @@ pub mod tests {
         let spec =
             ResolvedRowKey { attnum: 1, type_oid: crate::rowkey::oid::INT4, name: "id".into() };
         let mut columns = ColumnMap::new();
-        columns.insert((TABLE, 2), ReadColumn { transform: Some(transform(false)), mask: None });
+        columns.insert(
+            (TABLE, 2),
+            ReadColumn {
+                name: "public.users.email".into(),
+                transform: Some(transform(false)),
+                mask: None,
+            },
+        );
         let ctx = Arc::new(RowContext::new(
             Resolved {
                 columns,
@@ -1080,12 +1229,114 @@ pub mod tests {
         let (_ctx, _rewriter, mut decryptor) = row_bound_session();
         decryptor.on_frame(b'T', &row_bound_description(0)).unwrap();
         let moved = data_row(&[Some(b"8"), Some(&stored)]);
+        let error = decryptor.on_frame(b'D', &moved).expect_err("a relocation must fail");
+        // And it says which cell fired. The relay logs this error and nothing
+        // else about the frame, so an alarm that reads only "decryption
+        // failed" is one an operator cannot act on or tell apart from a key
+        // rotation mishap.
         assert!(
             matches!(
-                decryptor.on_frame(b'D', &moved),
-                Err(Error::Wire(dbsec_core::Error::Decrypt))
+                &error,
+                Error::RowBindingFailed { column, row_key, position }
+                    if column == "public.users.email" && row_key == "8" && *position == 1
             ),
-            "a relocated value must not reach the client"
+            "a relocation must be attributed to its cell, got {error}"
+        );
+        let text = error.to_string();
+        for part in ["public.users.email", "row key 8", "another row"] {
+            assert!(text.contains(part), "the alarm must name {part}: {text}");
+        }
+    }
+
+    /// The same failure with no row key in hand is *not* a relocation: an
+    /// unknown key id or a cell-bound value opened under the wrong key stays
+    /// the generic crypto failure, so the row-binding alarm means what it says.
+    #[test]
+    fn a_crypto_failure_with_no_row_key_is_not_reported_as_a_relocation() {
+        let ctx = context(false);
+        let mut decryptor = ctx.decryptor(SessionPortals::new());
+        decryptor.on_frame(b'T', &row_description(&[(1234, 1), (1234, 2)])).unwrap();
+
+        let ct =
+            envelope::encrypt(&KEY, &KEY_ID, &Binding::cell(&cell_context()), b"alice").unwrap();
+        let mut tampered = ct.clone();
+        *tampered.last_mut().expect("non-empty ciphertext") ^= 0xff;
+        let row = data_row(&[Some(b"7"), Some(&tampered)]);
+        assert!(
+            matches!(decryptor.on_frame(b'D', &row), Err(Error::Wire(dbsec_core::Error::Decrypt))),
+            "a cell-bound failure has no row to attribute the alarm to"
+        );
+    }
+
+    /// Seals one value through the write path and hands back its stored bytes,
+    /// which is the only way to get a genuinely row-bound `DBS3` value for the
+    /// read path to fail against.
+    fn sealed(sql: &str) -> Vec<u8> {
+        let (_ctx, mut rewriter, _d) = row_bound_session();
+        let rewritten = match rewriter.on_frame(b'Q', &query_frame(sql)).unwrap() {
+            FrameAction::Replace(body) => String::from_utf8_lossy(&body).into_owned(),
+            other => panic!("the insert must be rewritten, got {other:?}"),
+        };
+        let start = rewritten.find("\\x").expect("sealed literal") + 2;
+        let end = rewritten[start..].find('\'').unwrap() + start;
+        hex::decode(&rewritten[start..end]).expect("hex literal")
+    }
+
+    /// A projected row key the proxy cannot canonicalise is refused *as that*.
+    ///
+    /// Discarding the error made every one of them — a NULL key, non-UTF-8
+    /// text, a wrong-width binary integer, an unknown format code — arrive at
+    /// the client as `RowKeyMissing`, whose refusal says to select the table's
+    /// row key. The client selected it; the value in it is the problem, and a
+    /// refusal that misdirects the fix is worse than one that says nothing.
+    #[test]
+    fn an_unusable_row_key_is_refused_as_itself_not_as_a_missing_projection() {
+        let stored = sealed("INSERT INTO users (id, email) VALUES (7, 'alice@secret.test')");
+
+        // The key column is projected, and NULL in this row.
+        let (_ctx, _r, mut decryptor) = row_bound_session();
+        decryptor.on_frame(b'T', &row_bound_description(0)).unwrap();
+        let frames = refused(decryptor.on_frame(b'D', &data_row(&[None, Some(&stored)])).unwrap());
+        let text = String::from_utf8_lossy(&frames);
+        assert!(text.contains("42501"), "the client gets a SQLSTATE: {text}");
+        assert!(text.contains("row key is NULL"), "the refusal must name the NULL: {text}");
+        assert!(
+            !text.contains("does not carry"),
+            "and must not read as the missing-projection refusal: {text}"
+        );
+
+        // A wrong-width binary integer is the same class of failure and is
+        // reported the same way, rather than being reinterpreted.
+        let (_ctx, _r, mut decryptor) = row_bound_session();
+        decryptor.on_frame(b'T', &row_bound_description(1)).unwrap();
+        let short = data_row(&[Some(&[0, 0, 7]), Some(&stored)]);
+        let text = String::from_utf8_lossy(&refused(decryptor.on_frame(b'D', &short).unwrap()))
+            .into_owned();
+        assert!(text.contains("expected 4"), "the refusal must name the width: {text}");
+
+        // The projection the client really did omit still reports itself: this
+        // is the refusal the case above used to be confused with.
+        let (_ctx, _r, mut decryptor) = row_bound_session();
+        decryptor.on_frame(b'T', &row_description(&[(1234, 2)])).unwrap();
+        let text = String::from_utf8_lossy(&refused(
+            decryptor.on_frame(b'D', &data_row(&[Some(&stored)])).unwrap(),
+        ))
+        .into_owned();
+        assert!(text.contains("does not carry"), "a missing row key still says so: {text}");
+    }
+
+    /// A row key the proxy cannot read only refuses the values that need one.
+    /// Pre-migration plaintext in the same column opens without a key and is
+    /// unaffected — an outer join's unmatched row carries a NULL key, and
+    /// nothing in it is row-bound.
+    #[test]
+    fn an_unusable_row_key_does_not_refuse_a_value_that_needs_no_key() {
+        let (_ctx, _r, mut decryptor) = row_bound_session();
+        decryptor.on_frame(b'T', &row_bound_description(0)).unwrap();
+        let plaintext = data_row(&[None, Some(b"not-an-envelope")]);
+        assert!(
+            decryptor.on_frame(b'D', &plaintext).unwrap().body().is_none(),
+            "a value that opens without a row key must not be refused by the key it never used"
         );
     }
 
@@ -1222,7 +1473,11 @@ pub mod tests {
     #[test]
     fn mask_applies_after_decryption_and_to_plaintext() {
         let mask = MaskSpec { keep_first: 0, keep_last: 4, mask_with: '*' };
-        let ctx = context_with(ReadColumn { transform: Some(transform(false)), mask: Some(mask) });
+        let ctx = context_with(ReadColumn {
+            name: "public.users.email".into(),
+            transform: Some(transform(false)),
+            mask: Some(mask),
+        });
         let mut decryptor = ctx.decryptor(SessionPortals::new());
         decryptor.on_frame(b'T', &row_description(&[(1234, 1), (1234, 2)])).unwrap();
 
@@ -1249,7 +1504,11 @@ pub mod tests {
     #[test]
     fn text_format_bytea_keeps_its_hex_shape_through_the_mask() {
         let mask = MaskSpec { keep_first: 0, keep_last: 4, mask_with: '*' };
-        let ctx = context_with(ReadColumn { transform: Some(transform(false)), mask: Some(mask) });
+        let ctx = context_with(ReadColumn {
+            name: "public.users.email".into(),
+            transform: Some(transform(false)),
+            mask: Some(mask),
+        });
         let mut decryptor = ctx.decryptor(SessionPortals::new());
         decryptor.on_frame(b'T', &row_description(&[(1234, 2)])).unwrap();
 
@@ -1267,7 +1526,11 @@ pub mod tests {
     #[test]
     fn mask_only_column_masks_without_any_crypto() {
         let mask = MaskSpec { keep_first: 2, keep_last: 0, mask_with: '#' };
-        let ctx = context_with(ReadColumn { transform: None, mask: Some(mask) });
+        let ctx = context_with(ReadColumn {
+            name: "public.users.email".into(),
+            transform: None,
+            mask: Some(mask),
+        });
         let mut decryptor = ctx.decryptor(SessionPortals::new());
         decryptor.on_frame(b'T', &row_description(&[(1234, 2)])).unwrap();
 
@@ -1356,7 +1619,14 @@ pub mod tests {
         // A re-resolution now covers the position the statement was described
         // with. The driver sends no Describe — it already has one.
         let mut columns = ColumnMap::new();
-        columns.insert((1234, 2), ReadColumn { transform: Some(transform(false)), mask: None });
+        columns.insert(
+            (1234, 2),
+            ReadColumn {
+                name: "public.users.email".into(),
+                transform: Some(transform(false)),
+                mask: None,
+            },
+        );
         ctx.publish(Resolved { columns, ..Default::default() });
 
         execute(&mut rewriter, b"a");
@@ -1393,7 +1663,14 @@ pub mod tests {
         // The table is recreated, so the column resolves somewhere else
         // entirely and nothing covers the described position any more.
         let mut columns = ColumnMap::new();
-        columns.insert((5678, 2), ReadColumn { transform: Some(transform(false)), mask: None });
+        columns.insert(
+            (5678, 2),
+            ReadColumn {
+                name: "public.users.email".into(),
+                transform: Some(transform(false)),
+                mask: None,
+            },
+        );
         ctx.publish(Resolved {
             columns,
             names: HashSet::from(["email".to_owned()]),
@@ -1549,6 +1826,7 @@ pub mod tests {
     #[test]
     fn a_computed_mask_only_column_is_reported() {
         let ctx = context_with(ReadColumn {
+            name: "public.users.email".into(),
             transform: None,
             mask: Some(MaskSpec { keep_first: 0, keep_last: 4, mask_with: '*' }),
         });
@@ -1575,7 +1853,14 @@ pub mod tests {
     /// whose whole point is what `reject` does differently.
     fn strict_context() -> Arc<RowContext> {
         let mut columns = ColumnMap::new();
-        columns.insert((1234, 2), ReadColumn { transform: Some(transform(false)), mask: None });
+        columns.insert(
+            (1234, 2),
+            ReadColumn {
+                name: "public.users.email".into(),
+                transform: Some(transform(false)),
+                mask: None,
+            },
+        );
         Arc::new(RowContext::new(
             Resolved { columns, names: HashSet::from(["email".to_owned()]), ..Default::default() },
             OnUnprotected::Reject,
@@ -1622,7 +1907,14 @@ pub mod tests {
 
         // The refresher re-resolves the column to where it moved to.
         let mut columns = ColumnMap::new();
-        columns.insert((5678, 2), ReadColumn { transform: Some(transform(false)), mask: None });
+        columns.insert(
+            (5678, 2),
+            ReadColumn {
+                name: "public.users.email".into(),
+                transform: Some(transform(false)),
+                mask: None,
+            },
+        );
         ctx.publish(Resolved {
             columns,
             names: HashSet::from(["email".to_owned()]),
@@ -1720,7 +2012,8 @@ pub mod tests {
         // A multi-byte mask character is the cheapest way to make a rewrite
         // bigger than what arrived: every masked byte becomes three.
         let mask = MaskSpec { keep_first: 0, keep_last: 0, mask_with: '☃' };
-        let column = ReadColumn { transform: None, mask: Some(mask) };
+        let column =
+            ReadColumn { name: "public.users.email".into(), transform: None, mask: Some(mask) };
         let positions = vec![(0, column.clone(), None), (1, column, None)];
         let row = data_row(&[Some(b"aaaaaaaa"), Some(b"aaaaaaaa")]);
 
@@ -1728,10 +2021,27 @@ pub mod tests {
         // for the second — so the refusal lands before the row is finished.
         let max_body = row.len() + 16;
         let max_value = DEFAULT_MAX_PROTECTED_VALUE_LEN;
-        assert!(matches!(
-            RowDecryptor::decrypt_row(&positions, &row, Bounds { max_value, max_body }),
-            Err(Error::FrameTooLarge { msg_type: 'D', .. })
-        ));
+        let outgrown = RowDecryptor::decrypt_row(&positions, &row, Bounds { max_value, max_body })
+            .expect_err("the rewrite does not fit");
+        assert!(matches!(outgrown, Error::FrameTooLarge { msg_type: 'D', .. }));
+
+        // Both halves of one memory policy classify the same way. The
+        // per-value ceiling always answered the client; leaving the per-row
+        // ceiling fatal dropped the socket with nothing sent, so one bound
+        // read as a policy refusal and the other as a network fault (ERR-1).
+        // A crypto failure is still fatal — that is the line these sit on the
+        // other side of.
+        assert!(is_refusal(&outgrown), "the per-row bound is a refusal, not a session failure");
+        assert!(is_refusal(&Error::ProtectedValueTooLarge { position: 0, len: 2, max: 1 }));
+        assert!(!is_refusal(&Error::Wire(dbsec_core::Error::Decrypt)));
+        // What `is_refusal` decides is what the client is handed: an
+        // ErrorResponse and a closed session, not a bare close.
+        let mut decryptor = context(false).decryptor(SessionPortals::new());
+        let frames = refused(decryptor.refuse(&outgrown));
+        let text = String::from_utf8_lossy(&frames);
+        assert!(text.contains("42501"), "the client gets a SQLSTATE: {text}");
+        assert!(text.contains("byte limit"), "and the limit that refused it: {text}");
+
         // The same row under a bound that fits rewrites normally.
         let rewritten = RowDecryptor::decrypt_row(
             &positions,
@@ -1753,7 +2063,11 @@ pub mod tests {
     #[test]
     fn the_configured_ceiling_is_what_the_read_path_enforces() {
         let mask = MaskSpec { keep_first: 0, keep_last: 4, mask_with: '*' };
-        let positions = vec![(0, ReadColumn { transform: None, mask: Some(mask) }, None)];
+        let positions = vec![(
+            0,
+            ReadColumn { name: "public.users.email".into(), transform: None, mask: Some(mask) },
+            None,
+        )];
         let row = data_row(&[Some(&vec![b'v'; 4096])]);
         let bounds = |max_value| Bounds { max_value, max_body: pgwire::MAX_MESSAGE_LEN - 4 };
 
