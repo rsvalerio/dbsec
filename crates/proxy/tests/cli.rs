@@ -23,6 +23,10 @@ const DEFAULT_LISTEN: &str = "127.0.0.1:6432";
 /// the binary as an operator does, so the flag is part of what it pins.
 const PLAIN_RELAY_FLAG: &str = "--plain-relay";
 
+/// The opt-in that leaves core dumps enabled, spelled out for the same reason
+/// as [`PLAIN_RELAY_FLAG`].
+const ALLOW_CORE_DUMPS_FLAG: &str = "--allow-core-dumps";
+
 /// The warning a startup that protects nothing has to carry, whichever way it
 /// got there: a config file with no `[[column]]` entries and `--plain-relay`
 /// leave the proxy in the same state, so an operator grepping for one finds
@@ -184,31 +188,50 @@ fn no_argument_and_no_config_file_refuses_to_start() {
 /// The opt-in itself: with it, a missing default file means built-in defaults
 /// again, so startup gets all the way to binding the default listen address.
 ///
-/// Observed by taking that address away first, rather than by letting the
-/// proxy bind it: a fixed global port cannot be claimed by a test suite that
+/// Observed by spawning and reading stderr rather than by racing for the port
+/// first (TASK-0162). A fixed global port cannot be claimed by a suite that
 /// runs concurrently with the e2e suites, with a second checkout, or with
-/// another CI job. The bind failure names the address, which is the fact
-/// under test — that the run fell back to the default rather than erroring
-/// out on the missing file.
+/// another CI job — and an earlier version of this case took the address away
+/// first so that the bind would fail, which made the *outcome* depend on who
+/// else held the port: if the port was free again by the time the proxy
+/// reached it, the proxy bound it and stayed up, and the `Command::output()`
+/// waiting on it never returned.
+///
+/// Whichever way that race falls, the address the run reached is named on
+/// stderr — by the `dbsec listening` line when the bind succeeds and by the
+/// bind failure when it does not — and that address is the fact under test:
+/// the run fell back to the default rather than erroring out on the missing
+/// file. So the case waits for the address and then stops the process, which
+/// terminates either way.
 #[test]
 fn the_plain_relay_opt_in_falls_back_to_the_default_listen_address() {
-    let occupied = std::net::TcpListener::bind(DEFAULT_LISTEN).ok();
-
     let dir = tempfile::tempdir().unwrap();
-    let output = dbsec(dir.path())
-        .arg(PLAIN_RELAY_FLAG)
-        .output()
-        .expect("the dbsec binary must be runnable");
-    let stderr = String::from_utf8(output.stderr).unwrap();
-    drop(occupied);
+    let mut proxy = Running::start(dbsec(dir.path()).arg(PLAIN_RELAY_FLAG));
 
-    assert_eq!(output.status.code(), Some(1), "stderr: {stderr}");
-    assert!(stderr.contains(&format!("binding listen address {DEFAULT_LISTEN}")), "{stderr}");
     // The opt-in is not a quiet mode: running with no protection at all is
-    // still announced, in the same words the no-columns config uses.
-    assert!(stderr.contains(NO_PROTECTION_WARNING), "{stderr}");
-    assert!(stderr.contains(PLAIN_RELAY_FLAG), "the warning names how it got there: {stderr}");
-    assert!(output.stdout.is_empty(), "stdout: {:?}", String::from_utf8_lossy(&output.stdout));
+    // still announced, in the same words the no-columns config uses, and the
+    // warning names how it got there.
+    let warning = proxy.wait_for(NO_PROTECTION_WARNING);
+    assert!(warning.contains(PLAIN_RELAY_FLAG), "the warning names how it got there: {warning}");
+    proxy.wait_for(DEFAULT_LISTEN);
+    assert_eq!(proxy.stop(), "", "diagnostics must not reach stdout");
+}
+
+/// The other opt-in, driven as a command line rather than as a parsed `Args`:
+/// `--allow-core-dumps` is read before the hardening step it skips, so a run
+/// that carries it has to get all the way to serving — and a flag no spawned
+/// case ever passes is one a startup-order change can break silently
+/// (TASK-0162).
+#[test]
+fn the_core_dump_opt_in_is_accepted_on_the_command_line_and_still_serves() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("dbsec.toml"), config_toml(DISCOVERED_SESSIONS)).unwrap();
+
+    let mut proxy = Running::start(dbsec(dir.path()).arg(ALLOW_CORE_DUMPS_FLAG));
+    let line = proxy.wait_for("dbsec listening");
+    assert!(line.contains(&format!("max_sessions={DISCOVERED_SESSIONS}")), "{line}");
+    proxy.assert_still_serving();
+    assert_eq!(proxy.stop(), "", "diagnostics must not reach stdout");
 }
 
 /// A config file that exists and declares no `[[column]]` reaches exactly the
@@ -260,23 +283,30 @@ fn help_prints_usage_to_stdout_and_exits_zero() {
 /// and it must not turn help into a panic on stderr and a non-zero exit.
 ///
 /// Driven through a shell so the pipe is a real one with a real early-closing
-/// reader. `head -1` is the reader; the shell reports *its* status, so the
-/// assertion that matters here is the absence of a panic on dbsec's stderr —
-/// `main::tests::a_closed_pipe_makes_help_succeed_rather_than_fail` pins the
-/// exit code deterministically, which a pipe this small cannot.
+/// reader. `head -1` is the reader, and a POSIX shell reports the *last*
+/// stage's status for a pipeline — `head`'s, which is 0 whatever dbsec did. So
+/// dbsec's own status is echoed to stderr instead of being read off the
+/// pipeline (TASK-0172); `$?` is portable where `pipefail` is not, `sh` being
+/// dash on some of the platforms this runs on.
 #[test]
 fn help_survives_a_reader_that_closes_the_pipe() {
     let dir = tempfile::tempdir().unwrap();
     let output = Command::new("sh")
         .current_dir(dir.path())
         .arg("-c")
-        .arg(format!("{} --help | head -1", env!("CARGO_BIN_EXE_dbsec")))
+        .arg(format!(
+            "{{ {} --help; echo \"dbsec exit $?\" >&2; }} | head -1",
+            env!("CARGO_BIN_EXE_dbsec")
+        ))
         .output()
         .expect("sh must be runnable");
 
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
-    assert_eq!(output.status.code(), Some(0), "stderr: {stderr}");
+    assert!(
+        stderr.contains("dbsec exit 0"),
+        "help must succeed for the reader that hung up: {stderr}"
+    );
     assert!(stdout.contains("usage: dbsec"), "the reader still got its line: {stdout}");
     assert!(
         !stderr.contains("panicked") && !stderr.contains("failed printing"),
