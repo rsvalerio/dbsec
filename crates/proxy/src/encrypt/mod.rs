@@ -2219,7 +2219,12 @@ mod tests {
     fn row_bound_rewriter() -> QueryRewriter {
         use crate::rows::{Resolved, ResolvedRowKey, RowContext, DEFAULT_MAX_PROTECTED_VALUE_LEN};
 
-        let spec = ResolvedRowKey { attnum: 1, type_oid: rowkey::oid::INT4, name: "id".into() };
+        let spec = ResolvedRowKey {
+            attnum: 1,
+            type_oid: rowkey::oid::INT4,
+            name: "id".into(),
+            table: "public.users".into(),
+        };
         let rows = Arc::new(RowContext::new(
             Resolved {
                 row_key_by_table: std::collections::HashMap::from([(
@@ -4661,6 +4666,7 @@ mod tests {
             for sql in [
                 "INSERT INTO users (email) VALUES ('quinn@secret.test')",
                 "UPDATE users SET email = 'rita@secret.test'",
+                "UPDATE users SET email = 'tess@secret.test', id = 99 WHERE id = 7",
             ] {
                 drop(row_bound.on_frame(b'Q', &query_frame(sql)));
             }
@@ -4685,7 +4691,7 @@ mod tests {
         assert!(events.contains("passing through unencrypted"), "the sites did emit: {events}");
         for plaintext in [
             "alice", "bob", "carol", "dave", "erin", "fred", "gina", "hank", "ivan", "judy",
-            "kate", "liam", "mona", "nina", "opal", "quinn", "rita", "sara", "secret",
+            "kate", "liam", "mona", "nina", "opal", "quinn", "rita", "sara", "tess", "secret",
         ] {
             assert!(!events.contains(plaintext), "{plaintext} reached the log:\n{events}");
         }
@@ -4713,6 +4719,10 @@ mod tests {
                 table: "public.users".to_owned(),
                 column: "id".to_owned(),
                 shape: "INSERT without the row key in its column list",
+            },
+            Unprotected::RowKeyReassigned {
+                table: "public.users".to_owned(),
+                column: "id".to_owned(),
             },
             Unprotected::Predicate { column: "email".to_owned(), shape: "LIKE" },
             Unprotected::AmbiguousColumn { column: "email".to_owned(), shape: "comparison" },
@@ -4745,6 +4755,9 @@ mod tests {
                 }
                 Unprotected::RowKeyMissing { .. } => {
                     &["row-bound table written without its row key"]
+                }
+                Unprotected::RowKeyReassigned { .. } => {
+                    &["assignment list on a row-bound table writes its row key"]
                 }
                 Unprotected::Predicate { .. } => &["unsupported predicate for a searchable column"],
                 Unprotected::AmbiguousColumn { .. } => {
