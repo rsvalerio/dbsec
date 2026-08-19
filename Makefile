@@ -63,20 +63,32 @@ release: ## Compile (release)
 run: ## Run the proxy (needs ./dbsec.toml)
 	cargo run --bin dbsec
 
-test: ## Run the test suite
-	cargo test --all --all-features
+# nextest is the runner for unit and integration tests (needs
+# `cargo install cargo-nextest --locked`). It does not run doctests, so those
+# are a second command; CI splits them the same way.
+test: ## Run the test suite (nextest) and the doctests
+	cargo nextest run --all --all-features
+	cargo test --all --all-features --doc
 
 # Set DBSEC_E2E_STRICT_DRIVERS=1 to fail rather than skip when psycopg is not
 # installed (pip install 'psycopg[binary]' psycopg2-binary).
+#
+# `--success-output immediate` rather than nextest's `--no-capture`, which is
+# what `--nocapture` used to be here: both keep a passing suite's output (the
+# psycopg matrix reports which drivers it skipped, and a silent skip is the
+# thing worth seeing), but `--no-capture` also forces the suites to run one at
+# a time. Output is per-test buffered, so parallel runs stay readable.
 e2e: ## Driver matrix (tokio-postgres, sqlx, psycopg) against dockerized Postgres
 	@$(call start_pg)
-	cargo test -p dbsec --test e2e --test e2e_sqlx --test e2e_psycopg -- --ignored --nocapture; \
+	cargo nextest run -p dbsec --test e2e --test e2e_sqlx --test e2e_psycopg \
+		--run-ignored ignored-only --success-output immediate; \
 		status=$$?; $(call stop_pg); exit $$status
 
 e2e-vault: ## Vault/OpenBao key source against a live dev-mode OpenBao
 	@$(call start_pg)
 	@$(call start_bao)
-	cargo test -p dbsec --test e2e_vault -- --ignored --nocapture; \
+	cargo nextest run -p dbsec --test e2e_vault --run-ignored ignored-only \
+		--success-output immediate; \
 		status=$$?; $(call stop_bao); $(call stop_pg); exit $$status
 
 fuzz: ## Smoke-run each fuzz target for 30s (needs nightly + cargo-fuzz)
