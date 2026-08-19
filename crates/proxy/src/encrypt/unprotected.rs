@@ -34,8 +34,8 @@ pub(super) enum Unprotected<'a> {
     ///
     /// The `to` direction fires for anything the read path protects, the
     /// `from` direction only for what the write path would have sealed — see
-    /// [`WriteCatalog::protects_reads`] for why a mask-only table belongs in
-    /// the first set and not the second.
+    /// [`WriteCatalog::protects_reads`](super::catalog::WriteCatalog::protects_reads)
+    /// for why a mask-only table belongs in the first set and not the second.
     Copy { table: &'a ObjectName, to: bool },
     /// `COPY (query) TO STDOUT` over a protected table. Kept apart from
     /// [`Self::Copy`] because the remedy differs — there is no table to bulk
@@ -89,10 +89,11 @@ pub(super) enum Unprotected<'a> {
     /// `search_path` moved off the schema the catalog resolves against.
     SearchPathChanged,
     /// `standard_conforming_strings` was turned off. Sealed values are emitted
-    /// in a form that does not depend on it ([`bytea_literal`]), but the
-    /// client's own literals are now read one way by PostgreSQL and another by
-    /// the proxy's parser — reported here once, and again per literal that the
-    /// difference actually reaches ([`Self::AmbiguousLiteral`]).
+    /// in a form that does not depend on it
+    /// ([`bytea_literal`](super::seal::bytea_literal)), but the client's own
+    /// literals are now read one way by PostgreSQL and another by the proxy's
+    /// parser — reported here once, and again per literal that the difference
+    /// actually reaches ([`Self::AmbiguousLiteral`]).
     EscapeStringsChanged,
     /// An unqualified name that may be a protected table, in a session whose
     /// `search_path` no longer says which schema it resolves to.
@@ -296,7 +297,12 @@ impl Unprotected<'_> {
 
 /// The parser error's variant. Never its message: sqlparser embeds the
 /// offending token in the text, which for a literal is the plaintext itself.
-fn parser_error_kind(error: &ParserError) -> &'static str {
+///
+/// `pub(super)` with no caller outside this file on purpose: the module docs
+/// in `encrypt/mod.rs` name it as the thing that makes the audited `error_kind`
+/// field safe to log, and a link the reader can follow is worth more than one
+/// less name in the sibling scope.
+pub(super) fn parser_error_kind(error: &ParserError) -> &'static str {
     match error {
         ParserError::TokenizerError(_) => "tokenizer",
         ParserError::ParserError(_) => "parser",
@@ -352,7 +358,7 @@ pub(super) fn frame(msg_type: u8, body: &[u8]) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::encrypt::parse_sql;
+    use crate::encrypt::lexer::parse_sql;
 
     /// The parser's own message embeds the token it choked on — which for a
     /// literal is the plaintext — so only the variant is logged.

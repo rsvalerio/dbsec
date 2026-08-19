@@ -54,7 +54,7 @@
 //! array. `col = ANY($1)` — the whole list bound as one array parameter, which
 //! is how sqlx and asyncpg express a multi-value lookup — is rewritten the
 //! same way, with the array decoded, indexed element by element and re-encoded
-//! as `bytea[]` at Bind time ([`index_array`]). They are rewritten wherever
+//! as `bytea[]` at Bind time ([`index_array`](array::index_array)). They are rewritten wherever
 //! they appear in a `SELECT`/`UPDATE`/`DELETE`: `WHERE` and `HAVING`,
 //! `JOIN ... ON` constraints, CTE bodies, both branches of a
 //! `UNION`/`INTERSECT`/`EXCEPT`, and derived-table subqueries. Anything else
@@ -81,7 +81,7 @@
 //! preserves exactly, so those two match the rows the client meant and there
 //! is nothing to signal. Reporting them would refuse working SQL under
 //! `reject` and dilute the warning stream under `warn` — a signal that fires
-//! on correct queries stops being read. See [`protected_operand`].
+//! on correct queries stops being read. See [`protected_operand`](scope::protected_operand).
 //!
 //! # SQL text fidelity
 //!
@@ -89,10 +89,11 @@
 //! comments, whitespace, quoting style and dollar-quoted bodies are all
 //! normalized away. So only statements the rewrite actually changed are
 //! re-rendered; every other statement in a multi-statement `Query`, and all
-//! text between statements, is relayed exactly as the client wrote it. What
-//! is re-rendered is re-parsed and compared against the AST it came from
-//! before it goes on the wire ([`render_validated`]) — a divergence fails the
-//! session instead of executing SQL the client did not write.
+//! text between statements, is relayed exactly as the client wrote it. What is
+//! re-rendered is re-parsed and compared against the AST it came from before
+//! it goes on the wire ([`render_validated`](lexer::render_validated)) — a
+//! divergence fails the session instead of executing SQL the client did not
+//! write.
 //!
 //! # Logging
 //!
@@ -107,8 +108,8 @@
 //! |---|---|
 //! | `table`, `column` | SQL identifiers, as written by the client |
 //! | `direction` | `"to"` or `"from"`, for `COPY` |
-//! | `shape` | an AST discriminant such as `"function call"` ([`expr_shape`]) |
-//! | `error_kind` | the sqlparser error *variant* ([`parser_error_kind`]) — never its message, which embeds the offending token |
+//! | `shape` | an AST discriminant such as `"function call"` ([`expr_shape`](scope::expr_shape)) |
+//! | `error_kind` | the sqlparser error *variant* ([`parser_error_kind`](unprotected::parser_error_kind)) — never its message, which embeds the offending token |
 //! | `statements` | a count |
 //!
 //! Anything added later must stay inside that set;
@@ -117,6 +118,28 @@
 //! stays every site because the test ends in an exhaustive match over a value
 //! of each `Unprotected` variant: a variant added without a driver does not
 //! compile, and one whose driver stops firing fails the assertion.
+//!
+//! # Module layout
+//!
+//! What stays in this file is the state and the vocabulary the rest share:
+//! [`QueryRewriter`] itself, the catalog lookups every layer starts from, the
+//! [`Unprotected`] decision point, and the small types a value's sealing is
+//! described with. Everything that *does* something lives in a module named
+//! after the question it answers, so a reviewer can hold one at a time:
+//!
+//! | Module | What it decides |
+//! |---|---|
+//! | `frame` | which pgwire frames carry SQL or values, and what a refusal looks like on the wire |
+//! | `lexer` | how one SQL text is tokenized, parsed, split into statements and put back together |
+//! | `statement` | what each statement kind does about protected columns |
+//! | `query` | what a query puts in scope, and every place inside it a predicate can hide |
+//! | `predicate` | which comparisons are about a protected column, and which of those have a searchable rewrite |
+//! | `seal` | which row a write binds to, and the single point where a plaintext becomes a stored form |
+//! | `scope` | resolving a column reference against the relations in scope |
+//! | `catalog` | which tables and columns are protected, and how a SQL name resolves to one |
+//! | `settings` | which session settings a statement moves, read from tokens |
+//! | `array` | the Bind-time `bytea[]` codec behind `= ANY($n)` |
+//! | `unprotected` | the site descriptions themselves, and how each renders as a warning or a refusal |
 
 mod lexer;
 
@@ -131,48 +154,30 @@ pub(crate) use unprotected::error_response;
 mod catalog;
 pub use catalog::WriteCatalog;
 
+mod frame;
+mod predicate;
+mod query;
 mod scope;
 mod seal;
-use scope::{
-    ambiguous_column, ambiguous_operand, column_name, column_ref, computed_protected_column,
-    expr_shape, protected_column, protected_operand, ScopedTable, TableScope,
-};
-use seal::UpdateTarget;
+mod statement;
+use scope::{column_ref, TableScope};
 
-use catalog::{normalize, Columns, ReadColumns};
+use catalog::{normalize, Columns};
 
-use unprotected::{frame, Unprotected};
+use unprotected::Unprotected;
 
-use settings::{settings_moved, SettingMoved};
+use settings::SettingMoved;
 
-use array::{array_parameter, index_array};
-
-use lexer::reassemble;
-
-use std::borrow::Cow;
 use std::collections::HashSet;
-use std::sync::atomic::{AtomicU8, Ordering};
+use std::sync::atomic::AtomicU8;
 use std::sync::Arc;
 
-use dbsec_core::envelope::RowKey;
-use dbsec_core::pgwire;
 use dbsec_core::transform::{FieldTransform, WireForm};
-use sqlparser::ast::{
-    Expr, FunctionArg, FunctionArgExpr, GroupByExpr, Ident, Insert, JoinConstraint, JoinOperator,
-    ObjectName, OnConflict, OnConflictAction, OnInsert, Query, Select, SelectItem, SetExpr,
-    Statement, TableFactor, TableWithJoins, UnaryOperator, Value,
-};
-use sqlparser::dialect::PostgreSqlDialect;
-use sqlparser::parser::{Parser, ParserError};
-use sqlparser::tokenizer::{TokenWithSpan, Tokenizer};
+use sqlparser::ast::{Expr, ObjectName, Value};
 
 use crate::config::OnUnprotected;
-use crate::portal::{
-    ParamAction, ParamTransforms, ResultFormats, RowKeySource, SessionPortals, Target,
-};
-use crate::rowkey;
+use crate::portal::{ParamTransforms, RowKeySource, SessionPortals};
 use crate::rows::RowContext;
-use crate::session::FrameAction;
 use crate::Error;
 
 /// Why a rewrite stopped: the session cannot continue, or this one statement
@@ -185,91 +190,13 @@ enum Rejection {
     Fatal(Box<Error>),
     /// This one statement is refused and the session carries on: either
     /// `on_unprotected = "reject"` met a site it will not let through, or the
-    /// statement is unrewritable under any setting ([`record_param`]).
+    /// statement is unrewritable under any setting ([`record_param`](frame::record_param)).
     Refused(String),
 }
 
 impl From<Error> for Rejection {
     fn from(error: Error) -> Self {
         Self::Fatal(Box::new(error))
-    }
-}
-
-/// Records what Bind must do to one placeholder, turning the single refusal
-/// [`ParamTransforms::record`] can raise into a *statement-level* one.
-///
-/// `INSERT INTO users (email, backup_email) VALUES ($1, $1)` with the two
-/// columns under different transforms — or `UPDATE users SET email = $1 WHERE
-/// email = $1`, which needs the sealed value in the SET and the blind index in
-/// the WHERE — is valid client SQL, not a protocol violation. The Bind carries
-/// one value per placeholder, so only one of the two answers fits on the wire
-/// and the statement cannot be honoured. Refusing it is the whole remedy:
-/// nothing has gone upstream at this point, so the same
-/// [`SqlOutcome::Refuse`] path every other unrewritable statement takes
-/// applies unchanged.
-///
-/// It used to travel as [`Rejection::Fatal`], which tore the session down over
-/// well-formed SQL and told the client nothing but a closed socket — and under
-/// a connection pool the retry killed the next connection too.
-///
-/// Unlike an [`Unprotected`] site this does not consult `on_unprotected`:
-/// there is no "warn and relay" answer available. Letting it through would
-/// seal a value and then blind-index the ciphertext, or seal an already-sealed
-/// value — silently, and irreversibly in the second case (CL-3), which is the
-/// outcome [`ParamTransforms`] exists to prevent.
-fn record_param(
-    params: &mut ParamTransforms,
-    index: usize,
-    action: ParamAction,
-) -> Result<(), Rejection> {
-    match params.record(index, action) {
-        Ok(()) => Ok(()),
-        Err(Error::ConflictingParameter { placeholder }) => Err(Rejection::Refused(format!(
-            "dbsec refused this statement: placeholder ${placeholder} feeds two protected \
-             positions that need different values, and a Bind carries one value per \
-             placeholder; give each position its own placeholder"
-        ))),
-        Err(other) => Err(Rejection::Fatal(Box::new(other))),
-    }
-}
-
-/// The row key one sealed parameter binds to, resolved from the Bind that
-/// carries it.
-///
-/// [`RowKeySource::Param`] is the only arm with work to do: the key is another
-/// parameter of this same Bind, so its bytes exist only now. Canonicalising
-/// them reads *client input* — a NULL, a text body that is not UTF-8, a binary
-/// integer of the wrong width, an undefined format code — and every one of
-/// those is ordinary, well-formed traffic that a client can send by accident.
-///
-/// Propagating them as [`Error`] closed the connection with no ErrorResponse,
-/// which is the regression [`record_param`] was written to remove two lines
-/// away in the same function: a session torn down over well-formed SQL, and
-/// under a connection pool the retry killing the next connection too. They are
-/// statement-level refusals for the same reason every other Bind-time refusal
-/// is — nothing has gone upstream, so the statement can be refused and the
-/// session kept.
-fn bind_row_key(
-    row: &RowKeySource,
-    bind: &pgwire::BindMessage<'_>,
-) -> Result<Option<RowKey>, Rejection> {
-    let (index, type_oid, column) = match row {
-        RowKeySource::None => return Ok(None),
-        RowKeySource::Literal(key) => return Ok(Some(key.clone())),
-        RowKeySource::Param { index, type_oid, column } => (*index, *type_oid, column),
-    };
-    let resolved = rowkey::Format::from_code(bind.param_format(index)).and_then(|format| {
-        rowkey::canonical(type_oid, format, bind.params.get(index).copied().flatten())
-    });
-    match resolved {
-        Ok(key) => Ok(Some(key)),
-        Err(Error::RowKeyType(why)) => Err(Rejection::Refused(format!(
-            "dbsec refused this statement: placeholder ${} supplies the row key {column} that \
-             this statement's protected values are sealed against, but {why}; bind a usable \
-             {column} for the row being written",
-            index.saturating_add(1)
-        ))),
-        Err(other) => Err(Rejection::Fatal(Box::new(other))),
     }
 }
 
@@ -489,247 +416,6 @@ impl QueryRewriter {
         }
     }
 
-    /// Inspects one client→upstream frame, returning what the relay should do
-    /// with it.
-    pub fn on_frame(&mut self, msg_type: u8, body: &[u8]) -> Result<FrameAction, Error> {
-        if self.awaiting_sync {
-            return Ok(self.discard_until_sync(msg_type));
-        }
-        match msg_type {
-            b'Q' => {
-                let mut sql = body;
-                let query = pgwire::take_cstr(&mut sql).map_err(Error::Wire)?;
-                match self.rewrite_sql(query)? {
-                    // Refused here, so the backend never sees it and owes no
-                    // ReadyForQuery: the proxy answers with its own, and no
-                    // batch is recorded.
-                    SqlOutcome::Refuse(message) => {
-                        let mut reply = error_response(&message);
-                        reply.extend_from_slice(&self.ready_for_query());
-                        Ok(FrameAction::Reply(reply))
-                    }
-                    SqlOutcome::Rewrite(outcome) => {
-                        // A simple Query is its own batch: the backend answers
-                        // it with a ReadyForQuery, which is where the read
-                        // path resynchronises.
-                        self.portals.expect_batch()?;
-                        Ok(match outcome.rewritten {
-                            None => FrameAction::Relay,
-                            Some(rewritten) => {
-                                let mut new_body = rewritten.into_bytes();
-                                new_body.push(0);
-                                FrameAction::Replace(new_body)
-                            }
-                        })
-                    }
-                }
-            }
-            b'P' => {
-                let parse = pgwire::parse_parse(body)?;
-                let outcome = match self.rewrite_sql(parse.query)? {
-                    SqlOutcome::Refuse(message) => {
-                        // The backend is not going to answer this batch, so
-                        // the proxy owns the error state until Sync. Nothing
-                        // is recorded for this statement: the frame is not
-                        // forwarded, so no response is owed for it.
-                        self.awaiting_sync = true;
-                        return Ok(FrameAction::Reply(error_response(&message)));
-                    }
-                    SqlOutcome::Rewrite(outcome) => outcome,
-                };
-                self.portals.parse(parse.statement, outcome.params)?;
-                Ok(match outcome.rewritten {
-                    None => FrameAction::Relay,
-                    Some(sql) => FrameAction::Replace(pgwire::encode_parse(
-                        parse.statement,
-                        sql.as_bytes(),
-                        parse.param_types,
-                    )),
-                })
-            }
-            b'B' => self.bind(body),
-            b'D' => {
-                // Describe: the RowDescription it provokes is what tells the
-                // read path which columns of this statement are protected.
-                let (target, name) = describe_target(body)?;
-                self.portals.expect_describe(target, name)?;
-                Ok(FrameAction::Relay)
-            }
-            b'E' => {
-                let mut rest = body;
-                let portal = pgwire::take_cstr(&mut rest)?;
-                self.portals.expect_execute(portal)?;
-                Ok(FrameAction::Relay)
-            }
-            b'S' => {
-                self.portals.expect_batch()?;
-                Ok(FrameAction::Relay)
-            }
-            // FunctionCall: the legacy fast path, answered by
-            // FunctionCallResponse **and a ReadyForQuery** — it is the one
-            // client message outside Sync and the simple Query that closes a
-            // batch on its own. Left unrecorded it queued nothing, and its
-            // ReadyForQuery then settled the *next* batch's marker: from there
-            // every response was matched to the expectation in front of the one
-            // it answered, and a RowDescription was attributed to a following
-            // statement. The dangerous direction is a protected position the
-            // mis-attributed description does not cover, relayed in its stored
-            // form — for a mask-only column the very plaintext the mask exists
-            // to hide (SEC-31).
-            //
-            // The frame itself carries no SQL, so there is nothing to rewrite;
-            // whether its *result* may be relayed is decided on the read path,
-            // where `rows::RowDecryptor::function_call_result` answers the
-            // ordinary `on_unprotected` question about `'V'`.
-            b'F' => {
-                self.portals.expect_batch()?;
-                Ok(FrameAction::Relay)
-            }
-            // CopyData, CopyDone, CopyFail. In copy-in mode these are the
-            // payload, and the backend is ignoring the Sync the client already
-            // pipelined. Outside it they are strays PostgreSQL discards
-            // without answering — and `copy_data` refuses to move the queue
-            // for them, because a client that could pop this batch's marker
-            // could desync every response behind it. Relayed either way: the
-            // backend's own handling of a stray frame is the authority, and
-            // withholding it would only differ from PostgreSQL.
-            b'd' | b'c' | b'f' => {
-                self.portals.copy_data(msg_type);
-                Ok(FrameAction::Relay)
-            }
-            b'C' => {
-                // Close: 'S' = statement, 'P' = portal.
-                let (target, name) = describe_target(body)?;
-                match target {
-                    Target::Statement => self.portals.close_statement(name),
-                    Target::Portal => self.portals.close_portal(name),
-                }
-                Ok(FrameAction::Relay)
-            }
-            _ => Ok(FrameAction::Relay),
-        }
-    }
-
-    fn bind(&mut self, body: &[u8]) -> Result<FrameAction, Error> {
-        let bind = pgwire::parse_bind(body)?;
-        // Recorded even when the statement is unknown to the rewriter: the
-        // read path still needs to know which statement this portal names —
-        // and, since a Describe of a statement cannot say it, which formats
-        // this Bind asked its results back in (SEC-31).
-        let result_formats = ResultFormats::new(bind.result_format_codes()?);
-        let Some(params) = self.portals.bind(bind.portal, bind.statement, result_formats)? else {
-            return Ok(FrameAction::Relay);
-        };
-        if params.is_empty() {
-            return Ok(FrameAction::Relay);
-        }
-        let mut values: Vec<Option<Cow<'_, [u8]>>> =
-            bind.params.iter().map(|p| p.map(Cow::Borrowed)).collect();
-        // Every column whose array could not be indexed, not just the last one:
-        // an operator handed one name out of two fixes that site and hits the
-        // other on the next run.
-        let mut unindexed: Vec<String> = Vec::new();
-        for (index, action) in params.iter() {
-            let binary = bind.param_format(*index) == 1;
-            let Some(Some(value)) = values.get_mut(*index) else { continue };
-            let replacement = match action {
-                ParamAction::Seal { transform, row } => {
-                    let key = match bind_row_key(row, &bind) {
-                        Ok(key) => key,
-                        // Same shape as a refused Parse: nothing has gone
-                        // upstream, so the proxy owns the batch until Sync and
-                        // the session carries on.
-                        Err(Rejection::Refused(message)) => {
-                            self.awaiting_sync = true;
-                            return Ok(FrameAction::Reply(error_response(&message)));
-                        }
-                        Err(Rejection::Fatal(error)) => return Err(*error),
-                    };
-                    encode_param(transform.seal(value, key.as_ref())?, transform.wire(), binary)
-                }
-                ParamAction::SearchIndex(transform) => {
-                    let Some(token) = transform.search_index(value)? else {
-                        return Err(Error::Wire(dbsec_core::Error::Malformed));
-                    };
-                    // The index prefix is BYTEA regardless of the transform's
-                    // own stored form.
-                    encode_param(token, WireForm::Bytea, binary)
-                }
-                // The array is already in the parameter's own format: the
-                // codec re-encodes it in the shape it decoded.
-                ParamAction::SearchIndexArray { transform, column } => {
-                    match index_array(value, binary, transform)? {
-                        Some(indexed) => indexed,
-                        // Nothing about this array can be indexed faithfully.
-                        // The SQL already matches the blind index, so leaving
-                        // the plaintext array is the "matches no rows" outcome
-                        // the warn path describes; strict mode refuses it.
-                        None => {
-                            unindexed.push(column.to_string());
-                            continue;
-                        }
-                    }
-                }
-            };
-            *value = Cow::Owned(replacement);
-        }
-        // Every other parameter of this Bind is still transformed on the warn
-        // path: a sealed parameter relayed as plaintext because some *other*
-        // parameter could not be indexed would write the very thing this proxy
-        // exists to prevent.
-        if !unindexed.is_empty() {
-            let site =
-                Unprotected::Predicate { column: unindexed.join(", "), shape: "= ANY bound array" };
-            match self.unprotected(&site) {
-                Ok(()) => {}
-                Err(Rejection::Refused(message)) => {
-                    // Same shape as a refused Parse: the backend never sees
-                    // the Bind, so the proxy owns the batch until Sync.
-                    self.awaiting_sync = true;
-                    return Ok(FrameAction::Reply(error_response(&message)));
-                }
-                Err(Rejection::Fatal(error)) => return Err(*error),
-            }
-        }
-        Ok(FrameAction::Replace(pgwire::encode_bind(
-            bind.portal,
-            bind.statement,
-            &bind.param_formats,
-            &values,
-            bind.result_formats,
-        )?))
-    }
-
-    /// After a refusal the backend has no work queued for this batch, so the
-    /// proxy mirrors what the backend does in its own error state: drop
-    /// everything up to `Sync`, then answer with ReadyForQuery.
-    fn discard_until_sync(&mut self, msg_type: u8) -> FrameAction {
-        match msg_type {
-            b'S' => {
-                self.awaiting_sync = false;
-                FrameAction::Reply(self.ready_for_query())
-            }
-            // Terminate ends the session; the backend should see it.
-            b'X' => {
-                self.awaiting_sync = false;
-                FrameAction::Relay
-            }
-            _ => FrameAction::Reply(Vec::new()),
-        }
-    }
-
-    /// The ReadyForQuery a refusal answers with. The backend never saw the
-    /// statement, so its transaction is still open: reporting the aborted
-    /// state is what makes the client roll back instead of committing the
-    /// rest of a transaction whose protected write did not happen.
-    fn ready_for_query(&self) -> Vec<u8> {
-        let status = match self.tx_status.load(Ordering::Relaxed) {
-            b'T' | b'E' => b'E',
-            _ => b'I',
-        };
-        frame(b'Z', &[status])
-    }
-
     /// The single decision point for every statement the proxy cannot
     /// protect: warn and let it through, or refuse it.
     fn unprotected(&self, site: &Unprotected<'_>) -> Result<(), Rejection> {
@@ -801,1221 +487,6 @@ impl QueryRewriter {
         }
         Ok(false)
     }
-
-    /// [`Self::table`] for scope building: both directions of one table from a
-    /// single lookup, so an unresolvable `search_path` is reported once rather
-    /// than once per direction. See [`WriteCatalog::scoped`].
-    ///
-    /// The `search_path` guard is the read direction's, which is the wider of
-    /// the two: a table whose only protected column is mask-only is not in
-    /// [`WriteCatalog::may_be_protected`] at all, and a scope that dropped it
-    /// on an untrusted `search_path` would leave the projection check blind to
-    /// the one case where the stored value is the plaintext.
-    fn scoped_table(
-        &self,
-        name: &ObjectName,
-    ) -> Result<Option<(&Columns, &ReadColumns)>, Rejection> {
-        if self.search_path_trusted || name.0.len() > 1 {
-            return Ok(self.catalog.scoped(name));
-        }
-        if self.catalog.may_protect_reads(name) {
-            self.unprotected(&Unprotected::SearchPath(name))?;
-        }
-        Ok(None)
-    }
-
-    fn rewrite_sql(&mut self, query: &[u8]) -> Result<SqlOutcome, Error> {
-        let Ok(text) = std::str::from_utf8(query) else {
-            return self.unprotected_sql(&Unprotected::NonUtf8);
-        };
-        // Session settings are read from the token stream rather than from the
-        // parsed statements, because the parse cannot see them: sqlparser 0.53
-        // does not parse `SET SCHEMA` at all, and `set_config('search_path', …)`
-        // is an ordinary function call that can sit anywhere in any statement.
-        // They stay grouped per statement so a move takes effect from the
-        // statement that makes it onwards — a `SET` at the end of a batch must
-        // not retroactively stop the write in front of it from being sealed.
-        //
-        // The parser reads those same tokens rather than lexing the text a
-        // second time, so a rewritten statement is tokenized once.
-        let dialect = PostgreSqlDialect {};
-        let (moved, parsed) = match tokenize(&dialect, text) {
-            Ok(tokens) => (settings_moved(&tokens), parse_tokens(&dialect, tokens, text)),
-            // Text that does not tokenize does not parse either, so there is
-            // nothing to read out of it beyond the error itself.
-            Err(error) => (Vec::new(), Err(error)),
-        };
-        // The groups line up with the statements only when the tokenizer and
-        // the parser saw the same batch. Unparseable text (where nothing is
-        // rewritten, so no ordering can change an outcome) and any other
-        // disagreement fall back to applying every move up front, which is the
-        // conservative reading.
-        let aligned = parsed.as_ref().is_ok_and(|statements| statements.len() == moved.len());
-        // Whatever the startup packet moved is reported here, ahead of the
-        // batch's own moves: it was already in force when this statement
-        // arrived.
-        let mut upfront = std::mem::take(&mut self.startup_moved);
-        if !aligned {
-            upfront.extend(moved.iter().flatten().copied());
-        }
-        match self.note_session_state(&upfront) {
-            Ok(()) => {}
-            Err(Rejection::Fatal(error)) => return Err(*error),
-            Err(Rejection::Refused(message)) => return Ok(SqlOutcome::Refuse(message)),
-        }
-        let mut statements = match parsed {
-            Ok(statements) => statements,
-            Err(error) => return self.unprotected_sql(&Unprotected::Unparseable(&error)),
-        };
-
-        let mut params = ParamTransforms::default();
-        let mut changed = vec![false; statements.len()];
-        for (index, (statement, changed)) in statements.iter_mut().zip(&mut changed).enumerate() {
-            let noted = if aligned { self.note_session_state(&moved[index]) } else { Ok(()) };
-            match noted.and_then(|()| self.rewrite_statement(statement, &mut params)) {
-                Ok(did_change) => *changed = did_change,
-                Err(Rejection::Fatal(error)) => return Err(*error),
-                Err(Rejection::Refused(message)) => return Ok(SqlOutcome::Refuse(message)),
-            }
-        }
-
-        let rewritten = changed
-            .iter()
-            .any(|changed| *changed)
-            .then(|| reassemble(text, &statements, &changed))
-            .transpose()?;
-        Ok(SqlOutcome::Rewrite(RewriteOutcome { rewritten, params }))
-    }
-
-    /// Records the session settings a statement moved, as read out of the SQL
-    /// about to be relayed — or, on the session's first statement, what the
-    /// startup packet had already moved before any SQL arrived. Once
-    /// `search_path` stops making `public` the schema of an unqualified name,
-    /// the write path stops resolving bare names at all;
-    /// `standard_conforming_strings` is reported but changes no catalog
-    /// assumption, because what it invalidates is the proxy's reading of the
-    /// client's own literals.
-    fn note_session_state(&mut self, moved: &[SettingMoved]) -> Result<(), Rejection> {
-        for setting in moved {
-            match setting {
-                SettingMoved::SearchPath => {
-                    self.search_path_trusted = false;
-                    self.unprotected(&Unprotected::SearchPathChanged)?;
-                }
-                SettingMoved::EscapeStrings => {
-                    self.escape_strings = true;
-                    self.unprotected(&Unprotected::EscapeStringsChanged)?;
-                }
-            }
-        }
-        Ok(())
-    }
-
-    fn rewrite_statement(
-        &self,
-        statement: &mut Statement,
-        params: &mut ParamTransforms,
-    ) -> Result<bool, Rejection> {
-        match statement {
-            Statement::Insert(insert) => self.rewrite_insert(insert, params),
-            Statement::Update { table, assignments, from, selection, .. } => {
-                let mut changed = false;
-                if let TableFactor::Table { name, .. } = &table.relation {
-                    if let Some(columns) = self.table(name)? {
-                        let row = self.update_row(
-                            &UpdateTarget {
-                                table,
-                                from: from.as_ref(),
-                                selection: selection.as_ref(),
-                                assignments,
-                            },
-                            columns,
-                        );
-                        let target = AssignmentScope::of(columns, row);
-                        changed |= self.seal_assignments(assignments, &target, params)?;
-                    }
-                }
-                // `UPDATE ... FROM other` is a join: the predicate resolves
-                // names against the joined relation as well as the target, so
-                // a searchable column of *that* relation is as much a rewrite
-                // site as the target's own. Dropping it with the `..` left the
-                // comparison relayed verbatim — no rewrite, and no signal.
-                let scope = self.scope(std::iter::once(&*table).chain(from.as_ref()))?;
-                // A join constraint in that FROM resolves against the same
-                // scope the WHERE does, so it is the same rewrite site — and
-                // one only `rewrite_select` used to walk.
-                changed |= self.rewrite_join_conditions(
-                    std::iter::once(&mut *table).chain(from.as_mut()),
-                    &scope,
-                    params,
-                )?;
-                if let Some(selection) = selection {
-                    changed |= self.rewrite_predicate(selection, &scope, params)?;
-                }
-                // `SET x = (SELECT ...)` on an unprotected column still hides a
-                // query whose own predicates need rewriting.
-                for assignment in assignments.iter_mut() {
-                    changed |= self.rewrite_nested_queries(&mut assignment.value, params)?;
-                }
-                changed |=
-                    self.rewrite_derived_tables(std::iter::once(&mut *table).chain(from), params)?;
-                Ok(changed)
-            }
-            Statement::Query(query) => self.rewrite_query(query, params),
-            Statement::Delete(delete) => {
-                let tables = match &delete.from {
-                    sqlparser::ast::FromTable::WithFromKeyword(tables)
-                    | sqlparser::ast::FromTable::WithoutKeyword(tables) => tables,
-                };
-                // `USING` is the DELETE spelling of `UPDATE ... FROM`, and it
-                // is a separate field: a predicate over the joined relation
-                // resolves against it, so it belongs in the scope too. Left
-                // out, `DELETE FROM sessions USING users WHERE users.email =
-                // $1` compares plaintext against the stored form and deletes
-                // nothing — and its `<>` inversion deletes everything.
-                let scope = self.scope(tables.iter().chain(delete.using.iter().flatten()))?;
-                let mut changed = false;
-                if let Some(selection) = delete.selection.as_mut() {
-                    changed |= self.rewrite_predicate(selection, &scope, params)?;
-                }
-                let tables = match &mut delete.from {
-                    sqlparser::ast::FromTable::WithFromKeyword(tables)
-                    | sqlparser::ast::FromTable::WithoutKeyword(tables) => tables,
-                };
-                // Same as the UPDATE arm: a `USING a JOIN b ON …` constraint
-                // resolves against this scope and is as much a rewrite site as
-                // the WHERE.
-                changed |= self.rewrite_join_conditions(
-                    tables.iter_mut().chain(delete.using.iter_mut().flatten()),
-                    &scope,
-                    params,
-                )?;
-                changed |= self.rewrite_derived_tables(
-                    tables.iter_mut().chain(delete.using.iter_mut().flatten()),
-                    params,
-                )?;
-                Ok(changed)
-            }
-            Statement::Copy { source, to, .. } => {
-                match source {
-                    sqlparser::ast::CopySource::Table { table_name, .. } => {
-                        // The two directions ask different questions of the
-                        // catalog. `COPY … FROM STDIN` is a write, so what
-                        // matters is whether a value would have needed sealing
-                        // — a plaintext bulk load into a mask-only column is
-                        // correct and must not be refused. `COPY … TO` is a
-                        // read, and its rows leave as `CopyData` frames the
-                        // read path relays verbatim, so a mask-only column
-                        // leaves as the plaintext its mask exists to hide.
-                        let protected = if *to {
-                            self.reads_protected(table_name)?
-                        } else {
-                            self.table(table_name)?.is_some()
-                        };
-                        if protected {
-                            self.unprotected(&Unprotected::Copy { table: table_name, to: *to })?;
-                        }
-                    }
-                    // `COPY (SELECT ...) TO STDOUT`. PostgreSQL only allows a
-                    // query source in the *out* direction, and its rows leave
-                    // as `CopyData` frames — which the read path relays
-                    // verbatim, because only `DataRow` carries the column
-                    // identity decryption needs. So this form streams the
-                    // stored value of every protected column it projects, and
-                    // it used to do so with no signal at all: the classifier
-                    // looked at `CopySource::Table` only, so `reject` refused
-                    // `COPY users TO STDOUT` and relayed
-                    // `COPY (SELECT email FROM users) TO STDOUT`.
-                    //
-                    // The query is classified *and* rewritten. Classified
-                    // first, so `reject` refuses the leak before anything is
-                    // rendered; rewritten second, because under `warn` the
-                    // statement is relayed and its predicates are ordinary
-                    // predicates — a searchable equality left alone compares
-                    // the client's plaintext against the stored
-                    // `blind_index || envelope` and matches no row, which is
-                    // the failure [`Self::rewrite_nested_queries`] documents
-                    // as the unsafe one.
-                    //
-                    // Only the `TO` direction is rewritten, and that is what
-                    // keeps the re-rendering safe: PostgreSQL allows a query
-                    // source only on the way out, so a statement that changes
-                    // here is never a `COPY ... FROM STDIN` — the one COPY
-                    // shape with no wire-valid rendering through sqlparser's
-                    // `Display` (see [`parse_sql`], which parses it only by
-                    // appending a terminator the wire cannot carry). Anything
-                    // not rewritten keeps its original source text verbatim
-                    // ([`reassemble`]), and anything that is rewritten is
-                    // re-parsed and compared before it is sent
-                    // ([`render_validated`]).
-                    sqlparser::ast::CopySource::Query(query) => {
-                        for table in self.copied_protected_tables(query)? {
-                            self.unprotected(&Unprotected::CopyQuery { table })?;
-                        }
-                        if *to {
-                            return self.rewrite_query(query, params);
-                        }
-                    }
-                }
-                Ok(false)
-            }
-            // MERGE writes through the same `Assignment`s an UPDATE does, but
-            // its values come from the source relation rather than literals,
-            // so there is nothing the rewrite could seal — it is a refusal
-            // site, not a rewrite site.
-            Statement::Merge { table, .. } => {
-                if let TableFactor::Table { name, .. } = table {
-                    if self.table(name)?.is_some() {
-                        self.unprotected(&Unprotected::Unsupported {
-                            table: name,
-                            shape: "MERGE",
-                        })?;
-                    }
-                }
-                Ok(false)
-            }
-            // The literals of a PREPARE could be sealed, but its parameters
-            // are bound by a later EXECUTE the proxy cannot tie back to this
-            // statement, so half of the values would still land in plaintext.
-            Statement::Prepare { statement, .. } => {
-                if let Some(name) = write_target(statement) {
-                    if self.table(name)?.is_some() {
-                        self.unprotected(&Unprotected::Unsupported {
-                            table: name,
-                            shape: "PREPARE",
-                        })?;
-                    }
-                }
-                Ok(false)
-            }
-            _ => Ok(false),
-        }
-    }
-
-    fn rewrite_insert(
-        &self,
-        insert: &mut Insert,
-        params: &mut ParamTransforms,
-    ) -> Result<bool, Rejection> {
-        let Some(columns) = self.table(&insert.table_name)? else { return Ok(false) };
-        let mut changed = false;
-        let mut sealed = SealedValues::default();
-        if insert.columns.is_empty() {
-            // Without a column list the values cannot be matched to columns:
-            // the table's own column order is not something the proxy knows.
-            self.unprotected(&Unprotected::NoColumnList(&insert.table_name))?;
-        } else {
-            sealed = self.rewrite_insert_values(insert, columns, params)?;
-            changed |= sealed.changed;
-        }
-        // The conflict action's `WHERE` is a predicate over the target table,
-        // exactly like an UPDATE's own, so it is resolved against the same
-        // scope. The alias an `INSERT INTO t AS x` gives that table is the
-        // only name the predicate can qualify with, so the scope carries it.
-        let scope = TableScope {
-            tables: vec![ScopedTable {
-                alias: insert.table_alias.as_ref().map(normalize),
-                name: insert.table_name.0.iter().map(normalize).collect(),
-                columns,
-                // The write lookup above already resolved the name, so the
-                // read direction is fetched without repeating its
-                // `search_path` guard — reaching here means the name resolved.
-                read_columns: self.catalog.read_columns_of(&insert.table_name),
-            }],
-        };
-        // Which row the conflict action writes, read before `insert.on` is
-        // borrowed mutably below. Hardcoding `RowKeySource::None` here sealed
-        // every upsert-written value with cell-only binding on a table whose
-        // `INSERT`ed values a few lines above were bound to their row — the
-        // same statement writing `DBS3` for the inserted row and `DBS2` for
-        // the conflict-updated one, with no site reported for either policy.
-        let row = match insert.on.as_ref() {
-            Some(OnInsert::OnConflict(OnConflict {
-                conflict_target,
-                action: OnConflictAction::DoUpdate(update),
-            })) => self.conflict_row(insert, conflict_target.as_ref(), &update.assignments),
-            Some(OnInsert::DuplicateKeyUpdate(assignments)) => {
-                self.conflict_row(insert, None, assignments)
-            }
-            _ => AssignmentRow::Known(RowKeySource::None),
-        };
-        let target = AssignmentScope { row, columns, sealed };
-        // The conflict action writes the same columns on every existing row,
-        // and it is a plain assignment list — the UPDATE path handles it.
-        match insert.on.as_mut() {
-            Some(OnInsert::OnConflict(OnConflict {
-                action: OnConflictAction::DoUpdate(update),
-                ..
-            })) => {
-                changed |= self.seal_assignments(&mut update.assignments, &target, params)?;
-                if let Some(selection) = update.selection.as_mut() {
-                    changed |= self.rewrite_predicate(selection, &scope, params)?;
-                }
-            }
-            Some(OnInsert::DuplicateKeyUpdate(assignments)) => {
-                changed |= self.seal_assignments(assignments, &target, params)?;
-            }
-            _ => {}
-        }
-        Ok(changed)
-    }
-
-    /// Walks a query: CTE bodies, set-operation branches and the select
-    /// itself, so a searchable predicate is rewritten wherever it sits.
-    fn rewrite_query(
-        &self,
-        query: &mut Query,
-        params: &mut ParamTransforms,
-    ) -> Result<bool, Rejection> {
-        let mut changed = false;
-        if let Some(with) = query.with.as_mut() {
-            for cte in &mut with.cte_tables {
-                changed |= self.rewrite_query(&mut cte.query, params)?;
-            }
-        }
-        changed |= self.rewrite_set_expr(&mut query.body, params)?;
-        if let Some(order_by) = query.order_by.as_mut() {
-            for order in &mut order_by.exprs {
-                changed |= self.rewrite_nested_queries(&mut order.expr, params)?;
-            }
-        }
-        Ok(changed)
-    }
-
-    fn rewrite_set_expr(
-        &self,
-        body: &mut SetExpr,
-        params: &mut ParamTransforms,
-    ) -> Result<bool, Rejection> {
-        match body {
-            SetExpr::Select(select) => self.rewrite_select(select, params),
-            SetExpr::Query(query) => self.rewrite_query(query, params),
-            SetExpr::SetOperation { left, right, .. } => {
-                let left = self.rewrite_set_expr(left, params)?;
-                let right = self.rewrite_set_expr(right, params)?;
-                Ok(left | right)
-            }
-            // A data-modifying CTE: `WITH x AS (INSERT ... RETURNING ...)`.
-            SetExpr::Insert(statement) | SetExpr::Update(statement) => {
-                self.rewrite_statement(statement, params)
-            }
-            SetExpr::Values(_) | SetExpr::Table(_) => Ok(false),
-        }
-    }
-
-    fn rewrite_select(
-        &self,
-        select: &mut Select,
-        params: &mut ParamTransforms,
-    ) -> Result<bool, Rejection> {
-        let scope = self.scope(&select.from)?;
-        let mut changed = self.rewrite_join_conditions(&mut select.from, &scope, params)?;
-        changed |= self.rewrite_derived_tables(&mut select.from, params)?;
-        for predicate in [select.selection.as_mut(), select.having.as_mut()].into_iter().flatten() {
-            changed |= self.rewrite_predicate(predicate, &scope, params)?;
-        }
-        // Subqueries sitting in an *expression* rather than in FROM. These
-        // carry their own FROM, so they are walked by `rewrite_query` against
-        // their own scope; the predicate pass above deliberately stops at the
-        // subquery boundary, which is what keeps each query rewritten once.
-        // A protected column computed over in the projection loses its table
-        // identity on the way back, so the read path cannot act on it. Decided
-        // here, where the statement still says which column it was.
-        for item in &select.projection {
-            if let Some((column, expr)) = computed_protected_column(item, &scope) {
-                self.unprotected(&Unprotected::ComputedColumn { column, shape: expr_shape(expr) })?;
-            }
-        }
-        for expr in select_expressions(select) {
-            changed |= self.rewrite_nested_queries(expr, params)?;
-        }
-        Ok(changed)
-    }
-
-    /// Rewrites the derived tables of a relation list against their own
-    /// scopes.
-    ///
-    /// A derived table carries its own FROM, so its predicates belong to its
-    /// own traversal rather than the enclosing one. Every clause that holds
-    /// relations needs this pass, not only `SELECT`: `UPDATE ... FROM (SELECT
-    /// ...)` and `DELETE ... USING (SELECT ...)` walked their own `WHERE` but
-    /// never descended into the subquery next to it, so a searchable equality
-    /// in there was left comparing plaintext against the stored form — no
-    /// rewrite, no signal, and no rows.
-    fn rewrite_derived_tables<'from>(
-        &self,
-        from: impl IntoIterator<Item = &'from mut TableWithJoins>,
-        params: &mut ParamTransforms,
-    ) -> Result<bool, Rejection> {
-        let mut changed = false;
-        for table in from {
-            for factor in std::iter::once(&mut table.relation)
-                .chain(table.joins.iter_mut().map(|join| &mut join.relation))
-            {
-                match factor {
-                    TableFactor::Derived { subquery, .. } => {
-                        changed |= self.rewrite_query(subquery, params)?;
-                    }
-                    // A derived table inside a parenthesised join, e.g.
-                    // `FROM (users JOIN (SELECT ... WHERE email = '…') s ON …)`.
-                    // See [`Self::scope_of`] for why the nesting hides it.
-                    TableFactor::NestedJoin { table_with_joins, .. } => {
-                        changed |= self.rewrite_derived_tables(
-                            std::iter::once(&mut **table_with_joins),
-                            params,
-                        )?;
-                    }
-                    _ => {}
-                }
-            }
-        }
-        Ok(changed)
-    }
-
-    /// Rewrites the `ON` conditions of a relation list against the enclosing
-    /// scope, descending into parenthesised joins.
-    ///
-    /// A join constraint over a searchable column is as much a rewrite site as
-    /// a `WHERE` is, and the constraints of a join written as
-    /// `FROM (a JOIN b ON …)` live in the [`TableFactor::NestedJoin`]'s own
-    /// [`TableWithJoins`] — never in the top-level `joins` list a flat pass
-    /// looks at.
-    fn rewrite_join_conditions<'from>(
-        &self,
-        from: impl IntoIterator<Item = &'from mut TableWithJoins>,
-        scope: &TableScope<'_>,
-        params: &mut ParamTransforms,
-    ) -> Result<bool, Rejection> {
-        let mut changed = false;
-        for table in from {
-            changed |= self.rewrite_nested_join(&mut table.relation, scope, params)?;
-            for join in &mut table.joins {
-                changed |= self.rewrite_nested_join(&mut join.relation, scope, params)?;
-                if let Some(constraint) = join_condition(&mut join.join_operator) {
-                    changed |= self.rewrite_selection(constraint, scope, params)?;
-                }
-            }
-        }
-        Ok(changed)
-    }
-
-    /// The [`Self::rewrite_join_conditions`] step for one factor: recurse when
-    /// it is a parenthesised join, and do nothing otherwise.
-    fn rewrite_nested_join(
-        &self,
-        factor: &mut TableFactor,
-        scope: &TableScope<'_>,
-        params: &mut ParamTransforms,
-    ) -> Result<bool, Rejection> {
-        let TableFactor::NestedJoin { table_with_joins, .. } = factor else { return Ok(false) };
-        self.rewrite_join_conditions(std::iter::once(&mut **table_with_joins), scope, params)
-    }
-
-    /// A predicate owned by a statement or select: rewritten against its own
-    /// scope, then swept for nested queries.
-    ///
-    /// Both halves are needed at every site that owns a `WHERE`, and keeping
-    /// them behind one call is what stops a site being given only one of them
-    /// — which is exactly how `DELETE` and `UPDATE` came to walk their
-    /// predicates without ever crossing into a subquery.
-    fn rewrite_predicate(
-        &self,
-        expr: &mut Expr,
-        scope: &TableScope<'_>,
-        params: &mut ParamTransforms,
-    ) -> Result<bool, Rejection> {
-        let mut changed = self.rewrite_selection(expr, scope, params)?;
-        changed |= self.rewrite_nested_queries(expr, params)?;
-        Ok(changed)
-    }
-
-    /// Rewrites every query nested inside an expression, and nothing else.
-    ///
-    /// The counterpart to [`Self::rewrite_selection`], which rewrites
-    /// predicates inside one scope and never crosses a subquery boundary.
-    /// Splitting the two jobs this way is what makes the traversal safe:
-    /// each [`Query`] is reached from exactly one place, so no predicate can
-    /// be rewritten twice. Recursion into a nested query stops here because
-    /// [`Self::rewrite_query`] walks its insides itself.
-    ///
-    /// Before this existed, `rewrite_select` descended only into FROM-clause
-    /// derived tables, CTE bodies and set-operation branches. A searchable
-    /// equality inside a scalar subquery, an `EXISTS`, or a projection item
-    /// was left comparing the client's plaintext against the stored
-    /// `blind_index || envelope` — matching nothing, and never reaching
-    /// [`Self::unprotected`], so `reject` did not flag it either.
-    ///
-    /// "Matches nothing" is not a safe failure mode. `DELETE FROM t WHERE id
-    /// NOT IN (SELECT id FROM users WHERE email = '...')` turns an empty
-    /// subquery result into `NOT IN (empty)`, which is true for every row, so
-    /// the statement deletes the whole table.
-    fn rewrite_nested_queries(
-        &self,
-        expr: &mut Expr,
-        params: &mut ParamTransforms,
-    ) -> Result<bool, Rejection> {
-        let mut changed = false;
-        // The children to walk, gathered first: a closure capturing `changed`
-        // would borrow it for the whole match.
-        let mut children: Vec<&mut Expr> = Vec::new();
-        match expr {
-            // A query boundary: `rewrite_query` takes it from here, so the
-            // walk deliberately does not descend past this point.
-            Expr::Subquery(query) | Expr::Exists { subquery: query, .. } => {
-                return self.rewrite_query(query, params);
-            }
-            Expr::InSubquery { expr: operand, subquery, .. } => {
-                changed |= self.rewrite_query(subquery, params)?;
-                children.push(operand.as_mut());
-            }
-            Expr::BinaryOp { left, right, .. }
-            | Expr::AnyOp { left, right, .. }
-            | Expr::AllOp { left, right, .. }
-            | Expr::IsDistinctFrom(left, right)
-            | Expr::IsNotDistinctFrom(left, right) => {
-                children.push(left.as_mut());
-                children.push(right.as_mut());
-            }
-            Expr::UnaryOp { expr: inner, .. }
-            | Expr::Nested(inner)
-            | Expr::Cast { expr: inner, .. }
-            | Expr::IsNull(inner)
-            | Expr::IsNotNull(inner)
-            | Expr::IsTrue(inner)
-            | Expr::IsNotTrue(inner)
-            | Expr::IsFalse(inner)
-            | Expr::IsNotFalse(inner)
-            | Expr::Collate { expr: inner, .. } => children.push(inner.as_mut()),
-            Expr::InList { expr: operand, list, .. } => {
-                children.push(operand.as_mut());
-                children.extend(list.iter_mut());
-            }
-            Expr::Between { expr: operand, low, high, .. } => {
-                children.push(operand.as_mut());
-                children.push(low.as_mut());
-                children.push(high.as_mut());
-            }
-            Expr::Like { expr: operand, pattern, .. }
-            | Expr::ILike { expr: operand, pattern, .. }
-            | Expr::SimilarTo { expr: operand, pattern, .. } => {
-                children.push(operand.as_mut());
-                children.push(pattern.as_mut());
-            }
-            Expr::Tuple(items) => children.extend(items.iter_mut()),
-            Expr::Case { operand, conditions, results, else_result } => {
-                children.extend(operand.iter_mut().map(AsMut::as_mut));
-                children.extend(else_result.iter_mut().map(AsMut::as_mut));
-                children.extend(conditions.iter_mut());
-                children.extend(results.iter_mut());
-            }
-            Expr::Function(function) => {
-                if let sqlparser::ast::FunctionArguments::List(list) = &mut function.args {
-                    for argument in &mut list.args {
-                        let (FunctionArg::Named { arg, .. }
-                        | FunctionArg::ExprNamed { arg, .. }
-                        | FunctionArg::Unnamed(arg)) = argument;
-                        if let FunctionArgExpr::Expr(inner) = arg {
-                            children.push(inner);
-                        }
-                    }
-                }
-            }
-            // Everything else is a leaf, or a shape that cannot hold a query.
-            // A miss here leaves the pre-existing behaviour rather than
-            // opening a new hole, and an *outer* predicate over a protected
-            // column is still signalled by `rewrite_selection`.
-            _ => {}
-        }
-        for child in children {
-            changed |= self.rewrite_nested_queries(child, params)?;
-        }
-        Ok(changed)
-    }
-
-    /// Collects the protected tables visible to a predicate, with their
-    /// aliases, so column references can be resolved.
-    ///
-    /// Takes an iterator rather than a slice because the relations a predicate
-    /// sees are not always contiguous: `UPDATE ... FROM` keeps its second
-    /// relation in a field of its own, next to the target.
-    fn scope<'from>(
-        &self,
-        from: impl IntoIterator<Item = &'from TableWithJoins>,
-    ) -> Result<TableScope<'_>, Rejection> {
-        let mut tables = Vec::new();
-        for table_with_joins in from {
-            self.scope_of(table_with_joins, &mut tables)?;
-        }
-        Ok(TableScope { tables })
-    }
-
-    /// Adds one relation and its joins to a scope, descending into the
-    /// parenthesised joins sqlparser keeps as [`TableFactor::NestedJoin`].
-    ///
-    /// `FROM (users JOIN orders ON orders.id = users.id)` parses as a single
-    /// `NestedJoin` holding the whole join rather than as two `Table` factors,
-    /// so a walk that stops at the top level finds no table at all: every
-    /// protected table inside the parentheses drops out of the scope, and a
-    /// predicate over one is neither rewritten into an index match nor raised
-    /// as an [`Unprotected`] site — so `reject` relayed it verbatim and the
-    /// comparison matched no row. The parentheses only group the join; the
-    /// names inside them are in scope for the enclosing query exactly as they
-    /// would be without them, which is why the nesting is flattened away here.
-    fn scope_of<'a>(
-        &'a self,
-        table_with_joins: &TableWithJoins,
-        tables: &mut Vec<ScopedTable<'a>>,
-    ) -> Result<(), Rejection> {
-        let factors = std::iter::once(&table_with_joins.relation)
-            .chain(table_with_joins.joins.iter().map(|join| &join.relation));
-        for factor in factors {
-            match factor {
-                TableFactor::Table { name, alias, .. } => {
-                    let Some((columns, read_columns)) = self.scoped_table(name)? else { continue };
-                    tables.push(ScopedTable {
-                        alias: alias.as_ref().map(|alias| normalize(&alias.name)),
-                        name: name.0.iter().map(normalize).collect(),
-                        columns,
-                        read_columns,
-                    });
-                }
-                TableFactor::NestedJoin { table_with_joins, .. } => {
-                    self.scope_of(table_with_joins, tables)?;
-                }
-                // A derived table brings its own scope, and a set-returning
-                // function, `UNNEST` or `JSON_TABLE` names no base table the
-                // catalog could resolve.
-                _ => {}
-            }
-        }
-        Ok(())
-    }
-
-    /// Every protected table a `COPY (query) TO STDOUT` would read, gathered
-    /// from the query's own FROM clauses, its derived tables, its CTE bodies
-    /// and both branches of a set operation. Names are reported once each,
-    /// however many times the query mentions them.
-    ///
-    /// The *table* is what is reported, not the column. A COPY query's
-    /// projection is arbitrary SQL — `SELECT *`, a function call, a reference
-    /// to a CTE that selects the column three levels down — so "does this
-    /// stream a protected column" is not answerable from the statement text,
-    /// and answering "no" wrongly is the failure that leaks. Naming the table
-    /// is also what the table-form `COPY t TO STDOUT` already does, so the two
-    /// forms of one statement now behave alike.
-    ///
-    /// This walk recognises one table shape [`Self::scope`] does not — the
-    /// `PIVOT`/`UNPIVOT`/`MATCH_RECOGNIZE` wrappers — because the consequence
-    /// of missing one differs. There, a missed table leaves a predicate
-    /// unrewritten, which the client sees as an empty result; here it hands
-    /// the client a protected column's stored bytes. (The parenthesised join
-    /// used to be the second such shape; [`Self::scope_of`] descends into it
-    /// now, since the empty result it caused was no safer.)
-    fn copied_protected_tables(&self, query: &Query) -> Result<Vec<String>, Rejection> {
-        let mut found = Vec::new();
-        self.collect_copied_tables(query, &mut found)?;
-        Ok(found)
-    }
-
-    fn collect_copied_tables(
-        &self,
-        query: &Query,
-        found: &mut Vec<String>,
-    ) -> Result<(), Rejection> {
-        if let Some(with) = query.with.as_ref() {
-            for cte in &with.cte_tables {
-                self.collect_copied_tables(&cte.query, found)?;
-            }
-        }
-        self.collect_copied_tables_in(&query.body, found)
-    }
-
-    fn collect_copied_tables_in(
-        &self,
-        body: &SetExpr,
-        found: &mut Vec<String>,
-    ) -> Result<(), Rejection> {
-        match body {
-            SetExpr::Select(select) => {
-                for table in &select.from {
-                    let factors = std::iter::once(&table.relation)
-                        .chain(table.joins.iter().map(|join| &join.relation));
-                    for factor in factors {
-                        self.collect_copied_tables_from(factor, found)?;
-                    }
-                }
-            }
-            SetExpr::Query(query) => self.collect_copied_tables(query, found)?,
-            SetExpr::SetOperation { left, right, .. } => {
-                self.collect_copied_tables_in(left, found)?;
-                self.collect_copied_tables_in(right, found)?;
-            }
-            // `TABLE t`, the shorthand for `SELECT * FROM t`, which the parser
-            // keeps as a pair of bare strings rather than an `ObjectName`.
-            //
-            // sqlparser 0.53 cannot actually reach this arm from a COPY
-            // source: `parse_as_table` reads three tokens unconditionally and
-            // so overruns the closing paren, leaving `COPY (TABLE t) TO
-            // STDOUT` unparseable — which is a site of its own, so the shape
-            // is refused under `reject` today by a different name. The arm is
-            // here so a later parser fix cannot quietly open a hole.
-            SetExpr::Table(table) => {
-                let Some(name) = table.table_name.as_ref() else { return Ok(()) };
-                let parts = table.schema_name.iter().chain(std::iter::once(name));
-                let name = ObjectName(parts.map(|part| Ident::new(part.as_str())).collect());
-                self.record_copied_table(&name, found)?;
-            }
-            // A data-modifying CTE writes; it is the write path's own sites
-            // that cover it, and its rows are not what COPY streams.
-            SetExpr::Insert(_) | SetExpr::Update(_) | SetExpr::Values(_) => {}
-        }
-        Ok(())
-    }
-
-    fn collect_copied_tables_from(
-        &self,
-        factor: &TableFactor,
-        found: &mut Vec<String>,
-    ) -> Result<(), Rejection> {
-        match factor {
-            TableFactor::Table { name, .. } => self.record_copied_table(name, found),
-            TableFactor::Derived { subquery, .. } => self.collect_copied_tables(subquery, found),
-            TableFactor::NestedJoin { table_with_joins, .. } => {
-                let factors = std::iter::once(&table_with_joins.relation)
-                    .chain(table_with_joins.joins.iter().map(|join| &join.relation));
-                for factor in factors {
-                    self.collect_copied_tables_from(factor, found)?;
-                }
-                Ok(())
-            }
-            TableFactor::Pivot { table, .. }
-            | TableFactor::Unpivot { table, .. }
-            | TableFactor::MatchRecognize { table, .. } => {
-                self.collect_copied_tables_from(table, found)
-            }
-            // Set-returning functions, `UNNEST`, `JSON_TABLE`: none of them
-            // names a table the catalog could resolve.
-            _ => Ok(()),
-        }
-    }
-
-    fn record_copied_table(
-        &self,
-        name: &ObjectName,
-        found: &mut Vec<String>,
-    ) -> Result<(), Rejection> {
-        // The read-direction lookup: a query source only exists in the `TO`
-        // direction, and a mask-only table read this way streams the plaintext
-        // its mask exists to hide. See [`WriteCatalog::protects_reads`].
-        if !self.reads_protected(name)? {
-            return Ok(());
-        }
-        let name = name.to_string();
-        if !found.contains(&name) {
-            found.push(name);
-        }
-        Ok(())
-    }
-
-    /// Rewrites the equality shapes that a blind index can answer, and turns
-    /// everything else that mentions a searchable column into an
-    /// [`Unprotected`] site — an unrewritten predicate matches no row, and
-    /// "no rows" is indistinguishable from "no such user".
-    fn rewrite_selection(
-        &self,
-        expr: &mut Expr,
-        scope: &TableScope<'_>,
-        params: &mut ParamTransforms,
-    ) -> Result<bool, Rejection> {
-        use sqlparser::ast::BinaryOperator;
-        match expr {
-            Expr::BinaryOp { left, op: BinaryOperator::Eq, right } => {
-                if let Some(transform) = column_ref(scope, left).cloned() {
-                    self.rewrite_equality(left, right, &transform, params)
-                } else if let Some(transform) = column_ref(scope, right).cloned() {
-                    self.rewrite_equality(right, left, &transform, params)
-                } else {
-                    self.unsupported_predicate(expr, scope)
-                }
-            }
-            Expr::BinaryOp { left, op: BinaryOperator::And | BinaryOperator::Or, right } => {
-                let left = self.rewrite_selection(left, scope, params)?;
-                let right = self.rewrite_selection(right, scope, params)?;
-                Ok(left | right)
-            }
-            Expr::Nested(inner) => self.rewrite_selection(inner, scope, params),
-            Expr::UnaryOp { op: UnaryOperator::Not, expr: inner } => {
-                self.rewrite_selection(inner, scope, params)
-            }
-            Expr::InList { expr: column, list, .. } => {
-                self.rewrite_in_list(column, list, scope, params)
-            }
-            Expr::AnyOp { left, compare_op: BinaryOperator::Eq, right, .. } => {
-                if let Expr::Array(array) = right.as_mut() {
-                    return self.rewrite_in_list(left, &mut array.elem, scope, params);
-                }
-                // `= ANY($1)` is one bound array parameter: the elements only
-                // exist at Bind time, so the index is applied there.
-                if let Some((index, transform)) = array_parameter(left, right, scope) {
-                    let column: Arc<str> = column_name(left).unwrap_or_default().into();
-                    record_param(
-                        params,
-                        index,
-                        ParamAction::SearchIndexArray { transform, column },
-                    )?;
-                    let operand = std::mem::replace(left.as_mut(), Expr::Value(Value::Null));
-                    *left.as_mut() = index_prefix(operand);
-                    return Ok(true);
-                }
-                self.unsupported_predicate(expr, scope)
-            }
-            _ => self.unsupported_predicate(expr, scope),
-        }
-    }
-
-    /// `col IN (a, b)` and `col = ANY(ARRAY[a, b])` become an index-prefix
-    /// match against the indexed values. Either every element is indexable or
-    /// none is rewritten: a mixed predicate compares some values against the
-    /// index and others against the stored form.
-    fn rewrite_in_list(
-        &self,
-        column: &mut Expr,
-        list: &mut [Expr],
-        scope: &TableScope<'_>,
-        params: &mut ParamTransforms,
-    ) -> Result<bool, Rejection> {
-        let Some(transform) = column_ref(scope, column).cloned() else {
-            if let Some(column) = ambiguous_column(column, scope) {
-                self.unprotected(&Unprotected::AmbiguousColumn { column, shape: "IN list" })?;
-                return Ok(false);
-            }
-            // Row-wise `(a, b) IN ((..), (..))`: no single transform covers a
-            // row constructor, so it cannot be rewritten — but it still has to
-            // be reported rather than relayed to match nothing.
-            if let Some((column, searchable)) = protected_column(column, scope) {
-                self.unprotected(&if searchable {
-                    Unprotected::Predicate { column, shape: "row-wise IN list" }
-                } else {
-                    Unprotected::UnindexedPredicate { column, shape: "row-wise IN list" }
-                })?;
-            }
-            return Ok(false);
-        };
-        if !transform.supports_search() {
-            // Same as `rewrite_equality`: no index to compare against, so
-            // every element would be tested against the stored form.
-            let column = column_name(column).unwrap_or_default();
-            self.unprotected(&Unprotected::UnindexedPredicate { column, shape: "IN list" })?;
-            return Ok(false);
-        }
-        if !list.iter().all(|value| self.literal_agrees_with_server(value)) {
-            let column = column_name(column).unwrap_or_default();
-            self.unprotected(&Unprotected::AmbiguousLiteral { column: &column })?;
-            return Ok(false);
-        }
-        let indexable = !list.is_empty()
-            && list.iter().all(|value| match unwrap_casts(value) {
-                Expr::Value(Value::Placeholder(placeholder)) => {
-                    placeholder_index(placeholder).is_some()
-                }
-                other => literal_plaintext(other, transform.wire()).is_some(),
-            });
-        if !indexable {
-            let column = column_name(column).unwrap_or_default();
-            self.unprotected(&Unprotected::Predicate { column, shape: "IN list" })?;
-            return Ok(false);
-        }
-        for value in list.iter_mut() {
-            index_value(value, &transform, params)?;
-        }
-        *column = index_prefix(std::mem::replace(column, Expr::Value(Value::Null)));
-        Ok(true)
-    }
-
-    /// Turns `col = <value>` into `substring(col from 1 for 32) = <index>`.
-    /// Literals get the index inline; placeholders are indexed at Bind time.
-    fn rewrite_equality(
-        &self,
-        column: &mut Expr,
-        value: &mut Expr,
-        transform: &Arc<dyn FieldTransform>,
-        params: &mut ParamTransforms,
-    ) -> Result<bool, Rejection> {
-        if !transform.supports_search() {
-            // The column is protected but carries no equality index, so this
-            // comparison would run against the stored form and match nothing.
-            // Relaying it silently is the failure `Unprotected` exists to
-            // prevent: "no rows" reads as "no such user".
-            let column = column_name(column).unwrap_or_default();
-            self.unprotected(&Unprotected::UnindexedPredicate {
-                column,
-                shape: expr_shape(value),
-            })?;
-            return Ok(false);
-        }
-        if !self.literal_agrees_with_server(value) {
-            let column = column_name(column).unwrap_or_default();
-            self.unprotected(&Unprotected::AmbiguousLiteral { column: &column })?;
-            return Ok(false);
-        }
-        let indexable = match unwrap_casts(value) {
-            Expr::Value(Value::Placeholder(placeholder)) => {
-                placeholder_index(placeholder).is_some()
-            }
-            other => literal_plaintext(other, transform.wire()).is_some(),
-        };
-        if !indexable {
-            let column = column_name(column).unwrap_or_default();
-            self.unprotected(&Unprotected::Predicate { column, shape: expr_shape(value) })?;
-            return Ok(false);
-        }
-        index_value(value, transform, params)?;
-        *column = index_prefix(std::mem::replace(column, Expr::Value(Value::Null)));
-        Ok(true)
-    }
-
-    /// A predicate the rewriter cannot turn into an index match. Only worth a
-    /// signal when it actually mentions a protected column — otherwise it is
-    /// ordinary SQL the proxy has no business commenting on.
-    fn unsupported_predicate(
-        &self,
-        expr: &Expr,
-        scope: &TableScope<'_>,
-    ) -> Result<bool, Rejection> {
-        let shape = expr_shape(expr);
-        // Checked first: an ambiguous name resolves to no transform, so the
-        // protected-operand test below cannot see it, and it is precisely the
-        // case that must not be left as a plaintext comparison.
-        if let Some(column) = ambiguous_operand(expr, scope) {
-            self.unprotected(&Unprotected::AmbiguousColumn { column, shape })?;
-            return Ok(false);
-        }
-        let Some((column, searchable)) = protected_operand(expr, scope) else { return Ok(false) };
-        self.unprotected(&if searchable {
-            Unprotected::Predicate { column, shape }
-        } else {
-            Unprotected::UnindexedPredicate { column, shape }
-        })?;
-        Ok(false)
-    }
-
-    /// Seals one literal in place, or records the placeholder for Bind time.
-    /// Returns whether the statement text changed.
-    fn seal_expr(
-        &self,
-        expr: &mut Expr,
-        target: &SealTarget<'_>,
-        params: &mut ParamTransforms,
-    ) -> Result<bool, Rejection> {
-        let SealTarget { transform, column, row } = target;
-        match unwrap_casts(expr) {
-            Expr::Value(Value::Placeholder(placeholder)) => {
-                if let Some(index) = placeholder_index(placeholder) {
-                    record_param(
-                        params,
-                        index,
-                        ParamAction::Seal { transform: (*transform).clone(), row: (*row).clone() },
-                    )?;
-                }
-                return Ok(false);
-            }
-            Expr::Value(Value::Null) => return Ok(false),
-            _ => {}
-        }
-        if !self.literal_agrees_with_server(expr) {
-            self.unprotected(&Unprotected::AmbiguousLiteral { column })?;
-            return Ok(false);
-        }
-        let Some(plaintext) = literal_plaintext(expr, transform.wire()) else {
-            self.unprotected(&Unprotected::UnsupportedValue { column, shape: expr_shape(expr) })?;
-            return Ok(false);
-        };
-        // The literal's row key is known now — it came out of the same
-        // statement — so unlike a placeholder there is nothing to defer.
-        let row_key = match row {
-            RowKeySource::Literal(key) => Some(key.clone()),
-            // A literal value in a row whose *key* is a parameter cannot be
-            // sealed here: the key does not exist until Bind, and this value
-            // is being written now. Refused rather than sealed unbound.
-            RowKeySource::Param { .. } => {
-                self.unprotected(&Unprotected::UnsupportedValue {
-                    column,
-                    shape: "literal in a row whose key is a bound parameter",
-                })?;
-                return Ok(false);
-            }
-            RowKeySource::None => None,
-        };
-        let sealed = transform.seal(&plaintext, row_key.as_ref()).map_err(Error::Wire)?;
-        *expr = match transform.wire() {
-            WireForm::Bytea => bytea_literal(&sealed),
-            // FPE digits and HMAC hex carry no backslash, so an ordinary
-            // literal denotes the same string under either setting of
-            // `standard_conforming_strings`.
-            WireForm::Text => Expr::Value(Value::SingleQuotedString(
-                String::from_utf8_lossy(&sealed).into_owned(),
-            )),
-        };
-        Ok(true)
-    }
-}
-
-/// Lexes one SQL text into the tokens both readers work from — the session
-/// settings scan and the parser — so a statement is tokenized once rather than
-/// once per reader. The error is the parser's own, which is what
-/// [`parser_error_kind`] and the unparseable site already speak.
-fn tokenize(dialect: &PostgreSqlDialect, text: &str) -> Result<Vec<TokenWithSpan>, ParserError> {
-    Tokenizer::new(dialect, text).tokenize_with_location().map_err(ParserError::from)
-}
-
-/// Parses one SQL text from its [`tokenize`]d form, retrying once with a
-/// statement terminator.
-///
-/// `COPY ... FROM STDIN` is the reason for the retry. sqlparser reads the TSV
-/// payload that follows it in a script, so it wants either the data and its
-/// `\.` terminator or a `;`. On the wire there is neither — the payload arrives
-/// later as `CopyData` frames — so the statement fails to parse and `COPY`
-/// would only ever be seen as unparseable SQL, with a warning naming the wrong
-/// problem. The retry re-lexes, which costs nothing worth saving: it only
-/// happens for text that already failed to parse.
-fn parse_tokens(
-    dialect: &PostgreSqlDialect,
-    tokens: Vec<TokenWithSpan>,
-    text: &str,
-) -> Result<Vec<Statement>, ParserError> {
-    let error = match Parser::new(dialect).with_tokens_with_locations(tokens).parse_statements() {
-        Ok(statements) => return Ok(statements),
-        Err(error) => error,
-    };
-    Parser::parse_sql(dialect, &format!("{text};")).map_err(|_| error)
-}
-
-/// Parses one SQL text, for the callers that have no tokens of their own to
-/// share — the rewrite's own re-parse of what it rendered, and the tests.
-pub(super) fn parse_sql(text: &str) -> Result<Vec<Statement>, ParserError> {
-    let dialect = PostgreSqlDialect {};
-    let tokens = tokenize(&dialect, text)?;
-    parse_tokens(&dialect, tokens, text)
-}
-
-/// The table a write statement targets, for the shapes the rewrite declines
-/// to handle itself.
-fn write_target(statement: &Statement) -> Option<&ObjectName> {
-    let relation = match statement {
-        Statement::Insert(insert) => return Some(&insert.table_name),
-        Statement::Update { table, .. } => &table.relation,
-        Statement::Merge { table, .. } => table,
-        _ => return None,
-    };
-    match relation {
-        TableFactor::Table { name, .. } => Some(name),
-        _ => None,
-    }
-}
-
-/// The `ON` condition of a join, when it has one.
-fn join_condition(operator: &mut JoinOperator) -> Option<&mut Expr> {
-    let constraint = match operator {
-        JoinOperator::Inner(constraint)
-        | JoinOperator::LeftOuter(constraint)
-        | JoinOperator::RightOuter(constraint)
-        | JoinOperator::FullOuter(constraint)
-        | JoinOperator::Semi(constraint)
-        | JoinOperator::LeftSemi(constraint)
-        | JoinOperator::RightSemi(constraint)
-        | JoinOperator::Anti(constraint)
-        | JoinOperator::LeftAnti(constraint)
-        | JoinOperator::RightAnti(constraint)
-        | JoinOperator::AsOf { constraint, .. } => constraint,
-        JoinOperator::CrossJoin | JoinOperator::CrossApply | JoinOperator::OuterApply => {
-            return None
-        }
-    };
-    match constraint {
-        JoinConstraint::On(expr) => Some(expr),
-        JoinConstraint::Using(_) | JoinConstraint::Natural | JoinConstraint::None => None,
-    }
-}
-
-/// `substring(col from 1 for 32)` — the stored blind-index prefix.
-fn index_prefix(column: Expr) -> Expr {
-    let number = |n: &str| Box::new(Expr::Value(Value::Number(n.into(), false)));
-    Expr::Substring {
-        expr: Box::new(column),
-        substring_from: Some(number("1")),
-        substring_for: Some(number(&dbsec_core::blind_index::BLIND_INDEX_LEN.to_string())),
-        special: false,
-    }
-}
-
-/// Replaces one compared value with its blind index: inline for a literal,
-/// recorded for Bind time for a placeholder. Callers check first that the
-/// value is one of those two.
-fn index_value(
-    value: &mut Expr,
-    transform: &Arc<dyn FieldTransform>,
-    params: &mut ParamTransforms,
-) -> Result<(), Rejection> {
-    if let Expr::Value(Value::Placeholder(placeholder)) = unwrap_casts(value) {
-        let Some(index) = placeholder_index(placeholder) else {
-            return Err(Error::Wire(dbsec_core::Error::Malformed).into());
-        };
-        record_param(params, index, ParamAction::SearchIndex(transform.clone()))?;
-        return Ok(());
-    }
-    let Some(plaintext) = literal_plaintext(value, transform.wire()) else {
-        return Err(Error::Wire(dbsec_core::Error::Malformed).into());
-    };
-    let Some(token) = transform.search_index(&plaintext).map_err(Error::Wire)? else {
-        return Err(Error::Wire(dbsec_core::Error::Malformed).into());
-    };
-    *value = bytea_literal(&token);
-    Ok(())
-}
-
-/// A BYTEA value as SQL text: `E'\\x…'`, PostgreSQL's hex input syntax inside
-/// an *escape* string literal.
-///
-/// The plain `'\x…'` spelling reads as hex bytea only while
-/// `standard_conforming_strings` is on — with it off, the server applies
-/// C-style backslash processing to the literal first and every sealed write
-/// and every blind-index match is silently corrupted. `E'…'` processes
-/// backslashes whatever that setting says, so doubling the one backslash here
-/// makes the literal mean the same thing either way. sqlparser renders the
-/// stored `\x…` back out with the backslash doubled, and reads it back to
-/// `\x…` when the rewritten text is re-parsed for validation.
-fn bytea_literal(value: &[u8]) -> Expr {
-    Expr::Value(Value::EscapedStringLiteral(format!("\\x{}", hex::encode(value))))
-}
-
-/// One transformed Bind parameter, in the format the parameter arrived in.
-/// Text-shaped stored forms (FPE digits, hex tokens) are the same bytes in
-/// either format; a BYTEA form in a text-format parameter is `\x` hex.
-fn encode_param(value: Vec<u8>, wire: WireForm, binary: bool) -> Vec<u8> {
-    match wire {
-        WireForm::Text => value,
-        WireForm::Bytea if binary => value,
-        WireForm::Bytea => format!("\\x{}", hex::encode(value)).into_bytes(),
-    }
-}
-
-/// Splits a Describe or Close body into its target and name — both messages
-/// share the shape `u8 kind | cstr name`. A kind byte that is neither `'S'`
-/// (statement) nor `'P'` (portal) is a protocol violation the relay must not
-/// guess at: carrying on would leave the read path's expectations misaligned
-/// with what the server is about to answer.
-fn describe_target(body: &[u8]) -> Result<(Target, &[u8]), Error> {
-    let [kind, rest @ ..] = body else {
-        return Err(Error::Wire(dbsec_core::Error::Malformed));
-    };
-    let target = match kind {
-        b'S' => Target::Statement,
-        b'P' => Target::Portal,
-        _ => return Err(Error::Wire(dbsec_core::Error::Malformed)),
-    };
-    let mut rest = rest;
-    let name = pgwire::take_cstr(&mut rest)?;
-    Ok((target, name))
 }
 
 /// The zero-based parameter index a `$n` placeholder refers to, or `None` when
@@ -2026,89 +497,23 @@ fn describe_target(body: &[u8]) -> Result<(Target, &[u8]), Error> {
 /// unchecked panicked the session task in debug builds and wrapped to
 /// `usize::MAX` in release, where the rewrite went ahead against an index no
 /// Bind can ever fill (SEC-15).
-fn placeholder_index(placeholder: &str) -> Option<usize> {
+pub(super) fn placeholder_index(placeholder: &str) -> Option<usize> {
     placeholder.strip_prefix('$').and_then(|n| n.parse::<usize>().ok())?.checked_sub(1)
 }
 
 /// Peels the casts and parentheses drivers wrap literals in — psycopg's
 /// client-side binding renders every bytes parameter as `'\x…'::bytea` — so
 /// the value underneath can be recognised.
-fn unwrap_casts(expr: &Expr) -> &Expr {
+pub(super) fn unwrap_casts(expr: &Expr) -> &Expr {
     match expr {
         Expr::Cast { expr, .. } | Expr::Nested(expr) => unwrap_casts(expr),
         other => other,
     }
 }
 
-/// The expression positions of a `SELECT` that can hold a nested query and are
-/// not already swept elsewhere.
-///
-/// `WHERE` and `HAVING` are deliberately absent: they go through
-/// `rewrite_predicate`, which sweeps them as part of rewriting them. Listing
-/// them here as well would walk each of their subqueries twice.
-fn select_expressions(select: &mut Select) -> impl Iterator<Item = &mut Expr> {
-    let projection = select.projection.iter_mut().filter_map(|item| match item {
-        SelectItem::UnnamedExpr(expr) | SelectItem::ExprWithAlias { expr, .. } => Some(expr),
-        SelectItem::QualifiedWildcard(..) | SelectItem::Wildcard(_) => None,
-    });
-    let group_by = match &mut select.group_by {
-        GroupByExpr::Expressions(exprs, _) => Some(exprs.iter_mut()),
-        GroupByExpr::All(_) => None,
-    };
-    let join_constraints = select.from.iter_mut().flat_map(|table| {
-        table.joins.iter_mut().filter_map(|join| join_condition(&mut join.join_operator))
-    });
-    projection.chain(group_by.into_iter().flatten()).chain(join_constraints)
-}
-
-/// The plaintext a literal expression stands for, or `None` when it is not a
-/// literal at all. For BYTEA-form columns a `\x`-prefixed string is
-/// Postgres' hex input syntax, so it denotes the bytes it encodes rather than
-/// its own characters — sealing it verbatim would round-trip the hex text.
-///
-/// Every string-literal syntax Postgres accepts is matched, not just the
-/// ordinary `'...'` one. Missing any of them is a fail-open under the default
-/// `on_unprotected = "warn"`: the literal falls through to the
-/// [`Unprotected::UnsupportedValue`] gate, which under `warn` forwards the
-/// statement verbatim and lets the server store the plaintext. `E'...'` is the
-/// one that matters most in practice — many drivers emit it automatically for
-/// any string containing a backslash, so it needs no unusual client to reach.
-///
-/// Each variant carries content sqlparser has already *decoded*, which is what
-/// makes one shared handler correct: `E'o\'brien'` arrives as `o'brien` and
-/// `U&'d\0061t\+000061'` as `data`, so the bytes sealed are the bytes the
-/// server would have stored. `U&'...' UESCAPE '!'` is the sole gap and it does
-/// not reach here at all — sqlparser 0.53 cannot parse it, so it is caught
-/// earlier as [`Unprotected::Unparseable`] rather than silently mis-sealed.
-fn literal_plaintext(expr: &Expr, wire: WireForm) -> Option<Vec<u8>> {
-    match unwrap_casts(expr) {
-        Expr::Value(
-            Value::SingleQuotedString(s)
-            | Value::EscapedStringLiteral(s)
-            | Value::UnicodeStringLiteral(s)
-            | Value::NationalStringLiteral(s),
-        ) => Some(text_plaintext(s, wire)),
-        Expr::Value(Value::DollarQuotedString(s)) => Some(text_plaintext(&s.value, wire)),
-        Expr::Value(Value::Number(n, _)) => Some(n.as_bytes().to_vec()),
-        // A signed number is a `UnaryOp` over a `Number`, never a `Number` with
-        // the sign inside it. Missing that made `WHERE id = -1` name no row key
-        // at all, so a row with an ordinary negative key fell through to the
-        // `RowKeyMissing` gate and sealed cell-only under `warn` (SEC-11).
-        Expr::UnaryOp { op: UnaryOperator::Minus, expr } => match unwrap_casts(expr) {
-            Expr::Value(Value::Number(n, _)) => Some(format!("-{n}").into_bytes()),
-            _ => None,
-        },
-        Expr::UnaryOp { op: UnaryOperator::Plus, expr } => match unwrap_casts(expr) {
-            Expr::Value(Value::Number(n, _)) => Some(n.as_bytes().to_vec()),
-            _ => None,
-        },
-        _ => None,
-    }
-}
-
 /// The plaintext a piece of text stands for — shared by SQL literals and text
 /// format array elements, which read `\x` the same way.
-fn text_plaintext(text: &str, wire: WireForm) -> Vec<u8> {
+pub(super) fn text_plaintext(text: &str, wire: WireForm) -> Vec<u8> {
     match wire {
         WireForm::Bytea => text
             .strip_prefix("\\x")
@@ -2132,14 +537,27 @@ impl RewriteOutcome {
 }
 
 #[cfg(test)]
-mod tests {
+pub(in crate::encrypt) mod tests {
+    use std::borrow::Cow;
+    use std::sync::atomic::Ordering;
+
+    use sqlparser::ast::Ident;
+
     use super::array::tests::binary_array;
+    use super::lexer::parse_sql;
     use super::*;
     use crate::columns::ProtectedColumn;
+    use crate::rowkey;
     use crate::rows::tests::transform;
+    use crate::session::FrameAction;
     use dbsec_core::blind_index;
+    use dbsec_core::pgwire;
 
-    fn column(name: &str, transform: Arc<dyn FieldTransform>, searchable: bool) -> ProtectedColumn {
+    pub(in crate::encrypt) fn column(
+        name: &str,
+        transform: Arc<dyn FieldTransform>,
+        searchable: bool,
+    ) -> ProtectedColumn {
         ProtectedColumn {
             schema: "public".into(),
             table: "users".into(),
@@ -2151,7 +569,7 @@ mod tests {
         }
     }
 
-    fn catalog(searchable: bool) -> Arc<WriteCatalog> {
+    pub(in crate::encrypt) fn catalog(searchable: bool) -> Arc<WriteCatalog> {
         Arc::new(WriteCatalog::new(
             &[column("email", transform(searchable), searchable)],
             OnUnprotected::Warn,
@@ -2162,7 +580,7 @@ mod tests {
     /// stored form is deterministic but it is not the plaintext, so a
     /// predicate over one matches nothing just as an unsearchable `encrypt`
     /// column does.
-    fn fpe_transform() -> Arc<dyn FieldTransform> {
+    pub(in crate::encrypt) fn fpe_transform() -> Arc<dyn FieldTransform> {
         Arc::new(dbsec_core::transform::FpeTransform::new(
             Arc::new(crate::rows::tests::OneKey),
             "public.users.email".to_owned(),
@@ -2170,7 +588,7 @@ mod tests {
         ))
     }
 
-    fn token_transform() -> Arc<dyn FieldTransform> {
+    pub(in crate::encrypt) fn token_transform() -> Arc<dyn FieldTransform> {
         Arc::new(dbsec_core::transform::TokenTransform::new(
             Arc::new(crate::rows::tests::OneKey),
             "public.users.email".to_owned(),
@@ -2179,7 +597,7 @@ mod tests {
 
     /// A catalog holding one column with an arbitrary transform, so the
     /// predicate tests can cover every kind under both policies.
-    fn catalog_of(
+    pub(in crate::encrypt) fn catalog_of(
         transform: Arc<dyn FieldTransform>,
         searchable: bool,
         on_unprotected: OnUnprotected,
@@ -2189,7 +607,9 @@ mod tests {
 
     /// Two protected tables that both carry a searchable `email`, so an
     /// unqualified `email` in a query joining them resolves to neither.
-    fn ambiguous_catalog(on_unprotected: OnUnprotected) -> Arc<WriteCatalog> {
+    pub(in crate::encrypt) fn ambiguous_catalog(
+        on_unprotected: OnUnprotected,
+    ) -> Arc<WriteCatalog> {
         let mut accounts = column("email", transform(true), true);
         accounts.table = "accounts".into();
         let users = column("email", transform(true), true);
@@ -2218,7 +638,7 @@ mod tests {
         ))
     }
 
-    fn strict_catalog(searchable: bool) -> Arc<WriteCatalog> {
+    pub(in crate::encrypt) fn strict_catalog(searchable: bool) -> Arc<WriteCatalog> {
         Arc::new(WriteCatalog::new(
             &[column("email", transform(searchable), searchable)],
             OnUnprotected::Reject,
@@ -2228,7 +648,7 @@ mod tests {
     /// A rewriter with extended-protocol state of its own; tests that also
     /// drive the read path build the [`SessionPortals`] themselves and share
     /// it (see `rows::tests::session`).
-    fn rewriter(catalog: Arc<WriteCatalog>) -> QueryRewriter {
+    pub(in crate::encrypt) fn rewriter(catalog: Arc<WriteCatalog>) -> QueryRewriter {
         QueryRewriter::new(
             catalog,
             SessionPortals::new(),
@@ -2272,7 +692,7 @@ mod tests {
         )
     }
 
-    fn query_frame(sql: &str) -> Vec<u8> {
+    pub(in crate::encrypt) fn query_frame(sql: &str) -> Vec<u8> {
         let mut body = sql.as_bytes().to_vec();
         body.push(0);
         body
@@ -2280,7 +700,10 @@ mod tests {
 
     /// The SQL a Query frame was rewritten into, or `None` when it was
     /// relayed untouched.
-    fn rewritten_query(rewriter: &mut QueryRewriter, sql: &str) -> Option<String> {
+    pub(in crate::encrypt) fn rewritten_query(
+        rewriter: &mut QueryRewriter,
+        sql: &str,
+    ) -> Option<String> {
         match rewriter.on_frame(b'Q', &query_frame(sql)).unwrap() {
             FrameAction::Relay => None,
             FrameAction::Replace(body) => {
@@ -2293,7 +716,7 @@ mod tests {
     }
 
     /// The ErrorResponse text of a refused frame.
-    fn refusal(action: &FrameAction) -> String {
+    pub(in crate::encrypt) fn refusal(action: &FrameAction) -> String {
         let FrameAction::Reply(bytes) = action else { panic!("expected a refusal") };
         assert_eq!(bytes[0], b'E', "first frame is an ErrorResponse");
         String::from_utf8_lossy(bytes).into_owned()
@@ -2301,122 +724,24 @@ mod tests {
 
     /// How a sealed BYTEA value appears in rewritten SQL: the escape-string
     /// literal [`bytea_literal`] emits, with its backslash doubled.
-    const SEALED_PREFIX: &str = r"E'\\x";
+    pub(in crate::encrypt) const SEALED_PREFIX: &str = r"E'\\x";
 
-    fn sealed_literal(value: &[u8]) -> String {
+    pub(in crate::encrypt) fn sealed_literal(value: &[u8]) -> String {
         format!("{SEALED_PREFIX}{}'", hex::encode(value))
     }
 
     /// Extracts the sealed hex literal out of a rewritten statement and
     /// opens it.
-    fn open_hex_literal(sql: &str, searchable: bool) -> Vec<u8> {
+    pub(in crate::encrypt) fn open_hex_literal(sql: &str, searchable: bool) -> Vec<u8> {
         let stored = hex::decode(sealed_hex(sql).expect("hex literal")).unwrap();
         transform(searchable).open(&stored, None).unwrap().expect("opens")
     }
 
     /// The hex digits of the first sealed literal in a rewritten statement.
-    fn sealed_hex(sql: &str) -> Option<&str> {
+    pub(in crate::encrypt) fn sealed_hex(sql: &str) -> Option<&str> {
         let start = sql.find(SEALED_PREFIX)? + SEALED_PREFIX.len();
         let end = sql[start..].find('\'')? + start;
         Some(&sql[start..end])
-    }
-
-    #[test]
-    fn insert_literal_is_sealed() {
-        let mut rewriter = rewriter(catalog(false));
-        let sql = rewritten_query(
-            &mut rewriter,
-            "INSERT INTO users (id, email) VALUES (1, 'alice@example.com')",
-        )
-        .expect("rewritten");
-        assert!(!sql.contains("alice@example.com"));
-        assert_eq!(open_hex_literal(&sql, false), b"alice@example.com");
-    }
-
-    #[test]
-    fn update_literal_is_sealed_and_searchable_gets_index() {
-        let mut rewriter = rewriter(catalog(true));
-        let sql = rewritten_query(
-            &mut rewriter,
-            "UPDATE users SET email = 'bob@example.com' WHERE id = 7",
-        )
-        .expect("rewritten");
-        assert!(!sql.contains("bob@example.com"));
-        assert_eq!(open_hex_literal(&sql, true), b"bob@example.com");
-
-        // The stored form carries the blind index.
-        let stored = hex::decode(sealed_hex(&sql).unwrap()).unwrap();
-        let (index, _) = blind_index::split(&stored).unwrap();
-        assert_eq!(index, blind_index::compute(&crate::rows::tests::INDEX_KEY, b"bob@example.com"));
-    }
-
-    /// psycopg (client-side binding, and psycopg2 always) renders a bytes
-    /// parameter as `'\x…'::bytea`: the cast has to be seen through, and the
-    /// hex decoded, or the column would store the hex text — or plaintext.
-    #[test]
-    fn cast_wrapped_bytea_literals_are_sealed_as_the_bytes_they_denote() {
-        let mut rewriter = rewriter(catalog(false));
-        let hex = hex::encode("alice@example.com");
-        let sql = rewritten_query(
-            &mut rewriter,
-            &format!("INSERT INTO users (email) VALUES ('\\x{hex}'::bytea)"),
-        )
-        .expect("rewritten");
-        assert!(!sql.contains(&hex), "the plaintext bytes are still on the wire: {sql}");
-        assert_eq!(open_hex_literal(&sql, false), b"alice@example.com");
-    }
-
-    /// Postgres has five string-literal syntaxes and only one of them is
-    /// `'...'`. Each of the others reached the `UnsupportedValue` gate, which
-    /// under the default `warn` forwards the statement verbatim — so the
-    /// server decoded the literal and stored the plaintext in a column the
-    /// operator had marked protected.
-    ///
-    /// Each case asserts on the *decoded* content, which is the part that
-    /// makes this more than a variant list: `E'o\'brien'` must seal
-    /// `o'brien`, not the source text, or the column would round-trip a
-    /// backslash the client never sent.
-    #[test]
-    fn every_postgres_string_literal_syntax_is_sealed() {
-        for (literal, plaintext) in [
-            (r"E'o\'brien@secret.test'", "o'brien@secret.test"),
-            (r"E'tab\there@secret.test'", "tab\there@secret.test"),
-            ("$$alice@secret.test$$", "alice@secret.test"),
-            ("$tag$bob@secret.test$tag$", "bob@secret.test"),
-            (r"U&'d\0061ve@secret.test'", "dave@secret.test"),
-            ("N'nina@secret.test'", "nina@secret.test"),
-        ] {
-            let mut rewriter = rewriter(catalog(false));
-            let sql = rewritten_query(
-                &mut rewriter,
-                &format!("INSERT INTO users (id, email) VALUES (1, {literal})"),
-            )
-            .unwrap_or_else(|| panic!("{literal} was not rewritten at all"));
-
-            assert!(!sql.contains("secret.test"), "{literal} left plaintext on the wire: {sql}");
-            assert_eq!(
-                open_hex_literal(&sql, false),
-                plaintext.as_bytes(),
-                "{literal} sealed the wrong bytes"
-            );
-        }
-    }
-
-    /// `E'\\x41'` decodes to the four characters `\x41`, which for a BYTEA
-    /// column is Postgres' hex input syntax for one byte. The decode and the
-    /// hex read have to compose in that order, or the column stores the
-    /// literal text instead of the byte it denotes.
-    #[test]
-    fn an_escape_string_holding_bytea_hex_syntax_seals_the_bytes_it_denotes() {
-        let mut rewriter = rewriter(catalog(false));
-        let hex = hex::encode("alice@secret.test");
-        let sql = rewritten_query(
-            &mut rewriter,
-            &format!(r"INSERT INTO users (email) VALUES (E'\\x{hex}')"),
-        )
-        .expect("rewritten");
-        assert!(!sql.contains(&hex), "the plaintext bytes are still on the wire: {sql}");
-        assert_eq!(open_hex_literal(&sql, false), b"alice@secret.test");
     }
 
     #[test]
@@ -2527,79 +852,6 @@ mod tests {
     }
 
     #[test]
-    fn text_shaped_transforms_seal_as_plain_literals_and_params() {
-        use crate::rows::tests::OneKey;
-        use dbsec_core::transform::{FpeTransform, TokenTransform};
-
-        let fpe: Arc<dyn FieldTransform> =
-            Arc::new(FpeTransform::new(Arc::new(OneKey), "public.users.phone".into(), true));
-        let token: Arc<dyn FieldTransform> =
-            Arc::new(TokenTransform::new(Arc::new(OneKey), "public.users.ssn".into()));
-        let catalog = Arc::new(WriteCatalog::new(
-            &[column("phone", fpe.clone(), false), column("ssn", token.clone(), false)],
-            OnUnprotected::Warn,
-        ));
-        let mut rewriter = rewriter(catalog);
-
-        // FPE literal keeps its digit shape — no \x hex, no plaintext.
-        let sql = rewritten_query(
-            &mut rewriter,
-            "INSERT INTO users (phone, ssn) VALUES ('555-867-5309', 'abc')",
-        )
-        .expect("rewritten");
-        assert!(!sql.contains("555-867-5309") && !sql.contains("\\x"), "{sql}");
-        let pseudonym = sql.split('\'').nth(1).expect("first literal");
-        assert_eq!(pseudonym.len(), 12);
-        assert_eq!(&pseudonym[3..4], "-");
-        assert_eq!(fpe.open(pseudonym.as_bytes(), None).unwrap().unwrap(), b"555-867-5309");
-        // Token literal is the 64-char hex HMAC.
-        let token_literal = sql.split('\'').nth(3).expect("second literal");
-        assert_eq!(token_literal.len(), 64);
-        assert_eq!(token_literal.as_bytes(), token.seal(b"abc", None).unwrap().as_slice());
-
-        // Bound text-format param for an FPE column stays digit-shaped.
-        let parse = pgwire::encode_parse(
-            b"s1",
-            b"UPDATE users SET phone = $1 WHERE id = $2",
-            &0i16.to_be_bytes(),
-        );
-        assert!(matches!(rewriter.on_frame(b'P', &parse).unwrap(), FrameAction::Relay));
-        let bind = pgwire::encode_bind(
-            b"",
-            b"s1",
-            &[],
-            &[
-                Some(Cow::Borrowed(b"555-867-5309".as_slice())),
-                Some(Cow::Borrowed(b"7".as_slice())),
-            ],
-            &0i16.to_be_bytes(),
-        )
-        .unwrap();
-        let FrameAction::Replace(rewritten) = rewriter.on_frame(b'B', &bind).unwrap() else {
-            panic!("bind not rewritten")
-        };
-        let bound = pgwire::parse_bind(&rewritten).unwrap();
-        let sealed = bound.params[0].unwrap();
-        assert!(!sealed.starts_with(b"\\x"));
-        assert_eq!(fpe.open(sealed, None).unwrap().unwrap(), b"555-867-5309");
-        assert_eq!(bound.params[1], Some(b"7".as_slice()));
-    }
-
-    #[test]
-    fn fpe_seal_of_tiny_domain_fails_closed() {
-        use crate::rows::tests::OneKey;
-        use dbsec_core::transform::FpeTransform;
-
-        let fpe: Arc<dyn FieldTransform> =
-            Arc::new(FpeTransform::new(Arc::new(OneKey), "public.users.pin".into(), true));
-        let catalog =
-            Arc::new(WriteCatalog::new(&[column("pin", fpe, false)], OnUnprotected::Warn));
-        let mut rewriter = rewriter(catalog);
-        let body = query_frame("INSERT INTO users (pin) VALUES ('1234')");
-        assert!(rewriter.on_frame(b'Q', &body).is_err());
-    }
-
-    #[test]
     fn searchable_equality_rewrites_to_index_prefix_match() {
         use crate::rows::tests::INDEX_KEY;
 
@@ -2623,65 +875,6 @@ mod tests {
         .expect("rewritten");
         assert!(!sql.contains("bob@x.io") && !sql.contains("c@y.io"), "{sql}");
         assert_eq!(sql.matches("SUBSTRING(u.email FROM 1 FOR 32)").count(), 2, "{sql}");
-    }
-
-    /// A parenthesised join is one `TableFactor::NestedJoin` holding the whole
-    /// join, not the two `Table` factors the same query has without the
-    /// parentheses. The scope walk stopped at the top level, so every
-    /// protected table inside them was invisible: the equality was relayed
-    /// comparing the client's plaintext against the stored
-    /// `blind_index || envelope`, which matches no row and reads as "no such
-    /// user" — reached by adding one pair of parentheses.
-    #[test]
-    fn a_parenthesized_join_puts_its_protected_tables_in_scope() {
-        use crate::rows::tests::INDEX_KEY;
-
-        let mut rewriter = rewriter(catalog(true));
-        let expected = blind_index::compute(&INDEX_KEY, b"alice@example.com");
-
-        for sql in [
-            // The enclosing predicate.
-            "SELECT 1 FROM (users JOIN orders ON orders.id = users.id) \
-             WHERE users.email = 'alice@example.com'",
-            // A join constraint *inside* the parentheses.
-            "SELECT 1 FROM (orders JOIN users ON users.email = 'alice@example.com')",
-            // A derived table nested inside them, with its own predicate.
-            "SELECT 1 FROM (orders JOIN (SELECT id FROM users WHERE \
-             email = 'alice@example.com') s ON s.id = orders.id)",
-            // Nested twice over, and reached through an UPDATE's FROM rather
-            // than a SELECT's.
-            "UPDATE orders SET total = 1 FROM ((users JOIN accounts ON accounts.id = users.id)) \
-             WHERE users.email = 'alice@example.com'",
-        ] {
-            let rewritten = rewritten_query(&mut rewriter, sql).unwrap_or_else(|| {
-                panic!("relayed verbatim instead of rewritten: {sql}");
-            });
-            assert!(!rewritten.contains("alice@example.com"), "{sql}: {rewritten}");
-            assert!(rewritten.contains(&sealed_literal(&expected)), "{sql}: {rewritten}");
-        }
-    }
-
-    /// The other half of the same gap: a shape no blind index can answer, over
-    /// a table only the parenthesised join brings into scope, has to reach
-    /// [`QueryRewriter::unprotected`] — otherwise `reject` does not fail closed
-    /// for this syntax and the comparison is relayed to match nothing.
-    #[test]
-    fn an_unrewritable_predicate_inside_a_parenthesized_join_is_refused() {
-        let mut strict = rewriter(strict_catalog(true));
-        for sql in [
-            "SELECT 1 FROM (users JOIN orders ON orders.id = users.id) \
-             WHERE users.email LIKE 'a%'",
-            "SELECT 1 FROM (orders JOIN users ON users.email > 'a')",
-            "SELECT 1 FROM (orders JOIN (SELECT id FROM users WHERE email LIKE 'a%') s \
-             ON s.id = orders.id)",
-        ] {
-            let action = strict.on_frame(b'Q', &query_frame(sql)).unwrap();
-            assert!(
-                refusal(&action).contains("searchable column email"),
-                "{sql}: {}",
-                refusal(&action)
-            );
-        }
     }
 
     #[test]
@@ -2976,123 +1169,6 @@ mod tests {
             assert!(message.contains("dbsec refused this statement"), "{what}: {message}");
             let FrameAction::Reply(bytes) = &action else { unreachable!() };
             assert_eq!(bytes[bytes.len() - 6], b'Z', "{what}: ReadyForQuery follows the error");
-        }
-    }
-
-    /// Row-wise `SET (a, b) = (x, y)` is standard Postgres and parses to its
-    /// own `AssignmentTarget::Tuple`, which the assignment loop used to drop on
-    /// a `continue`. The single-element form is covered too: it parses as a
-    /// grouping paren rather than a tuple, so it takes a different arm.
-    #[test]
-    fn row_wise_tuple_assignment_is_sealed() {
-        for sql in [
-            "UPDATE users SET (email, id) = ('alice@secret.test', 5)",
-            "UPDATE users SET (id, email) = (5, 'alice@secret.test')",
-            "UPDATE users SET (email) = ('alice@secret.test')",
-            "UPDATE users SET (u.email, id) = ('alice@secret.test', 5)",
-        ] {
-            let mut rewriter = rewriter(catalog(false));
-            let rewritten = rewritten_query(&mut rewriter, sql)
-                .unwrap_or_else(|| panic!("not rewritten at all: {sql}"));
-            assert!(!rewritten.contains("alice@secret.test"), "plaintext on the wire: {rewritten}");
-            assert_eq!(open_hex_literal(&rewritten, false), b"alice@secret.test", "{sql}");
-        }
-    }
-
-    #[test]
-    fn row_wise_tuple_assignment_gets_the_blind_index_when_searchable() {
-        let mut rewriter = rewriter(catalog(true));
-        let sql =
-            rewritten_query(&mut rewriter, "UPDATE users SET (email, id) = ('bob@secret.test', 5)")
-                .expect("rewritten");
-        assert_eq!(open_hex_literal(&sql, true), b"bob@secret.test");
-
-        let stored = hex::decode(sealed_hex(&sql).unwrap()).unwrap();
-        let (index, _) = blind_index::split(&stored).unwrap();
-        assert_eq!(index, blind_index::compute(&crate::rows::tests::INDEX_KEY, b"bob@secret.test"));
-    }
-
-    /// `seal_assignments` is shared, so the upsert action takes the same path.
-    #[test]
-    fn row_wise_tuple_assignment_in_on_conflict_is_sealed() {
-        let mut rewriter = rewriter(catalog(false));
-        let sql = rewritten_query(
-            &mut rewriter,
-            "INSERT INTO users (id, email) VALUES (1, 'carol@secret.test') \
-             ON CONFLICT (id) DO UPDATE SET (email, id) = ('dave@secret.test', 5)",
-        )
-        .expect("rewritten");
-        assert!(!sql.contains("carol@secret.test"), "the inserted value leaked: {sql}");
-        assert!(!sql.contains("dave@secret.test"), "the upsert value leaked: {sql}");
-        assert_eq!(sql.matches(SEALED_PREFIX).count(), 2, "both values sealed: {sql}");
-    }
-
-    /// A tuple whose value side cannot be paired element-wise. Each of these
-    /// is valid enough to parse, so without an explicit signal it would fall
-    /// through to a plaintext write with nothing in the log.
-    #[test]
-    fn unpairable_tuple_assignment_is_a_site_and_is_refused() {
-        for (sql, expected) in [
-            ("UPDATE users SET (email, id) = (SELECT a, b FROM other)", "subquery"),
-            ("UPDATE users SET (email, id) = ROW('alice@secret.test', 5)", "function call"),
-            // Both parse cleanly; Postgres rejects them at execution time.
-            // Pairing by the shorter side would have sealed `email` regardless.
-            ("UPDATE users SET (email, id) = ('only-one')", "does not match the column list"),
-            (
-                "UPDATE users SET (email) = ('alice@secret.test', 5)",
-                "does not match the column list",
-            ),
-        ] {
-            let mut strict = rewriter(strict_catalog(false));
-            let action = strict.on_frame(b'Q', &query_frame(sql)).unwrap();
-            let refusal = refusal(&action);
-            assert!(refusal.contains(expected), "{sql}\n  refusal was: {refusal}");
-            assert!(!refusal.contains("secret.test"), "the refusal leaked plaintext: {refusal}");
-        }
-    }
-
-    /// A tuple target naming no protected column is left exactly alone — the
-    /// new arm must not turn ordinary row-wise updates into refusals.
-    #[test]
-    fn tuple_assignment_over_unprotected_columns_is_untouched() {
-        let mut strict = rewriter(strict_catalog(false));
-        let action = strict
-            .on_frame(b'Q', &query_frame("UPDATE users SET (id, name) = (5, 'nobody')"))
-            .unwrap();
-        assert!(matches!(action, FrameAction::Relay), "relayed untouched");
-    }
-
-    /// The invariant this finding broke, stated directly: under *either*
-    /// policy the plaintext must not reach the backend. `warn` seals it and
-    /// relays the rewrite; `reject` answers the client instead. Before the
-    /// fix `warn` relayed the plaintext verbatim and `reject` did too, because
-    /// the statement never reached the reject decision.
-    #[test]
-    fn a_tuple_assignment_never_puts_plaintext_on_the_backend_wire() {
-        let sql = "UPDATE users SET (email, id) = ('alice@secret.test', 5)";
-
-        let mut warn = rewriter(catalog(false));
-        match warn.on_frame(b'Q', &query_frame(sql)).unwrap() {
-            FrameAction::Replace(body) => {
-                let text = String::from_utf8_lossy(&body).into_owned();
-                assert!(!text.contains("alice@secret.test"), "warn relayed plaintext: {text}");
-            }
-            other => panic!("warn must rewrite and relay, got {other:?}"),
-        }
-
-        let mut strict = rewriter(strict_catalog(false));
-        match strict.on_frame(b'Q', &query_frame(sql)).unwrap() {
-            // Sealing succeeds under reject too — there is nothing to refuse.
-            FrameAction::Replace(body) => {
-                let text = String::from_utf8_lossy(&body).into_owned();
-                assert!(!text.contains("alice@secret.test"), "reject relayed plaintext: {text}");
-            }
-            FrameAction::Reply(bytes) => {
-                assert_eq!(bytes[0], b'E');
-                let text = String::from_utf8_lossy(&bytes).into_owned();
-                assert!(!text.contains("alice@secret.test"), "the refusal leaked: {text}");
-            }
-            other => panic!("plaintext would reach the backend: {other:?}"),
         }
     }
 
@@ -3607,541 +1683,11 @@ mod tests {
 
     // --- upsert and MERGE ------------------------------------------------
 
-    #[test]
-    fn on_conflict_do_update_seals_protected_assignments() {
-        let mut rewriter = rewriter(catalog(false));
-        let sql = rewritten_query(
-            &mut rewriter,
-            "INSERT INTO users (id, email) VALUES (1, 'a@b.io') \
-             ON CONFLICT (id) DO UPDATE SET email = 'c@d.io'",
-        )
-        .expect("rewritten");
-        assert!(!sql.contains("a@b.io") && !sql.contains("c@d.io"), "{sql}");
-        assert_eq!(sql.matches(SEALED_PREFIX).count(), 2, "both values sealed: {sql}");
-
-        // A bound placeholder in the conflict action is sealed at Bind time.
-        let parse = pgwire::encode_parse(
-            b"up",
-            b"INSERT INTO users (id, email) VALUES ($1, $2) \
-              ON CONFLICT (id) DO UPDATE SET email = $3",
-            &0i16.to_be_bytes(),
-        );
-        assert!(matches!(rewriter.on_frame(b'P', &parse).unwrap(), FrameAction::Relay));
-        let bind = pgwire::encode_bind(
-            b"",
-            b"up",
-            &[],
-            &[
-                Some(Cow::Borrowed(b"1".as_slice())),
-                Some(Cow::Borrowed(b"a@b.io".as_slice())),
-                Some(Cow::Borrowed(b"c@d.io".as_slice())),
-            ],
-            &0i16.to_be_bytes(),
-        )
-        .unwrap();
-        let FrameAction::Replace(rewritten) = rewriter.on_frame(b'B', &bind).unwrap() else {
-            panic!("bind not rewritten")
-        };
-        let bound = pgwire::parse_bind(&rewritten).unwrap();
-        for (index, expected) in [(1, b"a@b.io".as_slice()), (2, b"c@d.io".as_slice())] {
-            let stored =
-                hex::decode(bound.params[index].unwrap().strip_prefix(b"\\x").unwrap()).unwrap();
-            assert_eq!(transform(false).open(&stored, None).unwrap().unwrap(), expected);
-        }
-    }
-
-    /// The conflict action carries a `WHERE` of its own, and it is a predicate
-    /// over the target table exactly like an UPDATE's. Dropping it left a
-    /// searchable equality there comparing plaintext against the stored
-    /// `blind_index || envelope`: no rewrite, no signal, no rows.
-    #[test]
-    fn a_searchable_predicate_in_a_do_update_where_is_rewritten_or_signalled() {
-        let mut qualified = rewriter(catalog(true));
-        let sql = rewritten_query(
-            &mut qualified,
-            "INSERT INTO users (id) VALUES (1) \
-             ON CONFLICT (id) DO UPDATE SET id = 2 WHERE users.email = 'a@b.io'",
-        )
-        .expect("rewritten");
-        assert!(!sql.contains("a@b.io"), "{sql}");
-        assert!(sql.contains("FROM 1 FOR 32"), "{sql}");
-
-        // The alias an `INSERT INTO t AS x` gives the target is the only name
-        // its conflict-action predicate can qualify with.
-        let mut aliased = rewriter(catalog(true));
-        let sql = rewritten_query(
-            &mut aliased,
-            "INSERT INTO users AS u (id) VALUES (1) \
-             ON CONFLICT (id) DO UPDATE SET id = 2 WHERE u.email = 'a@b.io'",
-        )
-        .expect("rewritten");
-        assert!(!sql.contains("a@b.io") && sql.contains("FROM 1 FOR 32"), "{sql}");
-
-        // And a shape no index can answer is a gate, not a silent relay.
-        let mut strict = rewriter(strict_catalog(true));
-        let action = strict
-            .on_frame(
-                b'Q',
-                &query_frame(
-                    "INSERT INTO users (id) VALUES (1) \
-                     ON CONFLICT (id) DO UPDATE SET id = 2 WHERE email LIKE 'a%'",
-                ),
-            )
-            .unwrap();
-        assert!(refusal(&action).contains("searchable column email"));
-    }
-
-    /// `SET col = EXCLUDED.col` re-stores the value this proxy sealed in the
-    /// same statement's VALUES list, so it is neither sealed again nor
-    /// refused — refusing the canonical upsert is what keeps operators off
-    /// `reject`. The whitelist stops there: every reference that is not
-    /// provably already sealed is still a site.
-    #[test]
-    fn the_canonical_upsert_re_stores_the_value_it_just_sealed() {
-        let sql = "INSERT INTO users (id, email) VALUES (1, 'a@b.io') \
-                   ON CONFLICT (id) DO UPDATE SET email = EXCLUDED.email";
-
-        let mut permissive = rewriter(catalog(false));
-        let rewritten = rewritten_query(&mut permissive, sql).expect("rewritten");
-        assert!(!rewritten.contains("a@b.io"), "{rewritten}");
-        assert_eq!(
-            rewritten.matches(SEALED_PREFIX).count(),
-            1,
-            "only the VALUES literal: {rewritten}"
-        );
-        assert!(rewritten.contains("EXCLUDED.email"), "{rewritten}");
-
-        let mut strict = rewriter(strict_catalog(false));
-        assert!(
-            matches!(strict.on_frame(b'Q', &query_frame(sql)).unwrap(), FrameAction::Replace(_)),
-            "the canonical upsert must not be refused under reject"
-        );
-
-        // Row-wise, the same statement takes the tuple path.
-        let mut strict = rewriter(strict_catalog(false));
-        let action = strict
-            .on_frame(
-                b'Q',
-                &query_frame(
-                    "INSERT INTO users (id, email) VALUES (1, 'a@b.io') \
-                     ON CONFLICT (id) DO UPDATE SET (email) = (EXCLUDED.email)",
-                ),
-            )
-            .unwrap();
-        assert!(matches!(action, FrameAction::Replace(_)), "row-wise upsert refused");
-
-        for refused in [
-            // Not listed by the INSERT, so `EXCLUDED.email` is the column's
-            // own default and nothing sealed it.
-            "INSERT INTO users (id) VALUES (1) \
-             ON CONFLICT (id) DO UPDATE SET email = EXCLUDED.email",
-            // A different column: sealed, if at all, under another transform.
-            "INSERT INTO users (id, email) VALUES (1, 'a@b.io') \
-             ON CONFLICT (id) DO UPDATE SET email = EXCLUDED.id",
-            // Not the EXCLUDED relation at all.
-            "INSERT INTO users (id, email) VALUES (1, 'a@b.io') \
-             ON CONFLICT (id) DO UPDATE SET email = users.name",
-        ] {
-            let mut strict = rewriter(strict_catalog(false));
-            let action = strict.on_frame(b'Q', &query_frame(refused)).unwrap();
-            assert!(refusal(&action).contains("protected column email"), "{refused}");
-        }
-    }
-
-    /// The conflict action is reached even when the INSERT's own column list
-    /// has nothing protected in it.
-    #[test]
-    fn on_conflict_do_update_is_reached_without_protected_insert_columns() {
-        let mut rewriter = rewriter(catalog(false));
-        let sql = rewritten_query(
-            &mut rewriter,
-            "INSERT INTO users (id) VALUES (1) ON CONFLICT (id) DO UPDATE SET email = 'x@y.io'",
-        )
-        .expect("rewritten");
-        assert!(!sql.contains("x@y.io"), "{sql}");
-    }
-
     // --- search_path -----------------------------------------------------
-
-    /// The mis-protection direction: a bare name in a session that moved
-    /// `search_path` must not be sealed for `public.users`, because the value
-    /// would land in a table the read path never resolves.
-    #[test]
-    fn moved_search_path_stops_sealing_unqualified_names() {
-        let mut rewriter = rewriter(catalog(false));
-        assert!(rewritten_query(&mut rewriter, "SET search_path TO myschema").is_none());
-        assert!(
-            rewritten_query(&mut rewriter, "INSERT INTO users (email) VALUES ('a@b.io')").is_none(),
-            "an unqualified name must not be sealed once search_path moved"
-        );
-        // Qualifying the name puts it back beyond doubt.
-        let sql =
-            rewritten_query(&mut rewriter, "INSERT INTO public.users (email) VALUES ('a@b.io')")
-                .expect("rewritten");
-        assert!(!sql.contains("a@b.io"), "{sql}");
-    }
-
-    #[test]
-    fn default_search_path_stays_trusted() {
-        let mut rewriter = rewriter(catalog(false));
-        for sql in ["SET search_path TO public", "SET search_path = \"$user\", public"] {
-            assert!(rewritten_query(&mut rewriter, sql).is_none(), "{sql}");
-        }
-        let sql = rewritten_query(&mut rewriter, "INSERT INTO users (email) VALUES ('a@b.io')")
-            .expect("rewritten");
-        assert!(!sql.contains("a@b.io"), "{sql}");
-    }
-
-    /// `set_config` is the function spelling of `SET`, and it arrives as an
-    /// ordinary `SELECT` — nothing in the parsed statement marks it as a
-    /// session change. Missing it is not a plaintext leak but a silent
-    /// mis-seal: the value is sealed for `public.users` while the row lands in
-    /// `tenant7.users`, where the read path can never find it again.
-    #[test]
-    fn set_config_moves_search_path_the_same_way_set_does() {
-        for sql in [
-            "SELECT set_config('search_path', 'tenant7', false)",
-            "SELECT pg_catalog.set_config('search_path', 'tenant7', false)",
-            "SELECT set_config('SEARCH_PATH', 'tenant7', false)",
-            // A list that no longer starts at `public`.
-            "SELECT set_config('search_path', 'tenant7, public', false)",
-            // A setting name the proxy cannot read could be `search_path`.
-            "SELECT set_config($1, $2, false)",
-            // Nested anywhere in the statement, not just the projection.
-            "SELECT id FROM users WHERE id = (SELECT set_config('search_path', 'x', false))::int",
-        ] {
-            let mut rewriter = rewriter(catalog(false));
-            assert!(rewritten_query(&mut rewriter, sql).is_none(), "{sql}");
-            assert!(
-                rewritten_query(&mut rewriter, "INSERT INTO users (email) VALUES ('a@b.io')")
-                    .is_none(),
-                "unqualified write was still sealed after: {sql}"
-            );
-        }
-    }
-
-    /// The value still has to be read: `set_config` back to the default leaves
-    /// unqualified names resolving to `public`, so the write is sealed.
-    #[test]
-    fn set_config_back_to_the_default_stays_trusted() {
-        let mut rewriter = rewriter(catalog(false));
-        assert!(rewritten_query(
-            &mut rewriter,
-            "SELECT set_config('search_path', '\"$user\", public', false)"
-        )
-        .is_none());
-        let sql = rewritten_query(&mut rewriter, "INSERT INTO users (email) VALUES ('a@b.io')")
-            .expect("rewritten");
-        assert!(!sql.contains("a@b.io"), "{sql}");
-    }
-
-    /// Reading the whole batch's tokens up front is what makes `SET SCHEMA`
-    /// and `set_config` visible at all, but a move still belongs only to the
-    /// statements after it. Flattening the batch would let a `SET` at its end
-    /// retroactively unseal the write in front of it — a plaintext write under
-    /// the default `warn`, for SQL the server executes in the other order.
-    #[test]
-    fn a_search_path_move_does_not_reach_back_over_the_writes_before_it() {
-        let mut rewriter = rewriter(catalog(false));
-        let sql = rewritten_query(
-            &mut rewriter,
-            "INSERT INTO users (email) VALUES ('a@b.io'); SET search_path TO tenant7",
-        )
-        .expect("rewritten");
-        assert!(!sql.contains("a@b.io"), "the write before the move was not sealed: {sql}");
-
-        // And it holds for everything after it, in the same batch or a later
-        // one.
-        assert!(
-            rewritten_query(&mut rewriter, "INSERT INTO users (email) VALUES ('c@d.io')").is_none(),
-            "the move did not stick"
-        );
-    }
-
-    /// The other half of the same rule: a move does reach the statements that
-    /// follow it inside its own batch.
-    #[test]
-    fn a_search_path_move_covers_the_writes_after_it_in_the_same_batch() {
-        let mut rewriter = rewriter(catalog(false));
-        assert!(
-            rewritten_query(
-                &mut rewriter,
-                "SET search_path TO tenant7; INSERT INTO users (email) VALUES ('e@f.io')",
-            )
-            .is_none(),
-            "a write after the move in the same batch must not be sealed"
-        );
-    }
-
-    /// sqlparser 0.53 cannot parse `SET SCHEMA` at all, so it reaches the
-    /// server as unparseable SQL and, under `warn`, is relayed. Reading the
-    /// token stream rather than the AST is what keeps it tracked anyway.
-    #[test]
-    fn set_schema_moves_search_path_even_though_it_does_not_parse() {
-        let mut rewriter = rewriter(catalog(false));
-        assert!(parse_sql("SET SCHEMA 'tenant7'").is_err(), "the premise of this test");
-        assert!(rewritten_query(&mut rewriter, "SET SCHEMA 'tenant7'").is_none());
-        assert!(
-            rewritten_query(&mut rewriter, "INSERT INTO users (email) VALUES ('a@b.io')").is_none(),
-            "an unqualified name must not be sealed once SET SCHEMA moved search_path"
-        );
-    }
-
-    /// `set_config` and `SET SCHEMA` are refused under `reject` exactly as
-    /// `SET search_path` is, so an operator who pinned the search_path cannot
-    /// have it moved out from under them by a spelling the proxy ignored.
-    #[test]
-    fn strict_mode_refuses_every_search_path_spelling() {
-        for sql in [
-            "SET search_path TO tenant7",
-            "SET SCHEMA 'tenant7'",
-            "SELECT set_config('search_path', 'tenant7', false)",
-        ] {
-            let mut strict = rewriter(strict_catalog(false));
-            let action = strict.on_frame(b'Q', &query_frame(sql)).unwrap();
-            assert!(refusal(&action).contains("search_path"), "{sql}");
-        }
-    }
-
-    /// The word `set_config` inside a string literal or a quoted identifier is
-    /// data, not a call: reading tokens rather than the raw text is what keeps
-    /// these from refusing working SQL under `reject`.
-    #[test]
-    fn session_settings_are_not_read_out_of_literals_or_column_names() {
-        for sql in [
-            "SELECT id FROM users WHERE note = 'set_config(''search_path'', ''x'', false)'",
-            "UPDATE audit SET search_path = 'tenant7' WHERE id = 1",
-        ] {
-            let mut strict = rewriter(strict_catalog(false));
-            assert!(
-                matches!(
-                    strict.on_frame(b'Q', &query_frame(sql)).unwrap(),
-                    FrameAction::Relay | FrameAction::Replace(_)
-                ),
-                "{sql}"
-            );
-        }
-    }
 
     // --- standard_conforming_strings ---------------------------------------
 
-    /// A sealed BYTEA value goes out as `E'\\x…'`, not `'\x…'`. The plain
-    /// spelling is PostgreSQL's hex input syntax only while
-    /// `standard_conforming_strings` is on; with it off the server applies
-    /// backslash processing first and stores something else entirely. The
-    /// escape-string form means the same bytes under either setting.
-    #[test]
-    fn sealed_bytea_literals_do_not_depend_on_standard_conforming_strings() {
-        let mut rewriter = rewriter(catalog(true));
-        let sql = rewritten_query(&mut rewriter, "UPDATE users SET email = 'bob@secret.test'")
-            .expect("rewritten");
-        let hex = sealed_hex(&sql).expect("sealed literal");
-        assert!(sql.contains(&format!(r"E'\\x{hex}'")), "{sql}");
-        assert!(
-            !sql.contains(&format!(r"'\x{hex}'")),
-            "a bare hex literal is still emitted: {sql}"
-        );
-
-        // The same holds for the blind-index literal a predicate is rewritten
-        // to, which is BYTEA whatever the column's own stored form is.
-        let sql = rewritten_query(&mut rewriter, "SELECT id FROM users WHERE email = 'a@b.io'")
-            .expect("rewritten");
-        let index = blind_index::compute(&crate::rows::tests::INDEX_KEY, b"a@b.io");
-        assert!(sql.contains(&sealed_literal(&index)), "{sql}");
-    }
-
-    /// Turning the setting off is still reported: the proxy's own reading of
-    /// the *client's* literals diverges from the server's from that point on,
-    /// which no choice of output encoding can fix.
-    #[test]
-    fn turning_standard_conforming_strings_off_is_an_unprotected_site() {
-        for sql in [
-            "SET standard_conforming_strings = off",
-            "SET standard_conforming_strings TO 'off'",
-            "SET SESSION standard_conforming_strings = false",
-            "SELECT set_config('standard_conforming_strings', 'off', false)",
-        ] {
-            let mut strict = rewriter(strict_catalog(false));
-            let action = strict.on_frame(b'Q', &query_frame(sql)).unwrap();
-            assert!(refusal(&action).contains("standard_conforming_strings"), "{sql}");
-        }
-    }
-
-    /// Under the default `warn` the session carries on, and the write that
-    /// follows is still sealed in the setting-independent form.
-    #[test]
-    fn a_write_after_standard_conforming_strings_off_is_still_sealed_readably() {
-        let mut rewriter = rewriter(catalog(false));
-        assert!(rewritten_query(&mut rewriter, "SET standard_conforming_strings = off").is_none());
-        let sql = rewritten_query(&mut rewriter, "INSERT INTO users (email) VALUES ('a@b.io')")
-            .expect("rewritten");
-        assert!(sql.contains(SEALED_PREFIX), "{sql}");
-        assert_eq!(open_hex_literal(&sql, false), b"a@b.io");
-    }
-
-    /// Once the setting is off, a literal that actually carries a backslash is
-    /// one the proxy and the server read differently. Sealing it would store
-    /// the proxy's reading, which nothing downstream could tell apart from a
-    /// correct value, so the literal is reported instead and the data stays
-    /// intact. Literals without a backslash mean the same thing either way and
-    /// are still sealed.
-    #[test]
-    fn a_backslash_literal_after_the_setting_moved_is_reported_not_guessed_at() {
-        let mut lenient = rewriter(catalog(true));
-        assert!(rewritten_query(&mut lenient, "SET standard_conforming_strings = off").is_none());
-
-        assert!(
-            rewritten_query(&mut lenient, r"INSERT INTO users (email) VALUES ('a\nb@secret.test')")
-                .is_none(),
-            "a literal the two sides read differently must not be sealed"
-        );
-        assert!(
-            rewritten_query(&mut lenient, r"SELECT id FROM users WHERE email = 'a\nb@secret.test'")
-                .is_none(),
-            "nor indexed"
-        );
-
-        // No backslash, no disagreement.
-        let sql = rewritten_query(&mut lenient, "INSERT INTO users (email) VALUES ('a@b.io')")
-            .expect("rewritten");
-        assert_eq!(open_hex_literal(&sql, true), b"a@b.io");
-
-        // Under `reject` the setting change is refused outright, so the state
-        // this guards against is unreachable in the mode that enforces the
-        // invariant.
-        let mut strict = rewriter(strict_catalog(true));
-        let action =
-            strict.on_frame(b'Q', &query_frame("SET standard_conforming_strings = off")).unwrap();
-        assert!(refusal(&action).contains("standard_conforming_strings"));
-    }
-
-    /// Turning it *on* is the state the proxy already assumes, so it is not a
-    /// site at all — a signal that fires on correct SQL stops being read.
-    #[test]
-    fn turning_standard_conforming_strings_on_is_not_reported() {
-        for sql in [
-            "SET standard_conforming_strings = on",
-            "SET standard_conforming_strings TO true",
-            "SET standard_conforming_strings = 1",
-        ] {
-            let mut strict = rewriter(strict_catalog(false));
-            assert!(
-                matches!(strict.on_frame(b'Q', &query_frame(sql)).unwrap(), FrameAction::Relay),
-                "{sql}"
-            );
-        }
-    }
-
     // --- identifier folding ------------------------------------------------
-
-    /// Rust's `to_lowercase` folds `Ä` to `ä` and the Kelvin sign to `k`;
-    /// PostgreSQL leaves every multibyte character in an unquoted identifier
-    /// alone. Folding the proxy's way meant a protected column named with a
-    /// non-ASCII letter never matched, and the write went through in plaintext.
-    #[test]
-    fn a_non_ascii_column_name_is_folded_the_way_postgres_folds_it() {
-        let catalog = Arc::new(WriteCatalog::new(
-            &[column("Ämail", transform(false), false)],
-            OnUnprotected::Warn,
-        ));
-        let mut rewriter = rewriter(catalog);
-        // Written unquoted and with the ASCII half in a different case, which
-        // is exactly what the server folds and what it does not.
-        let sql = rewritten_query(&mut rewriter, "INSERT INTO users (ÄMAIL) VALUES ('a@b.io')")
-            .expect("rewritten");
-        assert!(!sql.contains("a@b.io"), "{sql}");
-        assert_eq!(open_hex_literal(&sql, false), b"a@b.io");
-    }
-
-    /// PostgreSQL truncates every identifier to 63 bytes, so a longer name in
-    /// a query refers to the truncated catalog entry. Matching the untruncated
-    /// name meant the write was treated as unprotected.
-    #[test]
-    fn an_over_long_identifier_matches_the_name_postgres_truncated_it_to() {
-        let stored = "e".repeat(crate::config::MAX_IDENTIFIER_BYTES);
-        let catalog = Arc::new(WriteCatalog::new(
-            &[column(&stored, transform(false), false)],
-            OnUnprotected::Warn,
-        ));
-        let mut rewriter = rewriter(catalog);
-        let written = format!("{stored}toolong");
-        let sql = rewritten_query(
-            &mut rewriter,
-            &format!("INSERT INTO users ({written}) VALUES ('a@b.io')"),
-        )
-        .expect("rewritten");
-        assert_eq!(open_hex_literal(&sql, false), b"a@b.io");
-    }
-
-    /// A session that started with a `search_path` in its startup packet is
-    /// untrusted from the first statement.
-    #[test]
-    fn untrusted_session_never_seals_unqualified_names() {
-        let mut rewriter = QueryRewriter::new(
-            catalog(false),
-            SessionPortals::new(),
-            None,
-            Arc::new(AtomicU8::new(b'I')),
-            StartupSettings { search_path_trusted: false, ..StartupSettings::default() },
-        );
-        assert!(
-            rewritten_query(&mut rewriter, "INSERT INTO users (email) VALUES ('a@b.io')").is_none()
-        );
-    }
-
-    /// The other half of the same story: a startup packet that turned
-    /// `standard_conforming_strings` off leaves the session in the state a
-    /// mid-session `SET` would have left it in — reported once, on the first
-    /// statement, and with the client's own backslash literals no longer read
-    /// as the server reads them.
-    #[test]
-    fn a_startup_packet_that_turned_standard_conforming_strings_off_is_reported_once() {
-        let started_off = |catalog| {
-            QueryRewriter::new(
-                catalog,
-                SessionPortals::new(),
-                None,
-                Arc::new(AtomicU8::new(b'I')),
-                StartupSettings { escape_strings: true, ..StartupSettings::default() },
-            )
-        };
-
-        // Under `reject` the divergence is refused on the first statement,
-        // exactly as the `SET` spelling is.
-        let mut strict = started_off(strict_catalog(false));
-        let action = strict.on_frame(b'Q', &query_frame("SELECT 1")).unwrap();
-        assert!(refusal(&action).contains("standard_conforming_strings"));
-
-        // Once, though: the report is the setting moving, not every statement
-        // that follows it.
-        assert!(matches!(
-            strict.on_frame(b'Q', &query_frame("SELECT 1")).unwrap(),
-            FrameAction::Relay
-        ));
-
-        // Under `warn` the session carries on, with a literal the two sides
-        // read differently left alone rather than sealed as the proxy read it.
-        let mut lenient = started_off(catalog(true));
-        assert!(
-            rewritten_query(&mut lenient, r"INSERT INTO users (email) VALUES ('a\nb@secret.test')")
-                .is_none(),
-            "a literal the two sides read differently must not be sealed"
-        );
-        let sql = rewritten_query(&mut lenient, "INSERT INTO users (email) VALUES ('a@b.io')")
-            .expect("rewritten");
-        assert_eq!(open_hex_literal(&sql, true), b"a@b.io");
-    }
-
-    /// A startup packet that moved nothing reports nothing: a signal that fires
-    /// on a correctly configured session stops being read.
-    #[test]
-    fn a_default_startup_packet_reports_nothing() {
-        let mut strict = rewriter(strict_catalog(false));
-        assert!(matches!(
-            strict.on_frame(b'Q', &query_frame("SELECT 1")).unwrap(),
-            FrameAction::Relay
-        ));
-    }
 
     // --- SQL text fidelity -----------------------------------------------
 
@@ -4390,299 +1936,7 @@ mod tests {
         assert!(message.contains("email") && message.contains("phone"), "{message}");
     }
 
-    #[test]
-    fn join_cte_and_set_operations_are_traversed() {
-        let mut rewriter = rewriter(catalog(true));
-        for sql in [
-            "SELECT u.id FROM users u JOIN orders o ON o.id = u.id AND u.email = 'a@b.io'",
-            "WITH hits AS (SELECT id FROM users WHERE email = 'a@b.io') SELECT * FROM hits",
-            "SELECT id FROM users WHERE email = 'a@b.io' UNION SELECT id FROM orders",
-            "SELECT id FROM (SELECT id, email FROM users WHERE email = 'a@b.io') AS s",
-            "SELECT count(*) FROM users GROUP BY email HAVING email = 'a@b.io'",
-        ] {
-            let rewritten = rewritten_query(&mut rewriter, sql).unwrap_or_else(|| panic!("{sql}"));
-            assert!(!rewritten.contains("a@b.io"), "{rewritten}");
-            assert!(rewritten.contains("FROM 1 FOR 32"), "{rewritten}");
-        }
-    }
-
-    /// `UPDATE ... FROM` and `DELETE ... USING` join a second relation into
-    /// the predicate's scope, and sqlparser keeps it in a field of its own. It
-    /// used to be dropped, so a searchable column of the joined relation
-    /// resolved to nothing: the comparison went upstream verbatim, matched no
-    /// row, and never reached the gate. `DELETE FROM sessions USING users
-    /// WHERE users.email = $1` silently revoked nothing — and its `<>`
-    /// inversion deleted every session there was.
-    #[test]
-    fn the_joined_relation_of_update_from_and_delete_using_is_in_scope() {
-        for sql in [
-            "DELETE FROM sessions USING users \
-             WHERE users.email = 'a@b.io' AND sessions.user_id = users.id",
-            "UPDATE sessions SET valid = false FROM users \
-             WHERE users.email = 'a@b.io' AND sessions.user_id = users.id",
-        ] {
-            let mut permissive = rewriter(catalog(true));
-            let rewritten =
-                rewritten_query(&mut permissive, sql).unwrap_or_else(|| panic!("{sql}"));
-            assert!(!rewritten.contains("a@b.io"), "{rewritten}");
-            assert!(rewritten.contains("FROM 1 FOR 32"), "{rewritten}");
-        }
-
-        // A derived table beside the target is a query of its own, and it was
-        // walked for `SELECT` but not for these two: the equality inside it
-        // went upstream as plaintext, matching nothing and signalling nothing.
-        for sql in [
-            "DELETE FROM sessions USING (SELECT id FROM users WHERE email = 'a@b.io') s \
-             WHERE s.id = sessions.user_id",
-            "UPDATE sessions SET valid = false \
-             FROM (SELECT id FROM users WHERE email = 'a@b.io') s WHERE s.id = sessions.user_id",
-        ] {
-            let mut permissive = rewriter(catalog(true));
-            let rewritten =
-                rewritten_query(&mut permissive, sql).unwrap_or_else(|| panic!("{sql}"));
-            assert!(!rewritten.contains("a@b.io"), "{rewritten}");
-            assert!(rewritten.contains("FROM 1 FOR 32"), "{rewritten}");
-        }
-
-        // A join constraint inside that FROM/USING resolves against the same
-        // scope the WHERE does, so it is the same rewrite site — and only
-        // `rewrite_select` used to walk one, so these two left it comparing
-        // plaintext against the stored form.
-        for sql in [
-            "DELETE FROM sessions USING accounts JOIN users ON users.email = 'a@b.io'",
-            "UPDATE sessions SET valid = false FROM accounts JOIN users \
-             ON users.email = 'a@b.io'",
-        ] {
-            let mut permissive = rewriter(catalog(true));
-            let rewritten =
-                rewritten_query(&mut permissive, sql).unwrap_or_else(|| panic!("{sql}"));
-            assert!(!rewritten.contains("a@b.io"), "{rewritten}");
-            assert!(rewritten.contains("FROM 1 FOR 32"), "{rewritten}");
-        }
-
-        // The inversion is the dangerous half and no index can answer it, so
-        // it has to reach the gate rather than delete the table.
-        for sql in [
-            "DELETE FROM sessions USING users WHERE users.email <> 'a@b.io'",
-            "UPDATE sessions SET valid = false FROM users WHERE users.email LIKE 'a%'",
-            "DELETE FROM sessions USING accounts JOIN users ON users.email LIKE 'a%'",
-        ] {
-            let mut strict = rewriter(strict_catalog(true));
-            let action = strict.on_frame(b'Q', &query_frame(sql)).unwrap();
-            assert!(refusal(&action).contains("searchable column email"), "{sql}");
-        }
-    }
-
-    /// An unqualified name that two protected relations in scope both carry
-    /// cannot be rewritten — picking one would compare against the wrong
-    /// table's blind index. It used to resolve to nothing at all, which put it
-    /// on the same path as SQL that mentions no protected column: relayed
-    /// verbatim, matching no row, and never refused under `reject`. It is a
-    /// site of its own now.
-    #[test]
-    fn an_ambiguous_unqualified_searchable_column_is_a_signalled_site() {
-        for sql in [
-            "SELECT * FROM users u JOIN accounts a ON u.id = a.uid WHERE email = 'a@b.io'",
-            "SELECT * FROM users u JOIN accounts a ON u.id = a.uid WHERE email IN ('a@b.io')",
-            "SELECT * FROM users u JOIN accounts a ON u.id = a.uid WHERE email LIKE 'a%'",
-        ] {
-            let mut permissive = rewriter(ambiguous_catalog(OnUnprotected::Warn));
-            assert!(rewritten_query(&mut permissive, sql).is_none(), "ambiguity must not guess");
-
-            let mut strict = rewriter(ambiguous_catalog(OnUnprotected::Reject));
-            let action = strict.on_frame(b'Q', &query_frame(sql)).unwrap();
-            let message = refusal(&action);
-            assert!(message.contains("email") && message.contains("qualify it"), "{message}");
-        }
-
-        // Qualifying the name resolves it, and the rewrite goes ahead.
-        let mut permissive = rewriter(ambiguous_catalog(OnUnprotected::Warn));
-        let sql = rewritten_query(
-            &mut permissive,
-            "SELECT * FROM users u JOIN accounts a ON u.id = a.uid WHERE u.email = 'a@b.io'",
-        )
-        .expect("rewritten");
-        assert!(!sql.contains("a@b.io") && sql.contains("FROM 1 FOR 32"), "{sql}");
-    }
-
-    /// A shape the rewriter cannot express is a refusal site, not a silent
-    /// "no rows".
-    #[test]
-    fn unsupported_predicates_over_searchable_columns_are_signalled() {
-        for sql in [
-            "SELECT id FROM users WHERE email LIKE 'a%'",
-            "SELECT id FROM users WHERE email > 'a@b.io'",
-            "SELECT id FROM users WHERE email IN (SELECT email FROM other)",
-            "SELECT id FROM users WHERE email = ANY(SELECT email FROM other)",
-            "SELECT id FROM users WHERE email IN ('a@b.io', lower('c@d.io'))",
-            "DELETE FROM users WHERE email = lower('a@b.io')",
-        ] {
-            let mut permissive = rewriter(catalog(true));
-            assert!(rewritten_query(&mut permissive, sql).is_none(), "{sql}");
-
-            let mut strict = rewriter(strict_catalog(true));
-            let action = strict.on_frame(b'Q', &query_frame(sql)).unwrap();
-            assert!(refusal(&action).contains("searchable column email"), "{sql}");
-        }
-    }
-
-    /// A predicate over a protected column with no equality index compares the
-    /// client's plaintext against a stored form that is not the plaintext, so
-    /// it matches nothing. That is the failure `Unprotected` exists to report,
-    /// and it must fire for every non-searchable transform kind — an operator
-    /// who sets `reject` to be told about queries that cannot work gets
-    /// nothing otherwise, and "no rows" reads as "no such user".
-    #[test]
-    fn predicates_over_protected_columns_without_an_index_are_signalled() {
-        let kinds: [(&str, Arc<dyn FieldTransform>); 3] = [
-            ("encrypt (searchable = false)", transform(false)),
-            ("fpe", fpe_transform()),
-            ("token", token_transform()),
-        ];
-        for (kind, column_transform) in kinds {
-            for sql in [
-                "SELECT id FROM users WHERE email = 'a@b.io'",
-                "SELECT id FROM users WHERE 'a@b.io' = email",
-                "SELECT id FROM users WHERE email IN ('a@b.io', 'c@d.io')",
-                "SELECT id FROM users WHERE email LIKE 'a%'",
-                "DELETE FROM users WHERE email = 'a@b.io'",
-            ] {
-                let mut permissive =
-                    rewriter(catalog_of(column_transform.clone(), false, OnUnprotected::Warn));
-                assert!(
-                    rewritten_query(&mut permissive, sql).is_none(),
-                    "{kind} under warn relays: {sql}"
-                );
-
-                let mut strict =
-                    rewriter(catalog_of(column_transform.clone(), false, OnUnprotected::Reject));
-                let action = strict.on_frame(b'Q', &query_frame(sql)).unwrap();
-                let message = refusal(&action);
-                assert!(
-                    message.contains("protected column email") && message.contains("no equality"),
-                    "{kind} under reject refuses: {sql}\ngot: {message}"
-                );
-            }
-        }
-    }
-
-    /// The remedy differs by column, so the two predicate signals stay
-    /// distinct: a searchable column names its blind index, an unindexed one
-    /// names the setting that would fix it.
-    #[test]
-    fn the_two_predicate_signals_name_different_remedies() {
-        let sql = "SELECT id FROM users WHERE email LIKE 'a%'";
-
-        let mut searchable = rewriter(strict_catalog(true));
-        let message = refusal(&searchable.on_frame(b'Q', &query_frame(sql)).unwrap());
-        assert!(message.contains("searchable column email"), "{message}");
-        assert!(message.contains("blind index"), "{message}");
-
-        let mut unindexed = rewriter(strict_catalog(false));
-        let message = refusal(&unindexed.on_frame(b'Q', &query_frame(sql)).unwrap());
-        assert!(message.contains("protected column email"), "{message}");
-        assert!(message.contains("searchable = true"), "{message}");
-    }
-
-    /// A mask-only column stores the plaintext, so its predicates are correct
-    /// exactly as written and must stay silent. `WriteCatalog::new` skips
-    /// columns with no transform, which is what makes this hold.
-    #[test]
-    fn predicates_over_mask_only_columns_stay_quiet() {
-        let mask_only = ProtectedColumn {
-            schema: "public".into(),
-            table: "users".into(),
-            column: "email".into(),
-            transform: None,
-            searchable: false,
-            readable: false,
-            mask: Some(dbsec_core::mask::MaskSpec { keep_first: 1, keep_last: 0, mask_with: '*' }),
-        };
-        let catalog = Arc::new(WriteCatalog::new(&[mask_only], OnUnprotected::Reject));
-        let mut strict = rewriter(catalog);
-        for sql in [
-            "SELECT id FROM users WHERE email = 'a@b.io'",
-            "SELECT id FROM users WHERE email LIKE 'a%'",
-            "SELECT id FROM users WHERE email IN ('a@b.io')",
-        ] {
-            assert!(
-                matches!(strict.on_frame(b'Q', &query_frame(sql)).unwrap(), FrameAction::Relay),
-                "a mask-only column stores the plaintext: {sql}"
-            );
-        }
-    }
-
-    /// Nullness survives sealing, so the two null tests are answered correctly
-    /// by the stored form and must not be reported as unprotected. Both modes
-    /// are checked through the same `unprotected` call site: silence under
-    /// `reject` is what proves there is no warning under `warn`.
-    #[test]
-    fn null_tests_over_searchable_columns_are_not_unprotected_sites() {
-        for sql in [
-            "SELECT id FROM users WHERE email IS NULL",
-            "SELECT id FROM users WHERE email IS NOT NULL",
-            "SELECT id FROM users WHERE id > 4 AND email IS NOT NULL",
-            "SELECT u.id FROM users u JOIN other o ON o.id = u.id AND u.email IS NULL",
-        ] {
-            let mut permissive = rewriter(catalog(true));
-            assert!(rewritten_query(&mut permissive, sql).is_none(), "{sql}");
-
-            let mut strict = rewriter(strict_catalog(true));
-            assert!(
-                matches!(strict.on_frame(b'Q', &query_frame(sql)).unwrap(), FrameAction::Relay),
-                "a null test matches correctly against the stored form: {sql}"
-            );
-        }
-    }
-
-    /// `IS DISTINCT FROM` is not in the same position as `IS NULL`: it
-    /// compares against the stored form like any other operator, so it stays a
-    /// signalled site.
-    #[test]
-    fn is_distinct_from_over_a_searchable_column_is_still_signalled() {
-        for sql in [
-            "SELECT id FROM users WHERE email IS DISTINCT FROM 'a@b.io'",
-            "SELECT id FROM users WHERE email IS NOT DISTINCT FROM 'a@b.io'",
-        ] {
-            let mut strict = rewriter(strict_catalog(true));
-            let action = strict.on_frame(b'Q', &query_frame(sql)).unwrap();
-            assert!(refusal(&action).contains("searchable column email"), "{sql}");
-        }
-    }
-
-    /// Predicates over columns the proxy does not protect stay silent.
-    #[test]
-    fn unsupported_predicates_over_other_columns_stay_quiet() {
-        let mut strict = rewriter(strict_catalog(true));
-        for sql in [
-            "SELECT id FROM users WHERE id > 4",
-            "SELECT id FROM users WHERE name LIKE 'a%'",
-            "SELECT id FROM other WHERE email LIKE 'a%'",
-        ] {
-            assert!(
-                matches!(strict.on_frame(b'Q', &query_frame(sql)).unwrap(), FrameAction::Relay),
-                "{sql}"
-            );
-        }
-    }
-
     // --- logging ---------------------------------------------------------
-
-    /// The plaintext bound to a protected column must not reach the log, so
-    /// the warning carries the column and the expression's shape instead.
-    #[test]
-    fn unsupported_value_warning_names_the_shape_not_the_value() {
-        let site = Unprotected::UnsupportedValue { column: "email", shape: "function call" };
-        let message = site.message();
-        assert!(message.contains("email") && message.contains("function call"), "{message}");
-
-        let parsed = Parser::parse_sql(&PostgreSqlDialect {}, "SELECT lower('a@b.io')").unwrap();
-        let Statement::Query(query) = &parsed[0] else { panic!("a query") };
-        let SetExpr::Select(select) = query.body.as_ref() else { panic!("a select") };
-        let SelectItem::UnnamedExpr(expr) = &select.projection[0] else { panic!("an expression") };
-        assert_eq!(expr_shape(expr), "function call");
-        assert!(!expr_shape(expr).contains("a@b.io"));
-    }
 
     /// Every passthrough site, driven with a distinct plaintext, and then the
     /// whole log grepped for those plaintexts. Each of these values is bound

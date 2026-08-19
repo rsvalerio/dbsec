@@ -50,10 +50,10 @@ pub(super) struct TableScope<'a> {
 /// cannot be rewritten — guessing which table's blind index to compare against
 /// is exactly the wrong-rows outcome the rewrite exists to prevent — but it
 /// still *is* a predicate over a protected column, so it has to reach
-/// [`QueryRewriter::unprotected`]. Collapsing it into "no protected column
-/// here" left the comparison relayed with nothing but a log line, refused by
-/// nothing, matching no row.
-pub(super) enum ColumnResolution<'a> {
+/// [`QueryRewriter::unprotected`](super::QueryRewriter::unprotected).
+/// Collapsing it into "no protected column here" left the comparison relayed
+/// with nothing but a log line, refused by nothing, matching no row.
+enum ColumnResolution<'a> {
     /// Exactly one protected column in scope carries this name.
     One(&'a Arc<dyn FieldTransform>),
     /// More than one does, and no rewrite can choose between them.
@@ -122,7 +122,7 @@ impl ScopedTable<'_> {
 }
 
 /// How a scope resolves an expression that may be a column reference.
-pub(super) fn resolve_column<'a>(scope: &'a TableScope<'_>, expr: &Expr) -> ColumnResolution<'a> {
+fn resolve_column<'a>(scope: &'a TableScope<'_>, expr: &Expr) -> ColumnResolution<'a> {
     match expr {
         Expr::Identifier(ident) => scope.resolve(std::slice::from_ref(ident)),
         Expr::CompoundIdentifier(idents) => scope.resolve(idents),
@@ -145,11 +145,11 @@ pub(super) fn column_ref<'a>(
 /// The direct sub-expressions of `expr`, for read-only walks.
 ///
 /// The mutable twin of this lives in
-/// [`QueryRewriter::rewrite_nested_queries`]; it stops at query boundaries
-/// because it hands them to `rewrite_query`, whereas this one descends into
-/// them, since a protected column referenced inside a subquery is still
-/// projected out of it.
-pub(super) fn expr_operands(expr: &Expr) -> Vec<&Expr> {
+/// [`QueryRewriter::rewrite_nested_queries`](super::QueryRewriter::rewrite_nested_queries);
+/// it stops at query boundaries because it hands them to `rewrite_query`,
+/// whereas this one descends into them, since a protected column referenced
+/// inside a subquery is still projected out of it.
+fn expr_operands(expr: &Expr) -> Vec<&Expr> {
     match expr {
         Expr::BinaryOp { left, right, .. }
         | Expr::AnyOp { left, right, .. }
@@ -282,14 +282,16 @@ pub(super) fn column_name(expr: &Expr) -> Option<String> {
 /// [`ScopedTable::read_columns`], which only the projection check consults.
 ///
 /// `IS NULL` and `IS NOT NULL` are deliberately absent: nullness survives
-/// sealing exactly. [`QueryRewriter::seal_expr`] returns early on a NULL
-/// literal and Bind leaves a NULL parameter untouched, so a NULL in a
-/// protected column is stored as SQL NULL and a non-NULL as a non-NULL
-/// envelope. `col IS NULL` therefore returns exactly the rows the client
-/// meant — no blind index is needed and none would help, so reporting it as
-/// an [`Unprotected`] site would refuse working SQL under `reject` and dilute
-/// the warning stream under `warn`. `IS DISTINCT FROM` is *not* exempt: it
-/// compares against the stored form like any other operator.
+/// sealing exactly.
+/// [`QueryRewriter::seal_expr`](super::QueryRewriter::seal_expr) returns early
+/// on a NULL literal and Bind leaves a NULL parameter untouched, so a NULL in
+/// a protected column is stored as SQL NULL and a non-NULL as a non-NULL
+/// envelope. `col IS NULL` therefore returns exactly the rows the client meant
+/// — no blind index is needed and none would help, so reporting it as an
+/// [`Unprotected`](super::unprotected::Unprotected) site would refuse working
+/// SQL under `reject` and dilute the warning stream under `warn`. `IS DISTINCT
+/// FROM` is *not* exempt: it compares against the stored form like any other
+/// operator.
 pub(super) fn protected_operand(expr: &Expr, scope: &TableScope<'_>) -> Option<(String, bool)> {
     predicate_operands(expr)?.into_iter().find_map(|operand| protected_column(operand, scope))
 }
@@ -297,7 +299,7 @@ pub(super) fn protected_operand(expr: &Expr, scope: &TableScope<'_>) -> Option<(
 /// The operands of an unhandled predicate — the positions a column reference
 /// can occupy such that the comparison is *about* that column. `None` for an
 /// expression that is not a comparison at all.
-pub(super) fn predicate_operands(expr: &Expr) -> Option<[&Expr; 2]> {
+fn predicate_operands(expr: &Expr) -> Option<[&Expr; 2]> {
     match expr {
         Expr::BinaryOp { left, right, .. }
         | Expr::AnyOp { left, right, .. }
@@ -373,5 +375,378 @@ pub(super) fn expr_shape(expr: &Expr) -> &'static str {
         Expr::TypedString { .. } => "typed literal",
         Expr::Nested(_) => "parenthesized expression",
         _ => "unsupported expression",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use dbsec_core::blind_index;
+    use dbsec_core::transform::FieldTransform;
+    use sqlparser::ast::{SelectItem, SetExpr, Statement};
+    use sqlparser::dialect::PostgreSqlDialect;
+    use sqlparser::parser::Parser;
+
+    use crate::columns::ProtectedColumn;
+
+    use crate::config::OnUnprotected;
+    use crate::encrypt::tests::*;
+    use crate::encrypt::unprotected::Unprotected;
+    use crate::encrypt::WriteCatalog;
+    use crate::rows::tests::transform;
+    use crate::session::FrameAction;
+
+    use super::expr_shape;
+
+    /// A parenthesised join is one `TableFactor::NestedJoin` holding the whole
+    /// join, not the two `Table` factors the same query has without the
+    /// parentheses. The scope walk stopped at the top level, so every
+    /// protected table inside them was invisible: the equality was relayed
+    /// comparing the client's plaintext against the stored
+    /// `blind_index || envelope`, which matches no row and reads as "no such
+    /// user" — reached by adding one pair of parentheses.
+    #[test]
+    fn a_parenthesized_join_puts_its_protected_tables_in_scope() {
+        use crate::rows::tests::INDEX_KEY;
+
+        let mut rewriter = rewriter(catalog(true));
+        let expected = blind_index::compute(&INDEX_KEY, b"alice@example.com");
+
+        for sql in [
+            // The enclosing predicate.
+            "SELECT 1 FROM (users JOIN orders ON orders.id = users.id) \
+             WHERE users.email = 'alice@example.com'",
+            // A join constraint *inside* the parentheses.
+            "SELECT 1 FROM (orders JOIN users ON users.email = 'alice@example.com')",
+            // A derived table nested inside them, with its own predicate.
+            "SELECT 1 FROM (orders JOIN (SELECT id FROM users WHERE \
+             email = 'alice@example.com') s ON s.id = orders.id)",
+            // Nested twice over, and reached through an UPDATE's FROM rather
+            // than a SELECT's.
+            "UPDATE orders SET total = 1 FROM ((users JOIN accounts ON accounts.id = users.id)) \
+             WHERE users.email = 'alice@example.com'",
+        ] {
+            let rewritten = rewritten_query(&mut rewriter, sql).unwrap_or_else(|| {
+                panic!("relayed verbatim instead of rewritten: {sql}");
+            });
+            assert!(!rewritten.contains("alice@example.com"), "{sql}: {rewritten}");
+            assert!(rewritten.contains(&sealed_literal(&expected)), "{sql}: {rewritten}");
+        }
+    }
+
+    /// The other half of the same gap: a shape no blind index can answer, over
+    /// a table only the parenthesised join brings into scope, has to reach
+    /// [`QueryRewriter::unprotected`] — otherwise `reject` does not fail closed
+    /// for this syntax and the comparison is relayed to match nothing.
+    #[test]
+    fn an_unrewritable_predicate_inside_a_parenthesized_join_is_refused() {
+        let mut strict = rewriter(strict_catalog(true));
+        for sql in [
+            "SELECT 1 FROM (users JOIN orders ON orders.id = users.id) \
+             WHERE users.email LIKE 'a%'",
+            "SELECT 1 FROM (orders JOIN users ON users.email > 'a')",
+            "SELECT 1 FROM (orders JOIN (SELECT id FROM users WHERE email LIKE 'a%') s \
+             ON s.id = orders.id)",
+        ] {
+            let action = strict.on_frame(b'Q', &query_frame(sql)).unwrap();
+            assert!(
+                refusal(&action).contains("searchable column email"),
+                "{sql}: {}",
+                refusal(&action)
+            );
+        }
+    }
+
+    #[test]
+    fn join_cte_and_set_operations_are_traversed() {
+        let mut rewriter = rewriter(catalog(true));
+        for sql in [
+            "SELECT u.id FROM users u JOIN orders o ON o.id = u.id AND u.email = 'a@b.io'",
+            "WITH hits AS (SELECT id FROM users WHERE email = 'a@b.io') SELECT * FROM hits",
+            "SELECT id FROM users WHERE email = 'a@b.io' UNION SELECT id FROM orders",
+            "SELECT id FROM (SELECT id, email FROM users WHERE email = 'a@b.io') AS s",
+            "SELECT count(*) FROM users GROUP BY email HAVING email = 'a@b.io'",
+        ] {
+            let rewritten = rewritten_query(&mut rewriter, sql).unwrap_or_else(|| panic!("{sql}"));
+            assert!(!rewritten.contains("a@b.io"), "{rewritten}");
+            assert!(rewritten.contains("FROM 1 FOR 32"), "{rewritten}");
+        }
+    }
+
+    /// `UPDATE ... FROM` and `DELETE ... USING` join a second relation into
+    /// the predicate's scope, and sqlparser keeps it in a field of its own. It
+    /// used to be dropped, so a searchable column of the joined relation
+    /// resolved to nothing: the comparison went upstream verbatim, matched no
+    /// row, and never reached the gate. `DELETE FROM sessions USING users
+    /// WHERE users.email = $1` silently revoked nothing — and its `<>`
+    /// inversion deleted every session there was.
+    #[test]
+    fn the_joined_relation_of_update_from_and_delete_using_is_in_scope() {
+        for sql in [
+            "DELETE FROM sessions USING users \
+             WHERE users.email = 'a@b.io' AND sessions.user_id = users.id",
+            "UPDATE sessions SET valid = false FROM users \
+             WHERE users.email = 'a@b.io' AND sessions.user_id = users.id",
+        ] {
+            let mut permissive = rewriter(catalog(true));
+            let rewritten =
+                rewritten_query(&mut permissive, sql).unwrap_or_else(|| panic!("{sql}"));
+            assert!(!rewritten.contains("a@b.io"), "{rewritten}");
+            assert!(rewritten.contains("FROM 1 FOR 32"), "{rewritten}");
+        }
+
+        // A derived table beside the target is a query of its own, and it was
+        // walked for `SELECT` but not for these two: the equality inside it
+        // went upstream as plaintext, matching nothing and signalling nothing.
+        for sql in [
+            "DELETE FROM sessions USING (SELECT id FROM users WHERE email = 'a@b.io') s \
+             WHERE s.id = sessions.user_id",
+            "UPDATE sessions SET valid = false \
+             FROM (SELECT id FROM users WHERE email = 'a@b.io') s WHERE s.id = sessions.user_id",
+        ] {
+            let mut permissive = rewriter(catalog(true));
+            let rewritten =
+                rewritten_query(&mut permissive, sql).unwrap_or_else(|| panic!("{sql}"));
+            assert!(!rewritten.contains("a@b.io"), "{rewritten}");
+            assert!(rewritten.contains("FROM 1 FOR 32"), "{rewritten}");
+        }
+
+        // A join constraint inside that FROM/USING resolves against the same
+        // scope the WHERE does, so it is the same rewrite site — and only
+        // `rewrite_select` used to walk one, so these two left it comparing
+        // plaintext against the stored form.
+        for sql in [
+            "DELETE FROM sessions USING accounts JOIN users ON users.email = 'a@b.io'",
+            "UPDATE sessions SET valid = false FROM accounts JOIN users \
+             ON users.email = 'a@b.io'",
+        ] {
+            let mut permissive = rewriter(catalog(true));
+            let rewritten =
+                rewritten_query(&mut permissive, sql).unwrap_or_else(|| panic!("{sql}"));
+            assert!(!rewritten.contains("a@b.io"), "{rewritten}");
+            assert!(rewritten.contains("FROM 1 FOR 32"), "{rewritten}");
+        }
+
+        // The inversion is the dangerous half and no index can answer it, so
+        // it has to reach the gate rather than delete the table.
+        for sql in [
+            "DELETE FROM sessions USING users WHERE users.email <> 'a@b.io'",
+            "UPDATE sessions SET valid = false FROM users WHERE users.email LIKE 'a%'",
+            "DELETE FROM sessions USING accounts JOIN users ON users.email LIKE 'a%'",
+        ] {
+            let mut strict = rewriter(strict_catalog(true));
+            let action = strict.on_frame(b'Q', &query_frame(sql)).unwrap();
+            assert!(refusal(&action).contains("searchable column email"), "{sql}");
+        }
+    }
+
+    /// An unqualified name that two protected relations in scope both carry
+    /// cannot be rewritten — picking one would compare against the wrong
+    /// table's blind index. It used to resolve to nothing at all, which put it
+    /// on the same path as SQL that mentions no protected column: relayed
+    /// verbatim, matching no row, and never refused under `reject`. It is a
+    /// site of its own now.
+    #[test]
+    fn an_ambiguous_unqualified_searchable_column_is_a_signalled_site() {
+        for sql in [
+            "SELECT * FROM users u JOIN accounts a ON u.id = a.uid WHERE email = 'a@b.io'",
+            "SELECT * FROM users u JOIN accounts a ON u.id = a.uid WHERE email IN ('a@b.io')",
+            "SELECT * FROM users u JOIN accounts a ON u.id = a.uid WHERE email LIKE 'a%'",
+        ] {
+            let mut permissive = rewriter(ambiguous_catalog(OnUnprotected::Warn));
+            assert!(rewritten_query(&mut permissive, sql).is_none(), "ambiguity must not guess");
+
+            let mut strict = rewriter(ambiguous_catalog(OnUnprotected::Reject));
+            let action = strict.on_frame(b'Q', &query_frame(sql)).unwrap();
+            let message = refusal(&action);
+            assert!(message.contains("email") && message.contains("qualify it"), "{message}");
+        }
+
+        // Qualifying the name resolves it, and the rewrite goes ahead.
+        let mut permissive = rewriter(ambiguous_catalog(OnUnprotected::Warn));
+        let sql = rewritten_query(
+            &mut permissive,
+            "SELECT * FROM users u JOIN accounts a ON u.id = a.uid WHERE u.email = 'a@b.io'",
+        )
+        .expect("rewritten");
+        assert!(!sql.contains("a@b.io") && sql.contains("FROM 1 FOR 32"), "{sql}");
+    }
+
+    /// A shape the rewriter cannot express is a refusal site, not a silent
+    /// "no rows".
+    #[test]
+    fn unsupported_predicates_over_searchable_columns_are_signalled() {
+        for sql in [
+            "SELECT id FROM users WHERE email LIKE 'a%'",
+            "SELECT id FROM users WHERE email > 'a@b.io'",
+            "SELECT id FROM users WHERE email IN (SELECT email FROM other)",
+            "SELECT id FROM users WHERE email = ANY(SELECT email FROM other)",
+            "SELECT id FROM users WHERE email IN ('a@b.io', lower('c@d.io'))",
+            "DELETE FROM users WHERE email = lower('a@b.io')",
+        ] {
+            let mut permissive = rewriter(catalog(true));
+            assert!(rewritten_query(&mut permissive, sql).is_none(), "{sql}");
+
+            let mut strict = rewriter(strict_catalog(true));
+            let action = strict.on_frame(b'Q', &query_frame(sql)).unwrap();
+            assert!(refusal(&action).contains("searchable column email"), "{sql}");
+        }
+    }
+
+    /// A predicate over a protected column with no equality index compares the
+    /// client's plaintext against a stored form that is not the plaintext, so
+    /// it matches nothing. That is the failure `Unprotected` exists to report,
+    /// and it must fire for every non-searchable transform kind — an operator
+    /// who sets `reject` to be told about queries that cannot work gets
+    /// nothing otherwise, and "no rows" reads as "no such user".
+    #[test]
+    fn predicates_over_protected_columns_without_an_index_are_signalled() {
+        let kinds: [(&str, Arc<dyn FieldTransform>); 3] = [
+            ("encrypt (searchable = false)", transform(false)),
+            ("fpe", fpe_transform()),
+            ("token", token_transform()),
+        ];
+        for (kind, column_transform) in kinds {
+            for sql in [
+                "SELECT id FROM users WHERE email = 'a@b.io'",
+                "SELECT id FROM users WHERE 'a@b.io' = email",
+                "SELECT id FROM users WHERE email IN ('a@b.io', 'c@d.io')",
+                "SELECT id FROM users WHERE email LIKE 'a%'",
+                "DELETE FROM users WHERE email = 'a@b.io'",
+            ] {
+                let mut permissive =
+                    rewriter(catalog_of(column_transform.clone(), false, OnUnprotected::Warn));
+                assert!(
+                    rewritten_query(&mut permissive, sql).is_none(),
+                    "{kind} under warn relays: {sql}"
+                );
+
+                let mut strict =
+                    rewriter(catalog_of(column_transform.clone(), false, OnUnprotected::Reject));
+                let action = strict.on_frame(b'Q', &query_frame(sql)).unwrap();
+                let message = refusal(&action);
+                assert!(
+                    message.contains("protected column email") && message.contains("no equality"),
+                    "{kind} under reject refuses: {sql}\ngot: {message}"
+                );
+            }
+        }
+    }
+
+    /// The remedy differs by column, so the two predicate signals stay
+    /// distinct: a searchable column names its blind index, an unindexed one
+    /// names the setting that would fix it.
+    #[test]
+    fn the_two_predicate_signals_name_different_remedies() {
+        let sql = "SELECT id FROM users WHERE email LIKE 'a%'";
+
+        let mut searchable = rewriter(strict_catalog(true));
+        let message = refusal(&searchable.on_frame(b'Q', &query_frame(sql)).unwrap());
+        assert!(message.contains("searchable column email"), "{message}");
+        assert!(message.contains("blind index"), "{message}");
+
+        let mut unindexed = rewriter(strict_catalog(false));
+        let message = refusal(&unindexed.on_frame(b'Q', &query_frame(sql)).unwrap());
+        assert!(message.contains("protected column email"), "{message}");
+        assert!(message.contains("searchable = true"), "{message}");
+    }
+
+    /// A mask-only column stores the plaintext, so its predicates are correct
+    /// exactly as written and must stay silent. `WriteCatalog::new` skips
+    /// columns with no transform, which is what makes this hold.
+    #[test]
+    fn predicates_over_mask_only_columns_stay_quiet() {
+        let mask_only = ProtectedColumn {
+            schema: "public".into(),
+            table: "users".into(),
+            column: "email".into(),
+            transform: None,
+            searchable: false,
+            readable: false,
+            mask: Some(dbsec_core::mask::MaskSpec { keep_first: 1, keep_last: 0, mask_with: '*' }),
+        };
+        let catalog = Arc::new(WriteCatalog::new(&[mask_only], OnUnprotected::Reject));
+        let mut strict = rewriter(catalog);
+        for sql in [
+            "SELECT id FROM users WHERE email = 'a@b.io'",
+            "SELECT id FROM users WHERE email LIKE 'a%'",
+            "SELECT id FROM users WHERE email IN ('a@b.io')",
+        ] {
+            assert!(
+                matches!(strict.on_frame(b'Q', &query_frame(sql)).unwrap(), FrameAction::Relay),
+                "a mask-only column stores the plaintext: {sql}"
+            );
+        }
+    }
+
+    /// Nullness survives sealing, so the two null tests are answered correctly
+    /// by the stored form and must not be reported as unprotected. Both modes
+    /// are checked through the same `unprotected` call site: silence under
+    /// `reject` is what proves there is no warning under `warn`.
+    #[test]
+    fn null_tests_over_searchable_columns_are_not_unprotected_sites() {
+        for sql in [
+            "SELECT id FROM users WHERE email IS NULL",
+            "SELECT id FROM users WHERE email IS NOT NULL",
+            "SELECT id FROM users WHERE id > 4 AND email IS NOT NULL",
+            "SELECT u.id FROM users u JOIN other o ON o.id = u.id AND u.email IS NULL",
+        ] {
+            let mut permissive = rewriter(catalog(true));
+            assert!(rewritten_query(&mut permissive, sql).is_none(), "{sql}");
+
+            let mut strict = rewriter(strict_catalog(true));
+            assert!(
+                matches!(strict.on_frame(b'Q', &query_frame(sql)).unwrap(), FrameAction::Relay),
+                "a null test matches correctly against the stored form: {sql}"
+            );
+        }
+    }
+
+    /// `IS DISTINCT FROM` is not in the same position as `IS NULL`: it
+    /// compares against the stored form like any other operator, so it stays a
+    /// signalled site.
+    #[test]
+    fn is_distinct_from_over_a_searchable_column_is_still_signalled() {
+        for sql in [
+            "SELECT id FROM users WHERE email IS DISTINCT FROM 'a@b.io'",
+            "SELECT id FROM users WHERE email IS NOT DISTINCT FROM 'a@b.io'",
+        ] {
+            let mut strict = rewriter(strict_catalog(true));
+            let action = strict.on_frame(b'Q', &query_frame(sql)).unwrap();
+            assert!(refusal(&action).contains("searchable column email"), "{sql}");
+        }
+    }
+
+    /// Predicates over columns the proxy does not protect stay silent.
+    #[test]
+    fn unsupported_predicates_over_other_columns_stay_quiet() {
+        let mut strict = rewriter(strict_catalog(true));
+        for sql in [
+            "SELECT id FROM users WHERE id > 4",
+            "SELECT id FROM users WHERE name LIKE 'a%'",
+            "SELECT id FROM other WHERE email LIKE 'a%'",
+        ] {
+            assert!(
+                matches!(strict.on_frame(b'Q', &query_frame(sql)).unwrap(), FrameAction::Relay),
+                "{sql}"
+            );
+        }
+    }
+
+    /// The plaintext bound to a protected column must not reach the log, so
+    /// the warning carries the column and the expression's shape instead.
+    #[test]
+    fn unsupported_value_warning_names_the_shape_not_the_value() {
+        let site = Unprotected::UnsupportedValue { column: "email", shape: "function call" };
+        let message = site.message();
+        assert!(message.contains("email") && message.contains("function call"), "{message}");
+
+        let parsed = Parser::parse_sql(&PostgreSqlDialect {}, "SELECT lower('a@b.io')").unwrap();
+        let Statement::Query(query) = &parsed[0] else { panic!("a query") };
+        let SetExpr::Select(select) = query.body.as_ref() else { panic!("a select") };
+        let SelectItem::UnnamedExpr(expr) = &select.projection[0] else { panic!("an expression") };
+        assert_eq!(expr_shape(expr), "function call");
+        assert!(!expr_shape(expr).contains("a@b.io"));
     }
 }

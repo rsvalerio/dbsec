@@ -95,7 +95,8 @@ impl WriteCatalog {
     /// Looks a table up the way Postgres would resolve the SQL name: the last
     /// identifier is the table, the one before it the schema, and bare names
     /// fall back to `public` — which holds only while the session's
-    /// `search_path` does, hence [`QueryRewriter::table`].
+    /// `search_path` does, hence
+    /// [`QueryRewriter::table`](super::QueryRewriter::table).
     pub(super) fn table(&self, name: &ObjectName) -> Option<&Columns> {
         self.tables.get(&resolved_name(name)?)
     }
@@ -166,4 +167,53 @@ pub(super) fn resolved_name(name: &ObjectName) -> Option<(String, String)> {
 /// differs from the server's.
 pub(super) fn normalize(ident: &Ident) -> String {
     fold_identifier(&ident.value, ident.quote_style.is_some()).into_owned()
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use crate::config::OnUnprotected;
+    use crate::encrypt::tests::*;
+    use crate::encrypt::WriteCatalog;
+    use crate::rows::tests::transform;
+
+    /// Rust's `to_lowercase` folds `Ä` to `ä` and the Kelvin sign to `k`;
+    /// PostgreSQL leaves every multibyte character in an unquoted identifier
+    /// alone. Folding the proxy's way meant a protected column named with a
+    /// non-ASCII letter never matched, and the write went through in plaintext.
+    #[test]
+    fn a_non_ascii_column_name_is_folded_the_way_postgres_folds_it() {
+        let catalog = Arc::new(WriteCatalog::new(
+            &[column("Ämail", transform(false), false)],
+            OnUnprotected::Warn,
+        ));
+        let mut rewriter = rewriter(catalog);
+        // Written unquoted and with the ASCII half in a different case, which
+        // is exactly what the server folds and what it does not.
+        let sql = rewritten_query(&mut rewriter, "INSERT INTO users (ÄMAIL) VALUES ('a@b.io')")
+            .expect("rewritten");
+        assert!(!sql.contains("a@b.io"), "{sql}");
+        assert_eq!(open_hex_literal(&sql, false), b"a@b.io");
+    }
+
+    /// PostgreSQL truncates every identifier to 63 bytes, so a longer name in
+    /// a query refers to the truncated catalog entry. Matching the untruncated
+    /// name meant the write was treated as unprotected.
+    #[test]
+    fn an_over_long_identifier_matches_the_name_postgres_truncated_it_to() {
+        let stored = "e".repeat(crate::config::MAX_IDENTIFIER_BYTES);
+        let catalog = Arc::new(WriteCatalog::new(
+            &[column(&stored, transform(false), false)],
+            OnUnprotected::Warn,
+        ));
+        let mut rewriter = rewriter(catalog);
+        let written = format!("{stored}toolong");
+        let sql = rewritten_query(
+            &mut rewriter,
+            &format!("INSERT INTO users ({written}) VALUES ('a@b.io')"),
+        )
+        .expect("rewritten");
+        assert_eq!(open_hex_literal(&sql, false), b"a@b.io");
+    }
 }

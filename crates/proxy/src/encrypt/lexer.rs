@@ -15,7 +15,10 @@ use std::ops::Range;
 
 use sqlparser::ast::Statement;
 
-use super::parse_sql;
+use sqlparser::dialect::PostgreSqlDialect;
+use sqlparser::parser::{Parser, ParserError};
+use sqlparser::tokenizer::{TokenWithSpan, Tokenizer};
+
 use crate::Error;
 
 /// Rebuilds the SQL text, re-rendering only the statements that changed and
@@ -202,6 +205,48 @@ fn skip_block_comment(bytes: &[u8], start: usize) -> Option<usize> {
 
 fn is_ident_byte(byte: u8) -> bool {
     byte.is_ascii_alphanumeric() || byte == b'_'
+}
+
+/// Lexes one SQL text into the tokens both readers work from — the session
+/// settings scan and the parser — so a statement is tokenized once rather than
+/// once per reader. The error is the parser's own, which is what
+/// [`parser_error_kind`](super::unprotected::parser_error_kind) and the unparseable
+/// site already speak.
+pub(super) fn tokenize(
+    dialect: &PostgreSqlDialect,
+    text: &str,
+) -> Result<Vec<TokenWithSpan>, ParserError> {
+    Tokenizer::new(dialect, text).tokenize_with_location().map_err(ParserError::from)
+}
+
+/// Parses one SQL text from its [`tokenize`]d form, retrying once with a
+/// statement terminator.
+///
+/// `COPY ... FROM STDIN` is the reason for the retry. sqlparser reads the TSV
+/// payload that follows it in a script, so it wants either the data and its
+/// `\.` terminator or a `;`. On the wire there is neither — the payload arrives
+/// later as `CopyData` frames — so the statement fails to parse and `COPY`
+/// would only ever be seen as unparseable SQL, with a warning naming the wrong
+/// problem. The retry re-lexes, which costs nothing worth saving: it only
+/// happens for text that already failed to parse.
+pub(super) fn parse_tokens(
+    dialect: &PostgreSqlDialect,
+    tokens: Vec<TokenWithSpan>,
+    text: &str,
+) -> Result<Vec<Statement>, ParserError> {
+    let error = match Parser::new(dialect).with_tokens_with_locations(tokens).parse_statements() {
+        Ok(statements) => return Ok(statements),
+        Err(error) => error,
+    };
+    Parser::parse_sql(dialect, &format!("{text};")).map_err(|_| error)
+}
+
+/// Parses one SQL text, for the callers that have no tokens of their own to
+/// share — the rewrite's own re-parse of what it rendered, and the tests.
+pub(super) fn parse_sql(text: &str) -> Result<Vec<Statement>, ParserError> {
+    let dialect = PostgreSqlDialect {};
+    let tokens = tokenize(&dialect, text)?;
+    parse_tokens(&dialect, tokens, text)
 }
 
 #[cfg(test)]
