@@ -1,7 +1,7 @@
 # dbsec — minimal Rust field-encryption proxy for PostgreSQL
 
-A small library (`dbsec-core`) plus a thin proxy binary (`dbsec`) replacing Acra with the
-bare minimum: transparent field-level encryption, searchable encryption, pseudonymization
+A small library (`dbsec-core`) plus a thin proxy binary (`dbsec`) covering the bare
+minimum: transparent field-level encryption, searchable encryption, pseudonymization
 and masking for PostgreSQL. Not a framework.
 
 ## Scope decisions
@@ -10,15 +10,15 @@ and masking for PostgreSQL. Not a framework.
 |---|---|
 | Database | PostgreSQL only (wire protocol v3) |
 | Shape | Library + thin proxy binary (~200-line `main`) |
-| Crypto format | Fresh envelope — no Acra/Themis compatibility |
-| SQL depth | Same as Acra: sqlparser rewrite of literals + extended-protocol Parse/Bind |
+| Crypto format | Fresh envelope — no compatibility with other proxies |
+| SQL depth | sqlparser rewrite of literals + extended-protocol Parse/Bind |
 | TLS | Both hops via rustls, each independently optional |
 | Keys | `KeySource` trait; OpenBao/Vault impl (Transit envelope), `FileKeySource` for dev |
 | Config | Flat TOML: `[[column]]` entries |
-| Searchable | Deterministic HMAC-SHA256 prefix + equality WHERE rewrite (Acra's approach) |
+| Searchable | Deterministic HMAC-SHA256 prefix + equality WHERE rewrite |
 | Pseudonymization | Storage-free: FF1 FPE (format-shaped data) + HMAC tokens (strings) |
 | Masking | Static per-column, read-path only (e.g. keep_last = 4) |
-| Dropped | MySQL, Themis, acra-censor, poison records, zones, per-client identity, translator API |
+| Dropped | MySQL, alternative crypto backends, SQL firewall, poison records, zones, per-client identity, HTTP/gRPC API |
 
 ## Ciphertext envelope
 

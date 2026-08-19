@@ -1,4 +1,4 @@
-//! Deterministic blind index for searchable encryption (Acra's approach):
+//! Deterministic blind index for searchable encryption:
 //! `hmac_sha256(index_key, plaintext)` prepended to the ciphertext envelope.
 //! Deterministic by design, so it leaks equality and frequency patterns —
 //! an accepted trade-off (see plans/PLAN.md caveats).
