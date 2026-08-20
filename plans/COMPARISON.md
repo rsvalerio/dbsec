@@ -152,7 +152,13 @@ is the sqlx application with no proxy, and
 the two front ends agree byte-for-byte; and the Vault/OpenBao `KeySource` is
 `dbsec-vault` (TASK-0192.02), with `KeySource` kept synchronous and cache
 misses bridged to the async client under a timeout, as the proxy already did.
-An embedder can no longer diverge from the proxy on any of them. One further thing the table does not show but an embedder meets:
+On each of those — the policy and its key-naming convention, row-key
+canonicalization, identifier folding, the transforms, and the Vault key
+source — an embedder now runs the proxy's own code, and the round-trip test is
+the check that they agree; what it does not cover is a `KeySource` an embedder
+writes itself.
+
+One further thing the table does not show but an embedder meets:
 
 - `keys::KeySource` is a synchronous trait. `dbsec-vault` bridges to its
   async client with `block_in_place` under `timeout_secs`, only on a cache
