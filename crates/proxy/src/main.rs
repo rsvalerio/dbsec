@@ -623,8 +623,9 @@ async fn serve(validated: ValidatedConfig) -> Result<(), Error> {
                     source
                 }
             };
-            let columns = Arc::new(config.policy().build(&keys));
-            let row_keys = Arc::new(config.policy().row_keys());
+            let policy = config.policy();
+            let columns = Arc::new(policy.build(&keys));
+            let row_keys = Arc::new(policy.row_keys());
             let dsn = protected.control_dsn.clone();
             let resolved =
                 resolve::resolve_columns(&dsn, &tls, &columns, &row_keys, CONNECT_TIMEOUT).await?;
