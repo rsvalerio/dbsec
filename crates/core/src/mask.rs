@@ -7,7 +7,7 @@
 
 use serde::Deserialize;
 
-#[derive(Debug, Clone, Copy, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct MaskSpec {
     /// Number of leading characters left visible.
