@@ -2,6 +2,35 @@
 All notable changes to this project will be documented in this file. See [conventional commits](https://www.conventionalcommits.org/) for commit guidelines.
 
 - - -
+## v0.6.0 - 2026-08-20
+#### Features
+- (**core**) add the Protector facade and an embedded sqlx example - (314b417) - Rodrigo Valerio, *Claude Fable 5*
+- (**derive**) add #[derive(Protect)] for record-level protection - (036c24b) - Rodrigo Valerio, *Claude Fable 5*
+#### Documentation
+- (**backlog**) file the record-level derive and close the stale rows in COMPARISON.md - (4eca0f8) - Rodrigo Valerio, *Claude Fable 5*
+- (**comparison**) compare dbsec with Acra, CipherStash and peers - (f176727) - Rodrigo Valeri
+- describe the nextest gate and record the CONTRIBUTING divergence - (b45553e) - Rodrigo Valerio
+- state the design decisions without naming Acra - (3f33db3) - Rodrigo Valeri
+#### Tests
+- (**core**) pin the typed RowKey constructors to canonical and tighten policy tests - (81057ba) - Rodrigo Valerio, *Claude Fable 5*
+#### Build system
+- (**test**) run the suite under cargo-nextest - (7f39623) - Rodrigo Valerio
+#### Continuous Integration
+- move the test job to nextest and off the shared cargo test - (d630ce8) - Rodrigo Valerio
+#### Refactoring
+- (**core**) move the column policy model into dbsec-core - (e265b2f) - Rodrigo Valerio, *Claude Fable 5*
+- (**core**) move the wire codec out and the naming logic in - (4bc80f5) - Rodrigo Valeri
+- (**rowkey**) decode wire format codes at the proxy, not in the library - (07774b8) - Rodrigo Valeri
+#### Miscellaneous Chores
+- (**backlog**) scope TASK-0192.08 to the derive and the canonicalization check - (dc4f295) - Rodrigo Valerio, *Claude Fable 5*
+- (**backlog**) close TASK-0192.08 - (8002176) - Rodrigo Valerio, *Claude Fable 5*
+- (**backlog**) close TASK-0192.05 - (c7d6fc5) - Rodrigo Valerio, *Claude Fable 5*
+- (**backlog**) close TASK-0192.03 - (f499b87) - Rodrigo Valerio, *Claude Fable 5*
+- (**backlog**) close the first two library tasks and file the fuzz breakage - (f1d3ebc) - Rodrigo Valeri
+- (**backlog**) file the dbsec-core reusability refactor - (853fa80) - Rodrigo Valeri
+
+- - -
+
 ## v0.5.0 - 2026-08-19
 #### Features
 - (**envelope**) make a cell-only value in a row-bound column refusable - (1ae82e8) - Rodrigo Valeri
