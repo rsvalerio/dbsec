@@ -22,6 +22,7 @@ pub mod ident;
 pub mod keys;
 pub mod mask;
 pub mod policy;
+pub mod protector;
 pub mod rowkey;
 pub mod sync;
 pub mod transform;
@@ -85,6 +86,29 @@ pub enum Error {
     /// as a configuration error.
     #[error("invalid policy: {0}")]
     Policy(String),
+    /// A column name the [`protector::Protector`] was not built with. An
+    /// error rather than a passthrough: a caller that mistypes a column name
+    /// must not end up storing plaintext.
+    #[error("no protected column named {0}")]
+    UnknownColumn(String),
+    /// A column whose table declares a `row_key` was sealed or opened without
+    /// one. Refused rather than degraded to a cell-only seal, which is the
+    /// relocatable ciphertext `strict_row_binding` exists to catch.
+    #[error("column {0} is row-bound; pass the row key")]
+    RowKeyRequired(String),
+    /// A row key was passed for a column whose table declares none. Refused
+    /// because the resulting `DBS3` envelope would bind to a row the proxy
+    /// and every other reader of this column never supplies.
+    #[error("column {0} declares no row_key, but one was passed")]
+    RowKeyNotDeclared(String),
+    /// An attempt to open a column whose stored form is irreversible: an HMAC
+    /// token, or FPE with `detokenize = false`.
+    #[error("column {0} cannot be opened: its stored form is irreversible by policy")]
+    NotReadable(String),
+    /// [`protector::Opened::into_value`] on a value that carried none of its
+    /// column's stored forms — pre-migration plaintext, or a mask-only column.
+    #[error("column {0} holds a value in none of its protected forms")]
+    Unprotected(String),
     #[error("FPE requires at least {} digits", transform::MIN_FPE_DIGITS)]
     FpeDomain,
     #[error("FPE transform failed")]

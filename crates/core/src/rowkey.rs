@@ -116,6 +116,43 @@ pub fn canonical(type_oid: u32, format: Format, value: Option<&[u8]>) -> Result<
     Ok(RowKey::new(text))
 }
 
+impl RowKey {
+    /// The key of a row whose `row_key` column is `smallint`.
+    pub fn from_i16(value: i16) -> Self {
+        Self::new(value.to_string().into_bytes())
+    }
+
+    /// The key of a row whose `row_key` column is `integer`.
+    pub fn from_i32(value: i32) -> Self {
+        Self::new(value.to_string().into_bytes())
+    }
+
+    /// The key of a row whose `row_key` column is `bigint`.
+    pub fn from_i64(value: i64) -> Self {
+        Self::new(value.to_string().into_bytes())
+    }
+
+    /// The key of a row whose `row_key` column is `text` or `varchar`. Its own
+    /// canonical form; nothing to normalise.
+    pub fn from_text(value: &str) -> Self {
+        Self::new(value.as_bytes().to_vec())
+    }
+
+    /// The key of a row whose `row_key` column is `uuid`, from any spelling
+    /// PostgreSQL accepts (upper or lower case, braced, hyphenated or not).
+    /// Refused when it is not a UUID, so a typo fails here rather than sealing
+    /// a value no read can name.
+    pub fn from_uuid(value: &str) -> Result<Self, Error> {
+        canonical(oid::UUID, Format::Text, Some(value.as_bytes()))
+    }
+
+    /// The key of a row whose `row_key` column is `uuid`, from its 16 raw
+    /// bytes — what a `uuid::Uuid::as_bytes()` hands out.
+    pub fn from_uuid_bytes(value: &[u8; 16]) -> Self {
+        Self::new(hyphenated(&hex::encode(value)).into_bytes())
+    }
+}
+
 /// Row key bytes as a `&str`, or a refusal. Borrowed rather than owned: the
 /// pass-through arms copy once into the key and never build a `String` on the
 /// way (PERF-3).

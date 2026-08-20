@@ -26,3 +26,10 @@ workspace = true
 [dev-dependencies]
 proptest = { workspace = true }
 tempfile = { workspace = true }
+# `examples/embedded.rs`: the library in a plain sqlx application, run by
+# `make e2e`. Same sqlx features the proxy's driver matrix uses.
+sqlx = { version = "0.9.0", default-features = false, features = ["runtime-tokio", "tls-rustls-aws-lc-rs", "postgres"] }
+tokio = { workspace = true }
+
+[[example]]
+name = "embedded"

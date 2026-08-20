@@ -25,6 +25,10 @@ const RECREATE_TABLE: &str = "users_recreate";
 /// so it needs a table of its own too.
 const ROW_KEY_TABLE: &str = "users_row_key";
 
+/// The library round-trip case: its proxy also declares a `row_key`, and the
+/// library writes into the same table the proxy reads.
+const LIBRARY_TABLE: &str = "users_library";
+
 #[tokio::test]
 #[ignore = "needs the Postgres from `make e2e`"]
 async fn transparent_encryption_end_to_end() {
@@ -416,4 +420,152 @@ async fn a_row_bound_value_written_in_text_reads_back_in_binary() {
     // And the session is still usable, which is what fails when the row key is
     // canonicalised in the wrong format.
     client.query_one("SELECT 1", &[]).await.unwrap();
+}
+
+/// A value sealed by the library opens through the proxy and vice versa —
+/// the claim that makes `dbsec-core` a library and not a second format.
+///
+/// The proxy's config and the library's `Policy` are written separately here
+/// on purpose: the point is that two front ends declaring the same policy over
+/// the same keyfile agree byte-for-byte on the envelope, the blind index and
+/// the row binding.
+#[tokio::test]
+#[ignore = "needs the Postgres from `make e2e`"]
+async fn library_and_proxy_share_one_table() {
+    use dbsec_core::envelope::RowKey;
+    use dbsec_core::keys::FileKeySource;
+    use dbsec_core::mask::MaskSpec;
+    use dbsec_core::policy::{ColumnPolicy, Policy, TablePolicy, TransformKind};
+    use dbsec_core::protector::{Opened, Protector};
+    use std::sync::Arc;
+
+    let direct = common::connect_direct().await;
+    common::create_table(&direct, LIBRARY_TABLE).await;
+
+    let dir = tempfile::tempdir().unwrap();
+    let opts = common::ProxyOpts::file_keys(common::port_library(), LIBRARY_TABLE).row_key("id");
+    let _proxy = common::spawn_proxy(dir.path(), &opts).await;
+    let via_proxy = common::connect_via_proxy(dir.path(), common::port_library()).await;
+
+    // The library side: the same policy `spawn_proxy` writes, over the same
+    // keyfile it wrote.
+    let policy = Policy::new(
+        vec![
+            ColumnPolicy::new(LIBRARY_TABLE, "email").searchable(true),
+            ColumnPolicy::new(LIBRARY_TABLE, "phone").transform(TransformKind::Fpe),
+            ColumnPolicy::new(LIBRARY_TABLE, "ssn").transform(TransformKind::Token),
+            ColumnPolicy::new(LIBRARY_TABLE, "note")
+                .transform(TransformKind::None)
+                .mask(MaskSpec { keep_first: 2, keep_last: 0, mask_with: '*' }),
+        ],
+        vec![TablePolicy::new(LIBRARY_TABLE, "id")],
+    );
+    let keys = Arc::new(FileKeySource::load(&dir.path().join("keys.toml")).unwrap());
+    let protector = Protector::new(policy, keys).unwrap();
+    let email = format!("{LIBRARY_TABLE}.email");
+    let phone = format!("{LIBRARY_TABLE}.phone");
+    let ssn = format!("{LIBRARY_TABLE}.ssn");
+    let note = format!("{LIBRARY_TABLE}.note");
+
+    // Library writes row 1, straight to the database.
+    let row1 = RowKey::from_i32(1);
+    direct
+        .execute(
+            &format!(
+                "INSERT INTO {LIBRARY_TABLE} (id, email, phone, ssn, note) VALUES (1, $1, $2, $3, $4)"
+            ),
+            &[
+                &protector.seal(&email, b"lib@example.com", Some(&row1)).unwrap(),
+                &String::from_utf8(protector.seal(&phone, b"555-100-2000", Some(&row1)).unwrap())
+                    .unwrap(),
+                &String::from_utf8(protector.seal(&ssn, b"078-05-1120", Some(&row1)).unwrap())
+                    .unwrap(),
+                &String::from_utf8(protector.seal(&note, b"library-note", Some(&row1)).unwrap())
+                    .unwrap(),
+            ],
+        )
+        .await
+        .unwrap();
+
+    // Proxy writes row 2, through the SQL rewrite.
+    via_proxy
+        .simple_query(&format!(
+            "INSERT INTO {LIBRARY_TABLE} (id, email, phone, ssn, note) \
+             VALUES (2, 'proxy@example.com', '555-300-4000', '219-09-9999', 'proxy-note')"
+        ))
+        .await
+        .unwrap();
+
+    // The proxy opens what the library wrote: decrypted, detokenized, masked.
+    let row = via_proxy
+        .query_one(
+            &format!("SELECT id, email, phone, ssn, note FROM {LIBRARY_TABLE} WHERE id = $1"),
+            &[&1i32],
+        )
+        .await
+        .expect("the proxy opens a library-written row-bound value");
+    assert_eq!(row.get::<_, Vec<u8>>(1), b"lib@example.com");
+    assert_eq!(row.get::<_, String>(2), "555-100-2000");
+    assert_eq!(row.get::<_, String>(4), "li**********");
+    let token_via_proxy: String = row.get(3);
+
+    // And its equality rewrite finds the library's blind index.
+    let found = via_proxy
+        .query_one(
+            &format!("SELECT id FROM {LIBRARY_TABLE} WHERE email = $1"),
+            &[&&b"lib@example.com"[..]],
+        )
+        .await
+        .expect("the proxy's search rewrite matches a library-written blind index");
+    assert_eq!(found.get::<_, i32>(0), 1);
+
+    // The library opens what the proxy wrote.
+    let row2 = RowKey::from_i32(2);
+    let stored = direct
+        .query_one(
+            &format!("SELECT email, phone, ssn, note FROM {LIBRARY_TABLE} WHERE id = 2"),
+            &[],
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        protector.open(&email, &stored.get::<_, Vec<u8>>(0), Some(&row2)).unwrap(),
+        Opened::Value(b"proxy@example.com".to_vec())
+    );
+    assert_eq!(
+        protector.open(&phone, stored.get::<_, String>(1).as_bytes(), Some(&row2)).unwrap(),
+        Opened::Value(b"555-300-4000".to_vec())
+    );
+    assert_eq!(
+        protector.seal(&ssn, b"219-09-9999", Some(&row2)).unwrap(),
+        stored.get::<_, String>(2).into_bytes(),
+        "tokens agree"
+    );
+    assert_eq!(
+        protector.seal(&ssn, b"078-05-1120", Some(&row1)).unwrap(),
+        token_via_proxy.into_bytes(),
+        "the proxy hands back the library's token unchanged"
+    );
+    assert_eq!(
+        protector.mask(&note, stored.get::<_, String>(3).as_bytes()).unwrap().as_ref(),
+        b"pr********"
+    );
+
+    // The library's search term is the proxy's stored prefix.
+    let term = protector.search_term(&email, b"proxy@example.com").unwrap().unwrap();
+    let found = direct
+        .query_one(
+            &format!("SELECT id FROM {LIBRARY_TABLE} WHERE substring(email from 1 for 32) = $1"),
+            &[&term],
+        )
+        .await
+        .unwrap();
+    assert_eq!(found.get::<_, i32>(0), 2);
+
+    // Row binding holds across the two: the proxy's row 2 value does not open
+    // as row 1.
+    assert!(matches!(
+        protector.open(&email, &stored.get::<_, Vec<u8>>(0), Some(&row1)),
+        Err(dbsec_core::Error::Decrypt)
+    ));
 }

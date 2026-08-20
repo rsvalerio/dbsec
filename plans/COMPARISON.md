@@ -129,15 +129,22 @@ What a framework author must reimplement today, all of it security-critical:
 | Missing from the library | Lives in | Cost of getting it wrong |
 |---|---|---|
 | Vault/OpenBao `KeySource` | `crates/proxy/src/vault.rs` | The library ships only `FileKeySource`, whose own docs say "dev/test". The README's headline "Vault/OpenBao-backed keys" is not a library feature. |
-| A façade (`seal`/`open`/`search_term` by column) | nowhere | Every embedder hand-wires `Ciphers` + `Arc<dyn KeySource>` + `CellContext` + transform choice, which is exactly where the three failures above happen. |
 
 Already closed: the PostgreSQL wire codec moved out of the library into
 `dbsec-pgwire` (TASK-0192.04); row-key canonicalization plus identifier
 folding — both of which build bytes that end up in the AAD — moved into
-`dbsec-core` (TASK-0192.01); and the column policy model with its
+`dbsec-core` (TASK-0192.01); the column policy model with its
 `schema.table.column` convention, validation and transform builder is
 `dbsec_core::policy` (TASK-0192.03), which the proxy deserializes into
-directly. An embedder can no longer diverge from the proxy on any of them. What still runs the wrong way is the KMS integration: the
+directly; and `dbsec_core::protector::Protector` (TASK-0192.05) is the
+seal/open/search_term/mask-by-column façade, with an unknown column, a
+missing or undeclared row key and an irreversible open all refused rather
+than degraded, and a pre-migration plaintext returned as a named
+`Opened::Unprotected` rather than as a value. `crates/core/examples/embedded.rs`
+is the sqlx application with no proxy, and
+`library_and_proxy_share_one_table` in the proxy's e2e suite is the proof that
+the two front ends agree byte-for-byte. An embedder can no longer diverge from
+the proxy on any of them. What still runs the wrong way is the KMS integration: the
 Vault/OpenBao source sits in the *binary*.
 
 Two further things the table does not show but an embedder meets:
@@ -146,9 +153,6 @@ Two further things the table does not show but an embedder meets:
   a key backend that does network I/O on the call path blocks the caller's
   runtime worker. The Vault extraction (TASK-0192.02) has to decide whether
   that stays a documented cache-on-miss guarantee or becomes an async trait.
-- `FieldTransform::open` returns `Ok(None)` for pre-migration plaintext so the
-  proxy can pass it through under `on_unprotected`. A library façade must make
-  that an explicit choice, not a silent return of plaintext.
 
 The refactor that closes this is tracked as TASK-0192 and its children
 (TASK-0192.01 … TASK-0192.08). The `Protector` façade (TASK-0192.05) reaches
