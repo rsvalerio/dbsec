@@ -2,7 +2,6 @@
 //! Frame-aware relay with optional TLS on both hops and transparent
 //! decryption of configured columns on the read path. See plans/PLAN.md.
 
-mod columns;
 mod config;
 mod diag;
 mod encrypt;
@@ -624,8 +623,8 @@ async fn serve(validated: ValidatedConfig) -> Result<(), Error> {
                     source
                 }
             };
-            let columns = Arc::new(columns::build(&config, &keys));
-            let row_keys = Arc::new(columns::row_keys(&config));
+            let columns = Arc::new(config.policy().build(&keys));
+            let row_keys = Arc::new(config.policy().row_keys());
             let dsn = protected.control_dsn.clone();
             let resolved =
                 resolve::resolve_columns(&dsn, &tls, &columns, &row_keys, CONNECT_TIMEOUT).await?;

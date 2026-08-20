@@ -129,14 +129,15 @@ What a framework author must reimplement today, all of it security-critical:
 | Missing from the library | Lives in | Cost of getting it wrong |
 |---|---|---|
 | Vault/OpenBao `KeySource` | `crates/proxy/src/vault.rs` | The library ships only `FileKeySource`, whose own docs say "dev/test". The README's headline "Vault/OpenBao-backed keys" is not a library feature. |
-| Column policy model (`TransformKind`, column/table specs, `columns::build`) | `crates/proxy/src/{config,columns}.rs` | Carries the `schema.table.column` key-naming convention. Name a key wrong and cross-column relocation protection is silently lost — no error, ever. |
 | A façade (`seal`/`open`/`search_term` by column) | nowhere | Every embedder hand-wires `Ciphers` + `Arc<dyn KeySource>` + `CellContext` + transform choice, which is exactly where the three failures above happen. |
 
 Already closed: the PostgreSQL wire codec moved out of the library into
-`dbsec-pgwire` (TASK-0192.04), and row-key canonicalization plus identifier
+`dbsec-pgwire` (TASK-0192.04); row-key canonicalization plus identifier
 folding — both of which build bytes that end up in the AAD — moved into
-`dbsec-core` (TASK-0192.01), so an embedder can no longer diverge from the
-proxy on either. What still runs the wrong way is the KMS integration: the
+`dbsec-core` (TASK-0192.01); and the column policy model with its
+`schema.table.column` convention, validation and transform builder is
+`dbsec_core::policy` (TASK-0192.03), which the proxy deserializes into
+directly. An embedder can no longer diverge from the proxy on any of them. What still runs the wrong way is the KMS integration: the
 Vault/OpenBao source sits in the *binary*.
 
 Two further things the table does not show but an embedder meets:

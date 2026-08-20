@@ -21,6 +21,7 @@ pub mod envelope;
 pub mod ident;
 pub mod keys;
 pub mod mask;
+pub mod policy;
 pub mod rowkey;
 pub mod sync;
 pub mod transform;
@@ -79,6 +80,11 @@ pub enum Error {
     KeyExhausted(String),
     #[error("unknown key: {0}")]
     UnknownKey(String),
+    /// A column policy that would look like protection while providing none —
+    /// see [`policy::Policy::validate`] for the rules. Front ends surface it
+    /// as a configuration error.
+    #[error("invalid policy: {0}")]
+    Policy(String),
     #[error("FPE requires at least {} digits", transform::MIN_FPE_DIGITS)]
     FpeDomain,
     #[error("FPE transform failed")]

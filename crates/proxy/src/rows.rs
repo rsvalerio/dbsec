@@ -1314,7 +1314,7 @@ pub mod tests {
     /// Both directions of one session over the state they share, so a test
     /// can play a whole extended-protocol conversation.
     fn session(ctx: &Arc<RowContext>) -> (crate::encrypt::QueryRewriter, RowDecryptor) {
-        use crate::columns::ProtectedColumn;
+        use dbsec_core::policy::ProtectedColumn;
         let catalog = Arc::new(crate::encrypt::WriteCatalog::new(
             &[ProtectedColumn {
                 schema: "public".into(),
@@ -1367,7 +1367,7 @@ pub mod tests {
         strict: bool,
         policy: OnUnprotected,
     ) -> (Arc<RowContext>, crate::encrypt::QueryRewriter, RowDecryptor) {
-        use crate::columns::ProtectedColumn;
+        use dbsec_core::policy::ProtectedColumn;
 
         const TABLE: u32 = 1234;
         let tf = transform_bound(false, strict);

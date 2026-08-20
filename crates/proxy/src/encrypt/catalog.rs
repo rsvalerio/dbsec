@@ -20,8 +20,8 @@ use std::sync::Arc;
 use dbsec_core::transform::FieldTransform;
 use sqlparser::ast::{Ident, ObjectName};
 
-use crate::columns::ProtectedColumn;
 use dbsec_core::ident::fold_identifier;
+use dbsec_core::policy::ProtectedColumn;
 
 use crate::config::OnUnprotected;
 
