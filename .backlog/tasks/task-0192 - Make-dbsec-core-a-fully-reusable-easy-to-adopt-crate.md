@@ -1,10 +1,10 @@
 ---
 id: TASK-0192
 title: 'Make dbsec-core a fully reusable, easy-to-adopt crate'
-status: To Do
+status: Done
 assignee: []
 created_date: '2026-08-19 16:58'
-updated_date: '2026-08-20 18:34'
+updated_date: '2026-08-20 19:50'
 labels:
   - library
   - refactor
@@ -25,8 +25,14 @@ No crypto behaviour changes in any child task: values written through the librar
 
 ## Acceptance Criteria
 <!-- AC:BEGIN -->
-- [ ] #1 Every child task is Done
-- [ ] #2 A plain sqlx application can encrypt, search and mask a column with no proxy process running, using only published crates
-- [ ] #3 Values written by the library open through the proxy and vice versa, proven by a test
-- [ ] #4 A plain sqlx application declares the policy once (derive + config) and gets encrypt/decrypt/search on its structs without calling seal/open per column (TASK-0192.08)
+- [x] #1 Every child task is Done
+- [x] #2 A plain sqlx application can encrypt, search and mask a column with no proxy process running, using only published crates
+- [x] #3 Values written by the library open through the proxy and vice versa, proven by a test
+- [x] #4 A plain sqlx application declares the policy once (derive + config) and gets encrypt/decrypt/search on its structs without calling seal/open per column (TASK-0192.08)
 <!-- AC:END -->
+
+## Implementation Notes
+
+<!-- SECTION:NOTES:BEGIN -->
+All eight children Done (2026-08-20). Stack: #21 lib/policy-model, #22 lib/derive, #23 lib/publishable, plus lib/vault. Remaining on the library side is only the crates.io release itself.
+<!-- SECTION:NOTES:END -->
