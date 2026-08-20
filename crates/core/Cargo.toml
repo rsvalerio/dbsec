@@ -1,6 +1,6 @@
 [package]
 name = "dbsec-core"
-description = "Field-level encryption, pseudonymization and masking for PostgreSQL wire traffic"
+description = "Field-level encryption, pseudonymization and masking for PostgreSQL columns"
 version.workspace = true
 edition.workspace = true
 license.workspace = true

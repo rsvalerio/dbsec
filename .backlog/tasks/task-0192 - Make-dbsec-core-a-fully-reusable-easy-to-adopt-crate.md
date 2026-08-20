@@ -4,6 +4,7 @@ title: 'Make dbsec-core a fully reusable, easy-to-adopt crate'
 status: To Do
 assignee: []
 created_date: '2026-08-19 16:58'
+updated_date: '2026-08-20 18:34'
 labels:
   - library
   - refactor
@@ -27,4 +28,5 @@ No crypto behaviour changes in any child task: values written through the librar
 - [ ] #1 Every child task is Done
 - [ ] #2 A plain sqlx application can encrypt, search and mask a column with no proxy process running, using only published crates
 - [ ] #3 Values written by the library open through the proxy and vice versa, proven by a test
+- [ ] #4 A plain sqlx application declares the policy once (derive + config) and gets encrypt/decrypt/search on its structs without calling seal/open per column (TASK-0192.08)
 <!-- AC:END -->
