@@ -16,10 +16,10 @@ repository = "https://github.com/rsvalerio/dbsec"
 rust-version = "1.85"
 
 [workspace.dependencies]
-dbsec-core = { path = "crates/core", version = "0.5.0" }
-dbsec-pgwire = { path = "crates/pgwire", version = "0.5.0" }
-dbsec-derive = { path = "crates/derive", version = "0.5.0" }
-dbsec-vault = { path = "crates/vault", version = "0.5.0" }
+dbsec-core = { path = "crates/core", version = "0.6.0" }
+dbsec-pgwire = { path = "crates/pgwire", version = "0.6.0" }
+dbsec-derive = { path = "crates/derive", version = "0.6.0" }
+dbsec-vault = { path = "crates/vault", version = "0.6.0" }
 
 # proc-macro (dbsec-derive)
 syn = { version = "2", features = ["full"] }
