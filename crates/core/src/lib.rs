@@ -23,9 +23,14 @@ pub mod keys;
 pub mod mask;
 pub mod policy;
 pub mod protector;
+pub mod record;
 pub mod rowkey;
 pub mod sync;
 pub mod transform;
+
+/// `#[derive(Protect)]` — see [`record`] and the `dbsec-derive` docs.
+#[cfg(feature = "derive")]
+pub use dbsec_derive::Protect;
 
 use std::path::PathBuf;
 

@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/core", "crates/pgwire", "crates/proxy"]
+members = ["crates/core", "crates/derive", "crates/pgwire", "crates/proxy"]
 exclude = ["fuzz"]
 
 [workspace.package]
@@ -12,6 +12,12 @@ repository = "https://github.com/rsvalerio/dbsec"
 [workspace.dependencies]
 dbsec-core = { path = "crates/core" }
 dbsec-pgwire = { path = "crates/pgwire" }
+dbsec-derive = { path = "crates/derive" }
+
+# proc-macro (dbsec-derive)
+syn = { version = "2", features = ["full"] }
+quote = "1"
+proc-macro2 = "1"
 
 # async runtime + protocol
 tokio = { version = "1", features = ["rt-multi-thread", "net", "io-util", "macros", "signal", "time"] }

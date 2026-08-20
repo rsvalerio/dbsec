@@ -568,4 +568,93 @@ async fn library_and_proxy_share_one_table() {
         protector.open(&email, &stored.get::<_, Vec<u8>>(0), Some(&row1)),
         Err(dbsec_core::Error::Decrypt)
     ));
+
+    // The same again through `#[derive(Protect)]`: the struct declares the
+    // policy, the proxy's config declares it in TOML, and a record sealed by
+    // one opens through the other. Tokens are irreversible so the struct
+    // leaves `ssn` out; the proxy's own config still protects that column.
+    #[derive(dbsec_core::Protect, Clone, Debug, PartialEq)]
+    #[dbsec(table = "users_library", row_key = "id", sealed_derive(Debug))]
+    struct User {
+        id: i32,
+        #[dbsec(searchable)]
+        email: String,
+        #[dbsec(fpe)]
+        phone: String,
+        #[dbsec(none, mask(keep_first = 2))]
+        note: String,
+    }
+    assert_eq!(User::TABLE, format!("public.{LIBRARY_TABLE}"));
+    let derived = Protector::new(
+        User::policy(),
+        Arc::new(FileKeySource::load(&dir.path().join("keys.toml")).unwrap()),
+    )
+    .unwrap();
+
+    let user = User {
+        id: 3,
+        email: "derive@example.com".into(),
+        phone: "555-500-6000".into(),
+        note: "derive-note".into(),
+    };
+    let sealed = user.seal(&derived).unwrap();
+    direct
+        .execute(
+            &format!(
+                "INSERT INTO {LIBRARY_TABLE} (id, email, phone, note) VALUES ($1, $2, $3, $4)"
+            ),
+            &[&sealed.id, &sealed.email, &sealed.phone, &sealed.note],
+        )
+        .await
+        .unwrap();
+
+    let row = via_proxy
+        .query_one(
+            &format!("SELECT id, email, phone, note FROM {LIBRARY_TABLE} WHERE id = $1"),
+            &[&3i32],
+        )
+        .await
+        .expect("the proxy opens a derive-sealed record");
+    assert_eq!(row.get::<_, Vec<u8>>(1), b"derive@example.com");
+    assert_eq!(row.get::<_, String>(2), "555-500-6000");
+    assert_eq!(row.get::<_, String>(3), "de*********");
+
+    let found = via_proxy
+        .query_one(
+            &format!("SELECT id FROM {LIBRARY_TABLE} WHERE email = $1"),
+            &[&&b"derive@example.com"[..]],
+        )
+        .await
+        .expect("the proxy's search rewrite matches a derive-written blind index");
+    assert_eq!(found.get::<_, i32>(0), 3);
+
+    // And the proxy's row 2 opens as the struct.
+    let stored = direct
+        .query_one(&format!("SELECT id, email, phone, note FROM {LIBRARY_TABLE} WHERE id = 2"), &[])
+        .await
+        .unwrap();
+    let from_proxy = UserSealed {
+        id: stored.get(0),
+        email: stored.get(1),
+        phone: stored.get(2),
+        note: stored.get(3),
+    };
+    assert_eq!(
+        from_proxy.open(&derived).unwrap(),
+        User {
+            id: 2,
+            email: "proxy@example.com".into(),
+            phone: "555-300-4000".into(),
+            note: "proxy-note".into(),
+        }
+    );
+    let term = User::email_term(&derived, b"proxy@example.com").unwrap();
+    let found = direct
+        .query_one(
+            &format!("SELECT id FROM {LIBRARY_TABLE} WHERE substring(email from 1 for 32) = $1"),
+            &[&term],
+        )
+        .await
+        .unwrap();
+    assert_eq!(found.get::<_, i32>(0), 2);
 }

@@ -1,0 +1,18 @@
+[package]
+name = "dbsec-derive"
+description = "#[derive(Protect)] for dbsec-core: record-level field encryption over a Protector"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lib]
+proc-macro = true
+
+[dependencies]
+syn = { workspace = true }
+quote = { workspace = true }
+proc-macro2 = { workspace = true }
+
+[lints]
+workspace = true

@@ -39,6 +39,8 @@ rustix = { workspace = true }
 workspace = true
 
 [dev-dependencies]
+# The e2e suite proves a `#[derive(Protect)]` record and the proxy agree.
+dbsec-core = { workspace = true, features = ["derive"] }
 futures-util = { workspace = true }
 # `test-util` for `#[tokio::test(start_paused = true)]`: the relay's drain
 # deadline is measured in seconds, and a paused clock asserts it without
