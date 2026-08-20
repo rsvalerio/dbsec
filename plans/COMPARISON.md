@@ -156,10 +156,16 @@ Two further things the table does not show but an embedder meets:
 
 The refactor that closes this is tracked as TASK-0192 and its children
 (TASK-0192.01 … TASK-0192.08). The `Protector` façade (TASK-0192.05) reaches
-the AWS-SDK level — seal/open/search by column name; the record-level derive
-(TASK-0192.08) is what reaches the "declare the policy on the struct and the
-fields are handled" level, and it is the only shape that can keep row binding
-transparent, since a per-value `Decode` never sees the row.
+the AWS-SDK level — seal/open/search by column name. `#[derive(Protect)]`
+(`dbsec-derive`, TASK-0192.08, behind the `derive` feature) reaches the
+"declare the policy on the struct and the fields are handled" level: the
+struct attributes are the policy (`User::policy()`), `seal` / `open` /
+`email_term` / `masked` are generated over it, and the sealed twin takes
+whatever derives the ORM needs (`sealed_derive(sqlx::FromRow)`). It is the
+only shape that can keep row binding transparent, since a per-value `Decode`
+never sees the row — the derive reads the `row_key` field itself. What remains
+of TASK-0192 is packaging: the Vault source out of the binary (0192.02),
+feature gates and crates.io metadata (0192.06), and the README (0192.07).
 
 ## Reference points for the library API
 

@@ -82,7 +82,7 @@ e2e: ## Driver matrix (tokio-postgres, sqlx, psycopg) against dockerized Postgre
 	@$(call start_pg)
 	cargo nextest run -p dbsec --test e2e --test e2e_sqlx --test e2e_psycopg \
 		--run-ignored ignored-only --success-output immediate \
-		&& cargo run -q -p dbsec-core --example embedded; \
+		&& cargo run -q -p dbsec-core --features derive --example embedded; \
 		status=$$?; $(call stop_pg); exit $$status
 
 e2e-vault: ## Vault/OpenBao key source against a live dev-mode OpenBao

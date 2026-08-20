@@ -423,6 +423,7 @@ version = "0.5.0"
 dependencies = [
  "aes",
  "aes-gcm",
+ "dbsec-derive",
  "fpe",
  "hex",
  "hmac 0.12.1",
@@ -437,6 +438,15 @@ dependencies = [
  "toml",
  "tracing",
  "zeroize",
+]
+
+[[package]]
+name = "dbsec-derive"
+version = "0.5.0"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 2.0.119",
 ]
 
 [[package]]
