@@ -31,7 +31,7 @@ The products compared:
 | Capability | dbsec | Acra | CipherStash | pgcrypto/pgsodium | Vault Transit | AWS DB Enc SDK |
 |---|---|---|---|---|---|---|
 | Transparent field encryption through a SQL proxy | ✅ | ✅ | ✅ (Proxy) | ❌ | ❌ | ❌ |
-| Same features from a linked-in library | ⚠️ partial | ✅ SDKs | ✅ (the primary shape) | n/a | ⚠️ per-value RPC | ✅ |
+| Same features from a linked-in library | ✅ | ✅ SDKs | ✅ (the primary shape) | n/a | ⚠️ per-value RPC | ✅ |
 | Rust-native | ✅ | ❌ Go | ✅ core | ❌ C | ❌ | ❌ |
 | Equality search over ciphertext | ✅ blind index | ✅ blind index | ✅ | ❌ | ❌ | ✅ beacons |
 | Range / ordering search | ❌ | ❌ | ✅ ORE | ❌ | ❌ | ❌ |
@@ -43,7 +43,7 @@ The products compared:
 | Ciphertext bound to its **row** | ✅ `DBS3` opt-in | ❌ | ✅ per-value keys | ❌ | ❌ | ✅ |
 | Per-value keys | ❌ (per-DEK) | ❌ | ✅ ZeroKMS | ❌ | ❌ | ⚠️ |
 | Identity-aware / per-tenant keys | ❌ | ✅ zones | ✅ | ❌ | ⚠️ | ⚠️ |
-| KMS-backed key storage | ✅ Vault/OpenBao | ✅ Vault/KMS/Redis/DB | ✅ ZeroKMS | ⚠️ in-DB | n/a | ✅ KMS |
+| KMS-backed key storage | ✅ Vault/OpenBao (`dbsec-vault`) | ✅ Vault/KMS/Redis/DB | ✅ ZeroKMS | ⚠️ in-DB | n/a | ✅ KMS |
 | Automatic DEK rotation | ✅ per start | ✅ | ✅ | ❌ | ✅ | ✅ |
 | Key-management CLI / re-encryption tooling | ❌ | ✅ `acra-keys` | ✅ | ❌ | ✅ | ⚠️ |
 | Tamper-evident audit log | ❌ | ✅ signed | ✅ | ❌ | ✅ | ❌ |
@@ -106,13 +106,12 @@ The stated goal: `dbsec-core` should be an independent, reusable crate that
 gives a Rust application the *same* protection the proxy gives, at code time
 instead of at runtime, with minimal glue left to the caller.
 
-**Status: met for the code path; packaging is the remainder.** The library is
-`dbsec-core` (crypto, policy, `Protector`) plus `dbsec-derive`
-(`#[derive(Protect)]`), and the README leads with it. The binary is still by
-far the larger crate — ~19,600 LOC against ~3,700 — but that is the SQL
-rewrite and the wire protocol, which a library does not need; nothing a
-library user depends on is inside it any more except the Vault/OpenBao
-`KeySource` (TASK-0192.02).
+**Status: met.** The library is `dbsec-core` (crypto, policy, `Protector`),
+`dbsec-derive` (`#[derive(Protect)]`) and `dbsec-vault` (the Vault/OpenBao
+`KeySource`), and the README leads with it. The binary is still by far the
+larger crate — ~19,600 LOC against ~5,000 — but that is the SQL rewrite and
+the wire protocol, which a library does not need. Nothing a library user
+depends on is inside it any more.
 
 What already works. `dbsec-core` depends on no tokio, no sqlparser and no
 `vaultrs`, and `transform::FieldTransform` is the right code-time abstraction:
@@ -127,16 +126,20 @@ fn binds_row(&self) -> bool;
 `EncryptTransform`, `FpeTransform`, `TokenTransform`, the envelope, the blind
 index and `MaskSpec` are all there and all callable.
 
-What a framework author must reimplement today, all of it security-critical:
+What a framework author had to reimplement when this was first written, all of
+it security-critical, and where each piece went:
 
-| Missing from the library | Lives in | Cost of getting it wrong |
-|---|---|---|
-| Vault/OpenBao `KeySource` | `crates/proxy/src/vault.rs` | The library ships only `FileKeySource` (behind the `keyfile` feature, documented as dev/test). An embedder writes its own `KeySource` over its KMS; the Vault one is not yet reusable. |
+| Was missing from the library | Now |
+|---|---|
+| Vault/OpenBao `KeySource` | `dbsec-vault` (TASK-0192.02) |
+| Row-key canonicalization, identifier folding | `dbsec_core::{rowkey, ident}` (TASK-0192.01) |
+| Column policy model and the `schema.table.column` convention | `dbsec_core::policy` (TASK-0192.03) |
+| A façade by column name | `dbsec_core::protector::Protector` (TASK-0192.05) |
+| Declaring the policy on the data | `#[derive(Protect)]` (TASK-0192.08) |
 
 Already closed: the PostgreSQL wire codec moved out of the library into
 `dbsec-pgwire` (TASK-0192.04); row-key canonicalization plus identifier
-folding — both of which build bytes that end up in the AAD — moved into
-`dbsec-core` (TASK-0192.01); the column policy model with its
+folding moved into `dbsec-core` (TASK-0192.01); the column policy model with its
 `schema.table.column` convention, validation and transform builder is
 `dbsec_core::policy` (TASK-0192.03), which the proxy deserializes into
 directly; and `dbsec_core::protector::Protector` (TASK-0192.05) is the
@@ -146,19 +149,20 @@ than degraded, and a pre-migration plaintext returned as a named
 `Opened::Unprotected` rather than as a value. `crates/core/examples/embedded.rs`
 is the sqlx application with no proxy, and
 `library_and_proxy_share_one_table` in the proxy's e2e suite is the proof that
-the two front ends agree byte-for-byte. On each of those — the
-policy and its key-naming convention, row-key canonicalization, identifier
-folding, the transforms, and the Vault key source — an embedder now runs the
-proxy's own code, and the round-trip test is the check that they agree; what it
-does not cover is a `KeySource` an embedder writes itself. What still runs the wrong way is the KMS integration: the
-Vault/OpenBao source sits in the *binary*.
+the two front ends agree byte-for-byte; and the Vault/OpenBao `KeySource` is
+`dbsec-vault` (TASK-0192.02), with `KeySource` kept synchronous and cache
+misses bridged to the async client under a timeout, as the proxy already did.
+On each of those — the policy and its key-naming convention, row-key
+canonicalization, identifier folding, the transforms, and the Vault key
+source — an embedder now runs the proxy's own code, and the round-trip test is
+the check that they agree; what it does not cover is a `KeySource` an embedder
+writes itself.
 
-Two further things the table does not show but an embedder meets:
+One further thing the table does not show but an embedder meets:
 
-- `keys::KeySource` is a synchronous trait. Linked into an async application,
-  a key backend that does network I/O on the call path blocks the caller's
-  runtime worker. The Vault extraction (TASK-0192.02) has to decide whether
-  that stays a documented cache-on-miss guarantee or becomes an async trait.
+- `keys::KeySource` is a synchronous trait. `dbsec-vault` bridges to its
+  async client with `block_in_place` under `timeout_secs`, only on a cache
+  miss, and needs a multi-thread tokio runtime for it — stated in its docs.
 
 The refactor that closes this is tracked as TASK-0192 and its children
 (TASK-0192.01 … TASK-0192.08). The `Protector` façade (TASK-0192.05) reaches
@@ -169,9 +173,9 @@ struct attributes are the policy (`User::policy()`), `seal` / `open` /
 `email_term` / `masked` are generated over it, and the sealed twin takes
 whatever derives the ORM needs (`sealed_derive(sqlx::FromRow)`). It is the
 only shape that can keep row binding transparent, since a per-value `Decode`
-never sees the row — the derive reads the `row_key` field itself. What remains
-of TASK-0192 is packaging: the Vault source out of the binary (0192.02),
-feature gates and crates.io metadata (0192.06), and the README (0192.07).
+never sees the row — the derive reads the `row_key` field itself. TASK-0192 is
+complete; what remains on the library side is a crates.io release (derive,
+then core, then vault).
 
 ## Reference points for the library API
 

@@ -389,13 +389,12 @@ dependencies = [
 name = "dbsec"
 version = "0.6.0"
 dependencies = [
- "base64",
  "dbsec-core",
  "dbsec-pgwire",
+ "dbsec-vault",
  "futures-util",
  "hex",
  "proptest",
- "rand 0.8.7",
  "rcgen",
  "rustix",
  "rustls",
@@ -412,8 +411,6 @@ dependencies = [
  "toml",
  "tracing",
  "tracing-subscriber",
- "url",
- "vaultrs",
  "zeroize",
 ]
 
@@ -455,6 +452,25 @@ version = "0.6.0"
 dependencies = [
  "proptest",
  "thiserror 2.0.20",
+]
+
+[[package]]
+name = "dbsec-vault"
+version = "0.5.0"
+dependencies = [
+ "base64",
+ "dbsec-core",
+ "hex",
+ "rand 0.8.7",
+ "serde",
+ "thiserror 2.0.20",
+ "tokio",
+ "toml",
+ "tracing",
+ "tracing-subscriber",
+ "url",
+ "vaultrs",
+ "zeroize",
 ]
 
 [[package]]

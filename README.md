@@ -10,7 +10,8 @@ clients that go through the proxy.
   authenticating
 - Equality search over ciphertext via a deterministic blind index
 - Storage-free pseudonymization (FF1 FPE + HMAC tokens) and read-path masking
-- Keys behind a `KeySource` trait (the proxy ships a Vault/OpenBao source);
+- Keys behind a `KeySource` trait; `dbsec-vault` implements it over
+  HashiCorp Vault / OpenBao (Transit-wrapped DEKs, KV-stored index keys);
   `unsafe_code = "forbid"` workspace-wide
 - PostgreSQL only; TLS on both proxy hops (rustls); flat TOML config
 
@@ -63,7 +64,8 @@ protector's policy on a column's stored form, an attempt to open a value that
 was never sealed (`open_lenient` accepts one, by name). Without the derive,
 `Protector` offers `seal` / `open` / `search_term` / `mask` by column name, and
 a policy can also be read from the proxy's TOML (`serde` feature) so the two
-share one file. `crates/core/examples/embedded.rs` is the complete sqlx
+share one file. `dbsec-vault` supplies the Vault/OpenBao `KeySource` the proxy uses, for
+the library too. `crates/core/examples/embedded.rs` is the complete sqlx
 application, run by `make e2e`; the crate docs carry the runnable example, the
 stored-format table and what the library does *not* protect.
 

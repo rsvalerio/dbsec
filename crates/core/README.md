@@ -11,8 +11,9 @@ application that links the library and clients that go through the proxy.
 - FF1 format-preserving pseudonymization (storage-free) and irreversible HMAC
   tokens.
 - Read-path masking.
-- Keys behind a `KeySource` trait you implement over your KMS;
-  `unsafe_code = "forbid"`.
+- Keys behind a `KeySource` trait you implement over your KMS — or take
+  [`dbsec-vault`](https://crates.io/crates/dbsec-vault) for HashiCorp Vault /
+  OpenBao; `unsafe_code = "forbid"`.
 
 ```toml
 [dependencies]

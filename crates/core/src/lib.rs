@@ -104,6 +104,7 @@
 #![deny(missing_docs)]
 
 pub mod blind_index;
+pub mod diag;
 pub mod envelope;
 pub mod ident;
 pub mod keys;
@@ -186,6 +187,10 @@ pub enum Error {
     /// The key source has no key under this id or name.
     #[error("unknown key: {0}")]
     UnknownKey(String),
+    /// A secret-bearing file is readable beyond its owner; see
+    /// [`keys::check_secret_file_mode`].
+    #[error("{0}")]
+    SecretFileMode(String),
     /// A column policy that would look like protection while providing none —
     /// see [`policy::Policy::validate`] for the rules. Front ends surface it
     /// as a configuration error.
