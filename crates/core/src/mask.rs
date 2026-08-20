@@ -9,7 +9,7 @@
 ///
 /// With the `serde` feature it deserializes from `{ keep_last = 4 }` and the
 /// like, `mask_with` defaulting to `*`.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[cfg_attr(feature = "serde", derive(serde::Deserialize), serde(deny_unknown_fields))]
 pub struct MaskSpec {
     /// Number of leading characters left visible.

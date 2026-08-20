@@ -338,6 +338,14 @@ mod tests {
         assert_eq!(&stored[..32], &term[..], "the predicate matches the stored prefix");
         assert_eq!(p.search_term("billing.cards.pan", b"4111111111111111").unwrap(), None);
         assert_eq!(p.search_term("users.note", b"x").unwrap(), None);
+        // An encrypt column with searchable = false stores no blind index, so
+        // a term for it would build a predicate that matches nothing.
+        let unsearchable = Protector::new(
+            Policy::new(vec![ColumnPolicy::new("users", "email")], vec![]),
+            Arc::new(OneKey),
+        )
+        .unwrap();
+        assert_eq!(unsearchable.search_term("users.email", b"a@b.io").unwrap(), None);
     }
 
     #[test]

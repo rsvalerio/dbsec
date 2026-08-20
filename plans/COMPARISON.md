@@ -146,8 +146,11 @@ than degraded, and a pre-migration plaintext returned as a named
 `Opened::Unprotected` rather than as a value. `crates/core/examples/embedded.rs`
 is the sqlx application with no proxy, and
 `library_and_proxy_share_one_table` in the proxy's e2e suite is the proof that
-the two front ends agree byte-for-byte. An embedder can no longer diverge from
-the proxy on any of them. What still runs the wrong way is the KMS integration: the
+the two front ends agree byte-for-byte. On each of those — the
+policy and its key-naming convention, row-key canonicalization, identifier
+folding, the transforms, and the Vault key source — an embedder now runs the
+proxy's own code, and the round-trip test is the check that they agree; what it
+does not cover is a `KeySource` an embedder writes itself. What still runs the wrong way is the KMS integration: the
 Vault/OpenBao source sits in the *binary*.
 
 Two further things the table does not show but an embedder meets:

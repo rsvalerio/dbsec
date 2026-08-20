@@ -72,7 +72,7 @@ pub enum TransformKind {
 ///
 /// With the `serde` feature it deserializes from the proxy's `[[column]]`
 /// table shape; in code, start from [`ColumnPolicy::new`] and set the rest.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 #[cfg_attr(feature = "serde", derive(serde::Deserialize), serde(deny_unknown_fields))]
 pub struct ColumnPolicy {
     /// Table name, optionally schema-qualified; bare names mean `public`.
@@ -162,7 +162,7 @@ impl ColumnPolicy {
 /// name the row at both ends. Through the proxy that means client-supplied
 /// key values, single-row updates and reads that project the key; in code it
 /// means passing the row key to every seal and open.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 #[cfg_attr(feature = "serde", derive(serde::Deserialize), serde(deny_unknown_fields))]
 pub struct TablePolicy {
     /// Table name, optionally schema-qualified; bare names mean `public`.
@@ -214,7 +214,7 @@ impl TablePolicy {
 ///
 /// With the `serde` feature it deserializes from the proxy's config shape —
 /// `[[column]]` and `[[table]]` arrays — so one TOML file can drive both.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 #[cfg_attr(feature = "serde", derive(serde::Deserialize), serde(deny_unknown_fields))]
 pub struct Policy {
     /// Every protected column.
@@ -558,6 +558,7 @@ mod tests {
              \n[[column]]\ntable = \"billing.cards\"\ncolumn = \"pan\"\ntransform = \"fpe\"\nmask = { keep_last = 4 }\n\
              \n[[table]]\ntable = \"users\"\nrow_key = \"id\"\nstrict_row_binding = true\n",
         );
+        assert_eq!(from_code, from_toml, "the builders and the TOML shape are one policy");
         for p in [&from_code, &from_toml] {
             p.validate().unwrap();
             assert_eq!(p.columns[0].qualified_name(), "public.users.email");
