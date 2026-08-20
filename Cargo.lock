@@ -456,7 +456,7 @@ dependencies = [
 
 [[package]]
 name = "dbsec-vault"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "base64",
  "dbsec-core",

@@ -17,7 +17,7 @@ application that links the library and clients that go through the proxy.
 
 ```toml
 [dependencies]
-dbsec-core = { version = "0.5", features = ["derive"] }
+dbsec-core = { version = "0.6", features = ["derive"] }
 ```
 
 ```rust
