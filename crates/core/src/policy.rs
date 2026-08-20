@@ -33,8 +33,6 @@
 use std::collections::HashSet;
 use std::sync::Arc;
 
-use serde::Deserialize;
-
 use crate::envelope::{CellContext, Ciphers};
 use crate::ident::{fold_identifier, MAX_IDENTIFIER_BYTES};
 use crate::keys::KeySource;
@@ -54,8 +52,8 @@ pub fn split_table(name: &str) -> (&str, &str) {
 }
 
 /// How a column's values are protected.
-#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Deserialize)]
-#[serde(rename_all = "lowercase")]
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Deserialize), serde(rename_all = "lowercase"))]
 pub enum TransformKind {
     /// AES-256-GCM envelope, stored as BYTEA.
     #[default]
@@ -72,31 +70,34 @@ pub enum TransformKind {
 
 /// One protected column.
 ///
-/// Deserializes from the proxy's `[[column]]` table shape; in code, start from
-/// [`ColumnPolicy::new`] and set the rest.
-#[derive(Debug, Clone, Deserialize)]
-#[serde(deny_unknown_fields)]
+/// With the `serde` feature it deserializes from the proxy's `[[column]]`
+/// table shape; in code, start from [`ColumnPolicy::new`] and set the rest.
+#[derive(Debug, Clone)]
+#[cfg_attr(feature = "serde", derive(serde::Deserialize), serde(deny_unknown_fields))]
 pub struct ColumnPolicy {
     /// Table name, optionally schema-qualified; bare names mean `public`.
     pub table: String,
     /// Column name within the table.
     pub column: String,
-    #[serde(default)]
+    /// How the column's values are protected. Defaults to
+    /// [`TransformKind::Encrypt`].
+    #[cfg_attr(feature = "serde", serde(default))]
     pub transform: TransformKind,
     /// Searchable columns carry a blind index before the envelope (stripped
     /// on read) and can be queried by equality. Only valid with
     /// [`TransformKind::Encrypt`].
-    #[serde(default)]
+    #[cfg_attr(feature = "serde", serde(default))]
     pub searchable: bool,
     /// Whether FPE values are detokenized on the read path. Only meaningful
     /// for [`TransformKind::Fpe`]; tokens are irreversible, envelopes always
     /// decrypt.
-    #[serde(default = "default_true")]
+    #[cfg_attr(feature = "serde", serde(default = "default_true"))]
     pub detokenize: bool,
     /// Read-path mask applied after decryption/detokenization.
     pub mask: Option<MaskSpec>,
 }
 
+#[cfg(feature = "serde")]
 fn default_true() -> bool {
     true
 }
@@ -114,21 +115,29 @@ impl ColumnPolicy {
         }
     }
 
+    /// Sets how the column is protected.
+    #[must_use]
     pub fn transform(mut self, transform: TransformKind) -> Self {
         self.transform = transform;
         self
     }
 
+    /// Makes an `encrypt` column searchable by equality (blind index).
+    #[must_use]
     pub fn searchable(mut self, searchable: bool) -> Self {
         self.searchable = searchable;
         self
     }
 
+    /// Whether an `fpe` column is detokenized on read.
+    #[must_use]
     pub fn detokenize(mut self, detokenize: bool) -> Self {
         self.detokenize = detokenize;
         self
     }
 
+    /// Sets the read-path mask.
+    #[must_use]
     pub fn mask(mut self, mask: MaskSpec) -> Self {
         self.mask = Some(mask);
         self
@@ -153,8 +162,8 @@ impl ColumnPolicy {
 /// name the row at both ends. Through the proxy that means client-supplied
 /// key values, single-row updates and reads that project the key; in code it
 /// means passing the row key to every seal and open.
-#[derive(Debug, Clone, Deserialize)]
-#[serde(deny_unknown_fields)]
+#[derive(Debug, Clone)]
+#[cfg_attr(feature = "serde", derive(serde::Deserialize), serde(deny_unknown_fields))]
 pub struct TablePolicy {
     /// Table name, optionally schema-qualified; bare names mean `public`.
     pub table: String,
@@ -177,15 +186,19 @@ pub struct TablePolicy {
     /// re-encrypted: back-compat then becomes a stated migration window rather
     /// than a permanent hole, and any later degradation is refused on the next
     /// read instead of going unnoticed.
-    #[serde(default)]
+    #[cfg_attr(feature = "serde", serde(default))]
     pub strict_row_binding: bool,
 }
 
 impl TablePolicy {
+    /// Declares `row_key` as the column that names a row of `table`, with the
+    /// migration window open (`strict_row_binding = false`).
     pub fn new(table: impl Into<String>, row_key: impl Into<String>) -> Self {
         Self { table: table.into(), row_key: row_key.into(), strict_row_binding: false }
     }
 
+    /// Closes or reopens the row-binding migration window.
+    #[must_use]
     pub fn strict_row_binding(mut self, strict: bool) -> Self {
         self.strict_row_binding = strict;
         self
@@ -198,12 +211,17 @@ impl TablePolicy {
 }
 
 /// The whole policy: every protected column and every row-bound table.
-#[derive(Debug, Clone, Default, Deserialize)]
-#[serde(deny_unknown_fields)]
+///
+/// With the `serde` feature it deserializes from the proxy's config shape —
+/// `[[column]]` and `[[table]]` arrays — so one TOML file can drive both.
+#[derive(Debug, Clone, Default)]
+#[cfg_attr(feature = "serde", derive(serde::Deserialize), serde(deny_unknown_fields))]
 pub struct Policy {
-    #[serde(default, rename = "column")]
+    /// Every protected column.
+    #[cfg_attr(feature = "serde", serde(default, rename = "column"))]
     pub columns: Vec<ColumnPolicy>,
-    #[serde(default, rename = "table")]
+    /// Every table that binds its encrypted values to a row.
+    #[cfg_attr(feature = "serde", serde(default, rename = "table"))]
     pub tables: Vec<TablePolicy>,
 }
 
@@ -212,19 +230,26 @@ pub struct Policy {
 /// takes only what it needs.
 #[derive(Debug, Clone)]
 pub struct RowKeyDecl {
+    /// Schema of the table, `public` by default.
     pub schema: String,
+    /// The table.
     pub table: String,
+    /// The column whose value names a row.
     pub column: String,
 }
 
 /// A protected column with its transform wired: what [`Policy::build`]
 /// produces and what every data path consumes.
 pub struct ProtectedColumn {
+    /// Schema of the table, `public` by default.
     pub schema: String,
+    /// The table.
     pub table: String,
+    /// The column.
     pub column: String,
     /// `None` for mask-only columns — writes pass through untouched.
     pub transform: Option<Arc<dyn FieldTransform>>,
+    /// Whether the column carries a blind index and supports equality search.
     pub searchable: bool,
     /// Whether the read path should try to open stored values. False for
     /// irreversible tokens and FPE with detokenize disabled.
@@ -235,12 +260,15 @@ pub struct ProtectedColumn {
 }
 
 impl ProtectedColumn {
+    /// `schema.table.column` — the key name and the cell context.
     pub fn qualified_name(&self) -> String {
         format!("{}.{}.{}", self.schema, self.table, self.column)
     }
 }
 
 impl Policy {
+    /// A policy over these columns and row-bound tables. Not validated until
+    /// [`Self::validate`] (which [`crate::protector::Protector::new`] calls).
     pub fn new(columns: Vec<ColumnPolicy>, tables: Vec<TablePolicy>) -> Self {
         Self { columns, tables }
     }
@@ -448,7 +476,7 @@ fn check_identifiers(name: &str, schema: &str, table: &str, column: &str) -> Res
     Ok(())
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "keyfile"))]
 mod tests {
     use super::*;
     use crate::envelope::KeyId;

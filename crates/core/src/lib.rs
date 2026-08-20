@@ -1,20 +1,107 @@
-//! dbsec-core: field-level encryption, pseudonymization and masking for
-//! PostgreSQL columns.
+//! Field-level encryption, pseudonymization and masking for PostgreSQL
+//! columns — as a library. The `dbsec` proxy is built on this crate and
+//! writes the same bytes, so a table can be shared between an application
+//! that links it and clients that go through the proxy.
 //!
-//! The crate is deliberately protocol-free: it transforms values, and says
-//! nothing about how they reach the database. That is what lets the same
-//! primitives serve an application sealing a field before it hands it to its
-//! own driver and the `dbsec` proxy sealing the same field mid-flight — both
-//! write the identical envelope. The PostgreSQL wire codec the proxy needs
-//! lives in `dbsec-pgwire`, and the `i16` format codes stay there with it.
+//! # Threat model, in three sentences
 //!
-//! It is not I/O-free, and the exception is exactly one type:
-//! [`keys::FileKeySource`] reads a TOML keyfile, which is why
-//! [`Error::KeyFileRead`], [`Error::KeyFileWrite`] and [`Error::KeyFileParse`]
-//! exist and why `toml` is in the dependency graph. That is a dev and test key
-//! source; an application shipping its own [`keys::KeySource`] should not have
-//! to compile a TOML parser to get an envelope, so the type is to move behind
-//! a `keyfile` feature (TASK-0192.06). See plans/PLAN.md for the roadmap.
+//! The database — its files, its backups, its DBA, a SQL injection that reads
+//! a table — sees only ciphertext, pseudonyms and tokens, because keys never
+//! reach it. A ciphertext is bound to its column and, opt-in, to its row, so
+//! stored bytes moved elsewhere stop authenticating. The application holding
+//! the keys is trusted; what it decrypts is its responsibility.
+//!
+//! # Five minutes
+//!
+//! Declare a policy, supply keys, and seal / open / search by column name.
+//! `keyfile` and `derive` are optional features; this runs with none.
+//!
+//! ```
+//! use std::sync::Arc;
+//! use dbsec_core::envelope::{KeyId, RowKey};
+//! use dbsec_core::keys::{Key, KeySource};
+//! use dbsec_core::policy::{ColumnPolicy, Policy, TablePolicy};
+//! use dbsec_core::protector::{Opened, Protector};
+//! use dbsec_core::Error;
+//!
+//! // Your KMS goes here. This one holds a single DEK and one index key.
+//! struct StaticKeys;
+//! impl KeySource for StaticKeys {
+//!     fn active_key(&self) -> Result<(KeyId, Key), Error> { Ok(([1; 16], Key::new([2; 32]))) }
+//!     fn key(&self, id: &KeyId) -> Result<Key, Error> {
+//!         if *id == [1; 16] { Ok(Key::new([2; 32])) } else { Err(Error::UnknownKey(hex::encode(id))) }
+//!     }
+//!     fn index_key(&self, _name: &str) -> Result<Key, Error> { Ok(Key::new([3; 32])) }
+//! }
+//!
+//! # fn main() -> Result<(), Error> {
+//! let policy = Policy::new(
+//!     vec![ColumnPolicy::new("users", "email").searchable(true)],
+//!     vec![TablePolicy::new("users", "id")],        // bind values to their row
+//! );
+//! let p = Protector::new(policy, Arc::new(StaticKeys))?;
+//!
+//! let row = RowKey::from_i64(42);
+//! let stored = p.seal("users.email", b"a@b.io", Some(&row))?;   // -> BYTEA
+//! assert_eq!(&stored[32..36], b"DBS3");                          // blind index, then the envelope
+//!
+//! // WHERE substring(email from 1 for 32) = $1
+//! let term = p.search_term("users.email", b"a@b.io")?.unwrap();
+//! assert_eq!(&stored[..32], &term[..]);
+//!
+//! assert_eq!(p.open("users.email", &stored, Some(&row))?, Opened::Value(b"a@b.io".to_vec()));
+//! assert!(matches!(p.open("users.email", &stored, Some(&RowKey::from_i64(7))), Err(Error::Decrypt)));
+//! # Ok(()) }
+//! ```
+//!
+//! With the `derive` feature the policy lives on the struct instead —
+//! `#[derive(Protect)]` generates `User::policy()`, `seal`, `open`,
+//! `email_term` and `masked`; see [`record`] and `examples/embedded.rs`.
+//!
+//! # What is stored
+//!
+//! | Transform | Stored as | Searchable | Reversible |
+//! |---|---|---|---|
+//! | `encrypt` | `DBS2` / `DBS3` AES-256-GCM envelope, BYTEA; 32-byte blind index prefix when `searchable` | equality, via the blind index | yes |
+//! | `fpe` | FF1 over the digits, same shape as the input, text | equality, deterministic | yes (unless `detokenize = false`) |
+//! | `token` | HMAC-SHA-256 hex, text | equality, deterministic | no |
+//! | `none` | plaintext | — | mask-only |
+//!
+//! Envelope versions: `DBS2` binds the cell (`schema.table.column`) into the
+//! AAD; `DBS3` binds the row key as well. `DBS1` values still open. See
+//! [`envelope`].
+//!
+//! # What this does not do
+//!
+//! - **Hide equality.** Blind indexes, FPE and tokens map equal plaintexts to
+//!   equal stored bytes by design; frequency analysis works on them. Use plain
+//!   `encrypt` for values that must not be correlated.
+//! - **Order or prefix search.** Equality only.
+//! - **Mask anywhere but where it is called.** A mask is applied by
+//!   [`protector::Protector::mask`] or by the proxy; a client that reads the
+//!   table directly sees the stored form.
+//! - **Manage keys.** [`keys::KeySource`] is the boundary; rotation of the
+//!   active DEK is the key source's business, and a deterministic key cannot
+//!   rotate without re-encrypting the column.
+//! - **Async key fetches.** [`keys::KeySource`] is synchronous; a KMS-backed
+//!   implementation should cache so the network is touched only on a cold miss
+//!   or a rotation.
+//!
+//! # Compatibility
+//!
+//! The stable surface is the **stored format**: the envelope layouts, the AAD
+//! construction, the blind-index, FPE and token derivations, and the
+//! `schema.table.column` key-naming convention. A change to any of those is a
+//! major version, because it strands data at rest. The Rust API follows
+//! semver in the usual way; [`Error`] is `#[non_exhaustive]`.
+//!
+//! # Features
+//!
+//! - `serde` — `Deserialize` on [`mask::MaskSpec`] and the [`policy`] types.
+//! - `keyfile` — [`keys::FileKeySource`], a TOML keyfile for development.
+//! - `derive` — `#[derive(Protect)]`.
+
+#![deny(missing_docs)]
 
 pub mod blind_index;
 pub mod envelope;
@@ -32,6 +119,7 @@ pub mod transform;
 #[cfg(feature = "derive")]
 pub use dbsec_derive::Protect;
 
+#[cfg(feature = "keyfile")]
 use std::path::PathBuf;
 
 /// Marked `#[non_exhaustive]` so later variants — a keyfile permissions check,
@@ -39,8 +127,13 @@ use std::path::PathBuf;
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
 pub enum Error {
+    /// The bytes are not an envelope this crate wrote, or are truncated —
+    /// also returned when an opened plaintext is not the type the caller
+    /// asked for.
     #[error("ciphertext envelope is malformed or truncated")]
     Malformed,
+    /// The envelope did not authenticate: wrong key, tampered bytes, or a
+    /// value moved to another column or row.
     #[error("decryption failed (wrong key or tampered data)")]
     Decrypt,
     /// A row-bound envelope reached the opener without the row's declared key.
@@ -69,7 +162,13 @@ pub enum Error {
     /// exists, so it is refused rather than wrapped. Not reachable through the
     /// proxy's wire limits today; this is the check that says so.
     #[error("{field} is {len} bytes, over the 4 GiB a row-bound envelope's length prefix frames")]
-    RowBindingFieldTooLong { field: &'static str, len: usize },
+    RowBindingFieldTooLong {
+        /// Which field: the cell context or the row key.
+        field: &'static str,
+        /// Its length in bytes.
+        len: usize,
+    },
+    /// AES-GCM refused to seal; not expected in practice.
     #[error("encryption failed")]
     Encrypt,
     /// A declared row key could not be canonicalised, so nothing can be bound
@@ -84,6 +183,7 @@ pub enum Error {
     /// source had no fresh key to roll to (see `envelope::MAX_ENCRYPTIONS_PER_KEY`).
     #[error("key {0} has spent its AES-GCM invocation budget; rotate the active DEK")]
     KeyExhausted(String),
+    /// The key source has no key under this id or name.
     #[error("unknown key: {0}")]
     UnknownKey(String),
     /// A column policy that would look like protection while providing none —
@@ -114,25 +214,39 @@ pub enum Error {
     /// column's stored forms — pre-migration plaintext, or a mask-only column.
     #[error("column {0} holds a value in none of its protected forms")]
     Unprotected(String),
+    /// Too few digits for FF1 to be safe; see [`transform::MIN_FPE_DIGITS`].
     #[error("FPE requires at least {} digits", transform::MIN_FPE_DIGITS)]
     FpeDomain,
+    /// The FF1 implementation refused the input.
     #[error("FPE transform failed")]
     Fpe(#[from] fpe::ff1::NumeralStringError),
+    /// The keyfile could not be read (`keyfile` feature).
+    #[cfg(feature = "keyfile")]
     #[error("reading key file {}", path.display())]
     KeyFileRead {
+        /// The keyfile.
         path: PathBuf,
+        /// The I/O failure.
         #[source]
         source: std::io::Error,
     },
+    /// The keyfile could not be written (`keyfile` feature).
+    #[cfg(feature = "keyfile")]
     #[error("writing key file {}", path.display())]
     KeyFileWrite {
+        /// The keyfile.
         path: PathBuf,
+        /// The I/O failure.
         #[source]
         source: std::io::Error,
     },
+    /// The keyfile is not valid TOML of the expected shape (`keyfile` feature).
+    #[cfg(feature = "keyfile")]
     #[error("parsing key file {}", path.display())]
     KeyFileParse {
+        /// The keyfile.
         path: PathBuf,
+        /// The parse failure.
         #[source]
         source: toml::de::Error,
     },
@@ -150,7 +264,9 @@ pub enum Error {
     /// tell a 403 from a connection refused from a missing KV path (ERR-9).
     #[error("key source: {context}")]
     KeyBackend {
+        /// What was being done when the backend failed.
         context: String,
+        /// The backend's own error.
         #[source]
         source: Box<dyn std::error::Error + Send + Sync + 'static>,
     },

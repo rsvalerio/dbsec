@@ -5,9 +5,24 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
+rust-version.workspace = true
+readme = "README.md"
+documentation = "https://docs.rs/dbsec-core"
+keywords = ["encryption", "postgresql", "field-level", "pseudonymization", "aes-gcm"]
+categories = ["cryptography", "database"]
+
+[package.metadata.docs.rs]
+all-features = true
 
 [features]
+# The default build is the crypto and the policy model, nothing else: no
+# serde, no TOML parser, no proc macro.
 default = []
+# `Deserialize` on `MaskSpec` and the `policy` types, so a policy can be read
+# from TOML/JSON/YAML with the caller's own parser.
+serde = ["dep:serde"]
+# `keys::FileKeySource`, the dev/test keyfile. Pulls a TOML parser.
+keyfile = ["serde", "dep:toml"]
 # `#[derive(Protect)]`: record-level seal/open/search over a `Protector`.
 derive = ["dep:dbsec-derive"]
 
@@ -21,8 +36,8 @@ sha2 = { workspace = true }
 rand = { workspace = true }
 zeroize = { workspace = true }
 hex = { workspace = true }
-serde = { workspace = true }
-toml = { workspace = true }
+serde = { workspace = true, optional = true }
+toml = { workspace = true, optional = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
 
@@ -39,4 +54,4 @@ tokio = { workspace = true }
 
 [[example]]
 name = "embedded"
-required-features = ["derive"]
+required-features = ["derive", "keyfile"]

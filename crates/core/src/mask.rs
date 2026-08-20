@@ -5,22 +5,25 @@
 //! client that writes a masked value back stores the masked form — both
 //! accepted trade-offs (see plans/PLAN.md).
 
-use serde::Deserialize;
-
-#[derive(Debug, Clone, Copy, Deserialize)]
-#[serde(deny_unknown_fields)]
+/// A read-path mask: which characters stay visible and what replaces the rest.
+///
+/// With the `serde` feature it deserializes from `{ keep_last = 4 }` and the
+/// like, `mask_with` defaulting to `*`.
+#[derive(Debug, Clone, Copy)]
+#[cfg_attr(feature = "serde", derive(serde::Deserialize), serde(deny_unknown_fields))]
 pub struct MaskSpec {
     /// Number of leading characters left visible.
-    #[serde(default)]
+    #[cfg_attr(feature = "serde", serde(default))]
     pub keep_first: usize,
     /// Number of trailing characters left visible.
-    #[serde(default)]
+    #[cfg_attr(feature = "serde", serde(default))]
     pub keep_last: usize,
     /// The character masked positions are replaced with.
-    #[serde(default = "default_mask_with")]
+    #[cfg_attr(feature = "serde", serde(default = "default_mask_with"))]
     pub mask_with: char,
 }
 
+#[cfg(feature = "serde")]
 fn default_mask_with() -> char {
     '*'
 }
@@ -83,6 +86,7 @@ mod tests {
         assert_eq!(spec(0, 2).apply(&[0xff, 0xfe, 0x41]), b"***");
     }
 
+    #[cfg(feature = "keyfile")]
     #[test]
     fn parses_from_toml() {
         let mask: MaskSpec = toml::from_str("keep_last = 4\nmask_with = \"#\"").unwrap();

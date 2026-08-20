@@ -11,7 +11,7 @@ name = "dbsec"
 path = "src/main.rs"
 
 [dependencies]
-dbsec-core = { workspace = true }
+dbsec-core = { workspace = true, features = ["keyfile"] }
 dbsec-pgwire = { workspace = true }
 tokio = { workspace = true }
 rustls = { workspace = true }

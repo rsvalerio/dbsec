@@ -22,6 +22,10 @@ pub enum WireForm {
     Text,
 }
 
+/// One column's protection: how a plaintext becomes its stored form and back.
+///
+/// Implemented by [`EncryptTransform`], [`FpeTransform`] and
+/// [`TokenTransform`]; [`crate::policy::Policy::build`] picks one per column.
 pub trait FieldTransform: Send + Sync {
     /// Transforms a plaintext value into its stored form (write path).
     ///
@@ -44,6 +48,7 @@ pub trait FieldTransform: Send + Sync {
     /// error, or is opened anyway (see `EncryptTransform::open`).
     fn open(&self, stored: &[u8], row: Option<&RowKey>) -> Result<Option<Vec<u8>>, Error>;
 
+    /// Which shape the stored value takes.
     fn wire(&self) -> WireForm {
         WireForm::Bytea
     }
@@ -100,6 +105,8 @@ pub struct EncryptTransform {
 }
 
 impl EncryptTransform {
+    /// An envelope transform bound to `context`; `index_key` names the
+    /// deterministic key of a searchable column, `None` for one that is not.
     pub fn new(ciphers: Arc<Ciphers>, context: CellContext, index_key: Option<String>) -> Self {
         Self {
             ciphers,
@@ -126,6 +133,7 @@ impl EncryptTransform {
         self
     }
 
+    /// Whether this column carries a blind index.
     pub fn searchable(&self) -> bool {
         self.index_key_name.is_some()
     }
@@ -211,6 +219,9 @@ pub struct FpeTransform {
 }
 
 impl FpeTransform {
+    /// FF1 under the deterministic key `key_name`; `detokenize` decides
+    /// whether [`FieldTransform::open`] reverses it or passes stored values
+    /// through.
     pub fn new(keys: Arc<dyn KeySource>, key_name: String, detokenize: bool) -> Self {
         Self { keys, key_name, detokenize, ff1: OnceLock::new() }
     }
@@ -283,6 +294,7 @@ pub struct TokenTransform {
 }
 
 impl TokenTransform {
+    /// HMAC tokens under the deterministic key `key_name`.
     pub fn new(keys: Arc<dyn KeySource>, key_name: String) -> Self {
         Self { keys, key_name, key: OnceLock::new() }
     }

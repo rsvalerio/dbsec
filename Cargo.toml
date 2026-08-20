@@ -8,11 +8,16 @@ version = "0.5.0"
 edition = "2021"
 license = "Apache-2.0"
 repository = "https://github.com/rsvalerio/dbsec"
+# Inherited by the library crates (`dbsec-core`, `dbsec-derive`, `dbsec-pgwire`)
+# and checked by the `msrv` job in ci.yml. The proxy binary does not inherit
+# it: it ships with whatever stable builds it and uses newer std APIs freely.
+# Bump deliberately, in its own commit.
+rust-version = "1.85"
 
 [workspace.dependencies]
-dbsec-core = { path = "crates/core" }
-dbsec-pgwire = { path = "crates/pgwire" }
-dbsec-derive = { path = "crates/derive" }
+dbsec-core = { path = "crates/core", version = "0.5.0" }
+dbsec-pgwire = { path = "crates/pgwire", version = "0.5.0" }
+dbsec-derive = { path = "crates/derive", version = "0.5.0" }
 
 # proc-macro (dbsec-derive)
 syn = { version = "2", features = ["full"] }

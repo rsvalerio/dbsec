@@ -131,10 +131,13 @@ pub const MAGIC_V1: &[u8; 4] = b"DBS1";
 /// column stops authenticating. Written only for a column whose table declares
 /// a `row_key`; see [`RowKey`].
 pub const MAGIC_V3: &[u8; 4] = b"DBS3";
+/// Length of the key id stamped into every envelope.
 pub const KEY_ID_LEN: usize = 16;
+/// Length of the AES-GCM nonce in every envelope.
 pub const NONCE_LEN: usize = 12;
 const HEADER_LEN: usize = MAGIC.len() + KEY_ID_LEN + NONCE_LEN;
 
+/// Identifies a DEK: the envelope header names the key it was sealed under.
 pub type KeyId = [u8; KEY_ID_LEN];
 
 /// The cell a ciphertext belongs to — `schema.table.column` — bound into the
@@ -152,6 +155,7 @@ impl CellContext {
         Self(qualified_column.into())
     }
 
+    /// The qualified column name.
     pub fn as_str(&self) -> &str {
         &self.0
     }
@@ -225,10 +229,14 @@ impl CellContext {
 pub struct RowKey(Vec<u8>);
 
 impl RowKey {
+    /// Wraps already-canonical bytes. Prefer the typed constructors
+    /// (`from_i64`, `from_uuid`, …) or [`crate::rowkey::canonical`], which
+    /// produce them.
     pub fn new(canonical: impl Into<Vec<u8>>) -> Self {
         Self(canonical.into())
     }
 
+    /// The canonical bytes.
     pub fn as_bytes(&self) -> &[u8] {
         &self.0
     }
@@ -243,7 +251,9 @@ impl RowKey {
 /// or omit one the decryptor silently tolerates.
 #[derive(Debug, Clone, Copy)]
 pub struct Binding<'a> {
+    /// The column the value belongs to.
     pub context: &'a CellContext,
+    /// The row it belongs to, when its table declares a row key.
     pub row: Option<&'a RowKey>,
     /// Whether a cell-only envelope found in a row-bound column is a downgrade
     /// rather than back-compat. See [`Binding::row_strict`]; ignored when
@@ -465,6 +475,8 @@ pub struct Ciphers {
 }
 
 impl Ciphers {
+    /// A cipher cache over `keys`, with the default per-DEK invocation budget
+    /// ([`MAX_ENCRYPTIONS_PER_KEY`]).
     pub fn new(keys: Arc<dyn KeySource>) -> Self {
         Self::with_budget(keys, MAX_ENCRYPTIONS_PER_KEY)
     }
