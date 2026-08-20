@@ -81,6 +81,12 @@ pub fn port_row_key() -> u16 {
     port_at(7)
 }
 
+/// The library round-trip case: `dbsec_core::protector::Protector` and the
+/// proxy sharing one row-bound table.
+pub fn port_library() -> u16 {
+    port_at(8)
+}
+
 pub fn dsn() -> String {
     std::env::var("DBSEC_E2E_DSN").unwrap_or_else(|_| DEFAULT_DSN.to_owned())
 }

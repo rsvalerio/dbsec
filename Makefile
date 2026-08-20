@@ -78,10 +78,11 @@ test: ## Run the test suite (nextest) and the doctests
 # psycopg matrix reports which drivers it skipped, and a silent skip is the
 # thing worth seeing), but `--no-capture` also forces the suites to run one at
 # a time. Output is per-test buffered, so parallel runs stay readable.
-e2e: ## Driver matrix (tokio-postgres, sqlx, psycopg) against dockerized Postgres
+e2e: ## Driver matrix (tokio-postgres, sqlx, psycopg) against dockerized Postgres, plus the embedded example
 	@$(call start_pg)
 	cargo nextest run -p dbsec --test e2e --test e2e_sqlx --test e2e_psycopg \
-		--run-ignored ignored-only --success-output immediate; \
+		--run-ignored ignored-only --success-output immediate \
+		&& cargo run -q -p dbsec-core --example embedded; \
 		status=$$?; $(call stop_pg); exit $$status
 
 e2e-vault: ## Vault/OpenBao key source against a live dev-mode OpenBao

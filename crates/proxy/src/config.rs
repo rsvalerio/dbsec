@@ -26,7 +26,7 @@
 //!   holds. The write path folds a SQL identifier the way PostgreSQL does
 //!   before comparing it (see [`dbsec_core::ident::fold_identifier`]), so a configured name that
 //!   is not itself in folded form only ever matches a double-quoted SQL
-//!   reference, and one longer than [`MAX_IDENTIFIER_BYTES`] matches nothing
+//!   reference, and one longer than [`dbsec_core::ident::MAX_IDENTIFIER_BYTES`] matches nothing
 //!   at all — which validation refuses rather than leaving to be discovered at
 //!   the first unprotected write.
 //! - **`COPY`.** A `COPY ... FROM` payload arrives as a `CopyData` stream the
@@ -48,7 +48,11 @@ use std::fmt;
 use std::ops::Range;
 use std::path::{Path, PathBuf};
 
-use dbsec_core::ident::{fold_identifier, MAX_IDENTIFIER_BYTES};
+#[cfg(test)]
+use dbsec_core::ident::MAX_IDENTIFIER_BYTES;
+#[cfg(test)]
+use dbsec_core::policy::TransformKind;
+use dbsec_core::policy::{ColumnPolicy, Policy, TablePolicy};
 use serde::Deserialize;
 use zeroize::Zeroizing;
 
@@ -449,58 +453,20 @@ pub struct Config {
     #[serde(default)]
     pub on_unprotected: OnUnprotected,
     #[serde(default, rename = "column")]
-    pub columns: Vec<ColumnConfig>,
+    pub columns: Vec<ColumnPolicy>,
     /// Per-table row binding: `[[table]] table = "users", row_key = "id"`.
     /// Optional and opt-in — a table with no entry keeps cell-only binding and
     /// its stored values are untouched.
     #[serde(default, rename = "table")]
-    pub tables: Vec<TableConfig>,
+    pub tables: Vec<TablePolicy>,
 }
 
-/// One table's declared row key, which binds each encrypted value to the row it
-/// was written in (see `dbsec_core::envelope::RowKey`).
-///
-/// Opt-in per table because it is not free: the proxy must be able to name the
-/// row at both ends, so a protected table with a row key accepts only
-/// client-supplied key values, only single-row updates of its protected
-/// columns, and only reads that project the key. Those are refusals, not silent
-/// degradations — see `README.md`.
-#[derive(Debug, Clone, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct TableConfig {
-    /// Table name, optionally schema-qualified; bare names mean `public`.
-    pub table: String,
-    /// The column whose value names a row. Must be unique per row — a primary
-    /// key, or a column with a unique constraint. The proxy cannot verify that
-    /// and does not try: a non-unique choice silently weakens the binding to
-    /// "some row in this group", which is why this is documented as the
-    /// operator's assertion.
-    pub row_key: String,
-    /// Whether a stored value in this table's encrypted columns that carries
-    /// *no* row binding is an error on read rather than back-compat.
-    ///
-    /// Off by default, which is what makes adopting `row_key` migration-free:
-    /// values written before the key was declared keep opening. That tolerance
-    /// is also what makes a degraded write invisible — an upsert branch or an
-    /// `UPDATE` that could not name one row seals cell-only, and the result is
-    /// a ciphertext relocatable between rows for as long as the DEK lives,
-    /// indistinguishable in the stored bytes from a pre-migration value.
-    ///
-    /// Turn this on once the table's pre-`row_key` values have been
-    /// re-encrypted: back-compat then becomes a stated migration window rather
-    /// than a permanent hole, and any later degradation is refused on the next
-    /// read instead of going unnoticed.
-    #[serde(default)]
-    pub strict_row_binding: bool,
-}
-
-impl TableConfig {
-    /// Splits `schema.table`, defaulting the schema to `public`.
-    pub fn schema_and_table(&self) -> (&str, &str) {
-        match self.table.split_once('.') {
-            Some((schema, table)) => (schema, table),
-            None => ("public", &self.table),
-        }
+impl Config {
+    /// The column policy, as the library builds transforms from it. The proxy
+    /// deserializes `[[column]]` / `[[table]]` straight into the core types,
+    /// so this is a clone, not a translation.
+    pub fn policy(&self) -> Policy {
+        Policy::new(self.columns.clone(), self.tables.clone())
     }
 }
 
@@ -537,50 +503,6 @@ pub enum OnUnprotected {
     /// Refuse the statement with a PostgreSQL ErrorResponse. Nothing reaches
     /// the server and the session stays usable.
     Reject,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct ColumnConfig {
-    /// Table name, optionally schema-qualified; bare names mean `public`.
-    pub table: String,
-    /// Column name within the table.
-    pub column: String,
-    #[serde(default)]
-    pub transform: TransformKind,
-    /// Searchable columns carry a blind index before the envelope (stripped
-    /// on read; equality rewrite arrives with the searchable milestone).
-    /// Only valid with `transform = "encrypt"`.
-    #[serde(default)]
-    pub searchable: bool,
-    /// Whether FPE values are detokenized on the read path. Only meaningful
-    /// for `transform = "fpe"`; tokens are irreversible, envelopes always
-    /// decrypt.
-    #[serde(default = "default_true")]
-    pub detokenize: bool,
-    /// Read-path mask applied after decryption/detokenization, e.g.
-    /// `mask = { keep_last = 4 }`.
-    pub mask: Option<dbsec_core::mask::MaskSpec>,
-}
-
-#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum TransformKind {
-    /// AES-256-GCM envelope, stored as BYTEA.
-    #[default]
-    Encrypt,
-    /// FF1 format-preserving encryption over decimal digits, stored in the
-    /// column's original text shape.
-    Fpe,
-    /// Irreversible deterministic HMAC token (hex), stored as text.
-    Token,
-    /// No crypto — writes pass through untouched. Only valid together with
-    /// `mask`, for columns that should be masked but stay plaintext at rest.
-    None,
-}
-
-fn default_true() -> bool {
-    true
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -708,16 +630,6 @@ fn default_transit_mount() -> String {
 
 fn default_vault_timeout_secs() -> u64 {
     5
-}
-
-impl ColumnConfig {
-    /// `(schema, table)` with the `public` default applied.
-    pub fn schema_and_table(&self) -> (&str, &str) {
-        match self.table.split_once('.') {
-            Some((schema, table)) => (schema, table),
-            None => ("public", &self.table),
-        }
-    }
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -961,94 +873,13 @@ impl Config {
             }
             Some(ProtectedConfig { keys, control_dsn })
         };
-        let mut seen = std::collections::HashSet::new();
-        for column in &self.columns {
-            let (schema, table) = column.schema_and_table();
-            let name = format!("{schema}.{table}.{}", column.column);
-            if !seen.insert(name.clone()) {
-                return Err(Error::InvalidConfig(format!("duplicate [[column]] entry for {name}")));
-            }
-            if column.searchable && column.transform != TransformKind::Encrypt {
-                return Err(Error::InvalidConfig(format!(
-                    "{name}: searchable requires transform = \"encrypt\""
-                )));
-            }
-            if !column.detokenize && column.transform != TransformKind::Fpe {
-                return Err(Error::InvalidConfig(format!(
-                    "{name}: detokenize = false is only meaningful for transform = \"fpe\""
-                )));
-            }
-            if column.transform == TransformKind::None && column.mask.is_none() {
-                return Err(Error::InvalidConfig(format!(
-                    "{name}: transform = \"none\" does nothing without a mask"
-                )));
-            }
-            check_identifiers(&name, schema, table, &column.column)?;
-        }
-        self.validate_row_keys()?;
+        // The policy-level rules live with the policy so a library caller meets
+        // the same refusals; here they only change error type.
+        self.policy().validate().map_err(|e| match e {
+            dbsec_core::Error::Policy(msg) => Error::InvalidConfig(msg),
+            other => Error::InvalidConfig(other.to_string()),
+        })?;
         Ok(protected)
-    }
-
-    /// Checks every `[[table]]` row-key declaration against the columns it
-    /// would bind.
-    ///
-    /// Three of these refuse a configuration that would *look* like row
-    /// binding while providing none of it, which is the failure worth being
-    /// loud about: an operator who declares a row key believes cross-row
-    /// relocation is detected, and a silent no-op leaves them believing it.
-    fn validate_row_keys(&self) -> Result<(), Error> {
-        let mut seen = std::collections::HashSet::new();
-        for entry in &self.tables {
-            let (schema, table) = entry.schema_and_table();
-            let qualified = format!("{schema}.{table}");
-            if !seen.insert(qualified.clone()) {
-                return Err(Error::InvalidConfig(format!(
-                    "duplicate [[table]] entry for {qualified}"
-                )));
-            }
-            check_identifiers(&qualified, schema, table, &entry.row_key)?;
-
-            let columns: Vec<&ColumnConfig> = self
-                .columns
-                .iter()
-                .filter(|column| column.schema_and_table() == (schema, table))
-                .collect();
-            if columns.is_empty() {
-                return Err(Error::InvalidConfig(format!(
-                    "[[table]] {qualified} declares row_key = \"{}\" but the table has no \
-                     [[column]] entries, so there is nothing to bind",
-                    entry.row_key
-                )));
-            }
-            // Only authenticated encryption has associated data to bind a row
-            // into. FPE and tokenization map a plaintext to the same stored
-            // bytes in every row — that determinism is what makes them
-            // searchable and joinable — so a copy between rows of such a column
-            // is indistinguishable from a legitimate write, whatever is
-            // configured here.
-            if !columns.iter().any(|column| column.transform == TransformKind::Encrypt) {
-                return Err(Error::InvalidConfig(format!(
-                    "[[table]] {qualified} declares row_key = \"{}\", but none of its columns \
-                     use transform = \"encrypt\"; fpe and token values are identical in every \
-                     row by design, so a row key would bind nothing",
-                    entry.row_key
-                )));
-            }
-            // The key column may itself be protected — but then reading it
-            // back to verify a sibling would require opening a value that is
-            // bound to the key being recovered.
-            if columns.iter().any(|column| {
-                column.column == entry.row_key && column.transform != TransformKind::None
-            }) {
-                return Err(Error::InvalidConfig(format!(
-                    "[[table]] {qualified} declares row_key = \"{}\", which is itself a \
-                     transformed [[column]]; the row key must be readable to verify the row it \
-                     names",
-                    entry.row_key
-                )));
-            }
-        }
-        Ok(())
     }
 }
 
@@ -1097,38 +928,6 @@ fn check_control_dsn_is_not_downgradeable(dsn: &Dsn) -> Result<(), Error> {
          TLS offer, answers N to its SSLRequest, and that connection carries the control user's \
          password and resolves which columns are protected. Add sslmode=require to control_dsn"
     )))
-}
-
-/// Checks one `[[column]]` entry's three names against what PostgreSQL can
-/// actually hold, so a name the catalog could never match is caught here
-/// rather than turning into a write the proxy quietly treats as unprotected.
-///
-/// A name longer than [`MAX_IDENTIFIER_BYTES`] is an error: the server
-/// truncates on the way in, so no catalog row carries the name as written and
-/// the entry can only ever fail to resolve. A name that is not already in
-/// PostgreSQL's folded form is a warning rather than an error, because it is
-/// legitimate — a column created as `"Email"` really is stored with the
-/// capital — but it is far more often a config typo, and the consequence is
-/// worth spelling out: only a *double-quoted* SQL reference will match it.
-fn check_identifiers(name: &str, schema: &str, table: &str, column: &str) -> Result<(), Error> {
-    for (kind, ident) in [("schema", schema), ("table", table), ("column", column)] {
-        if ident.len() > MAX_IDENTIFIER_BYTES {
-            return Err(Error::InvalidConfig(format!(
-                "{name}: {kind} name is {} bytes, and PostgreSQL truncates identifiers to \
-                 {MAX_IDENTIFIER_BYTES}, so no table or column can carry it",
-                ident.len()
-            )));
-        }
-        if fold_identifier(ident, false) != ident {
-            tracing::warn!(
-                kind,
-                ident,
-                "configured identifier is not in the form PostgreSQL folds an unquoted name to; \
-                 only a double-quoted SQL reference will match it"
-            );
-        }
-    }
-    Ok(())
 }
 
 #[cfg(test)]

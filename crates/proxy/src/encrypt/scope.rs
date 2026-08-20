@@ -420,7 +420,7 @@ mod tests {
     use sqlparser::dialect::PostgreSqlDialect;
     use sqlparser::parser::Parser;
 
-    use crate::columns::ProtectedColumn;
+    use dbsec_core::policy::ProtectedColumn;
 
     use crate::config::OnUnprotected;
     use crate::encrypt::test_support::*;

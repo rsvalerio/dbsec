@@ -27,12 +27,12 @@ use tokio::time::timeout;
 use tokio_postgres::tls::{MakeTlsConnect, TlsConnect};
 use tokio_postgres::Socket;
 
-use crate::columns::ProtectedColumn;
-use crate::columns::RowKeyDecl;
 use crate::config::Dsn;
 use crate::rows::{ColumnMap, ReadColumn, Resolved, ResolvedRowKey, RowContext};
 use crate::tls::TlsContext;
 use crate::Error;
+use dbsec_core::policy::ProtectedColumn;
+use dbsec_core::policy::RowKeyDecl;
 
 const LOOKUP: &str = "\
 SELECT a.attrelid, a.attnum, a.atttypid
@@ -481,7 +481,7 @@ mod tests {
         )
         .expect("test config parses");
         let keys: Arc<dyn KeySource> = Arc::new(OneKey);
-        crate::columns::build(&config, &keys)
+        config.policy().build(&keys)
     }
 
     #[test]

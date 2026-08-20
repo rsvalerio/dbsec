@@ -129,19 +129,37 @@ What a framework author must reimplement today, all of it security-critical:
 | Missing from the library | Lives in | Cost of getting it wrong |
 |---|---|---|
 | Vault/OpenBao `KeySource` | `crates/proxy/src/vault.rs` | The library ships only `FileKeySource`, whose own docs say "dev/test". The README's headline "Vault/OpenBao-backed keys" is not a library feature. |
-| Row-key canonicalization | `crates/proxy/src/rowkey.rs` | `0007`, `+7` and `7` must canonicalize identically, as must uuid case/brace/hyphen forms. Diverge and library-written values never open through the proxy. |
-| PostgreSQL identifier folding | `crates/proxy/src/encrypt/` | It builds the `CellContext` string baked into every AAD. Drift silently breaks decryption. |
-| Column policy model (`TransformKind`, column/table specs, `columns::build`) | `crates/proxy/src/{config,columns}.rs` | Carries the `schema.table.column` key-naming convention. Name a key wrong and cross-column relocation protection is silently lost — no error, ever. |
-| A façade (`seal`/`open`/`search_term` by column) | nowhere | Every embedder hand-wires `Ciphers` + `Arc<dyn KeySource>` + `CellContext` + transform choice, which is exactly where the three failures above happen. |
 
-And the split runs the wrong way in two places: `pgwire` (the PostgreSQL wire
-codec, ~540 LOC) sits in the *library* where only the proxy uses it, while the
-KMS integration sits in the *binary*. *(The wire codec moved out to
-`dbsec-pgwire` in TASK-0192.04; row-key canonicalization and identifier folding
-moved into `dbsec-core` in TASK-0192.01.)*
+Already closed: the PostgreSQL wire codec moved out of the library into
+`dbsec-pgwire` (TASK-0192.04); row-key canonicalization plus identifier
+folding — both of which build bytes that end up in the AAD — moved into
+`dbsec-core` (TASK-0192.01); the column policy model with its
+`schema.table.column` convention, validation and transform builder is
+`dbsec_core::policy` (TASK-0192.03), which the proxy deserializes into
+directly; and `dbsec_core::protector::Protector` (TASK-0192.05) is the
+seal/open/search_term/mask-by-column façade, with an unknown column, a
+missing or undeclared row key and an irreversible open all refused rather
+than degraded, and a pre-migration plaintext returned as a named
+`Opened::Unprotected` rather than as a value. `crates/core/examples/embedded.rs`
+is the sqlx application with no proxy, and
+`library_and_proxy_share_one_table` in the proxy's e2e suite is the proof that
+the two front ends agree byte-for-byte. An embedder can no longer diverge from
+the proxy on any of them. What still runs the wrong way is the KMS integration: the
+Vault/OpenBao source sits in the *binary*.
+
+Two further things the table does not show but an embedder meets:
+
+- `keys::KeySource` is a synchronous trait. Linked into an async application,
+  a key backend that does network I/O on the call path blocks the caller's
+  runtime worker. The Vault extraction (TASK-0192.02) has to decide whether
+  that stays a documented cache-on-miss guarantee or becomes an async trait.
 
 The refactor that closes this is tracked as TASK-0192 and its children
-(TASK-0192.01 … TASK-0192.07).
+(TASK-0192.01 … TASK-0192.08). The `Protector` façade (TASK-0192.05) reaches
+the AWS-SDK level — seal/open/search by column name; the record-level derive
+(TASK-0192.08) is what reaches the "declare the policy on the struct and the
+fields are handled" level, and it is the only shape that can keep row binding
+transparent, since a per-value `Decode` never sees the row.
 
 ## Reference points for the library API
 

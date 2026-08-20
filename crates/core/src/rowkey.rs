@@ -116,6 +116,43 @@ pub fn canonical(type_oid: u32, format: Format, value: Option<&[u8]>) -> Result<
     Ok(RowKey::new(text))
 }
 
+impl RowKey {
+    /// The key of a row whose `row_key` column is `smallint`.
+    pub fn from_i16(value: i16) -> Self {
+        Self::new(value.to_string().into_bytes())
+    }
+
+    /// The key of a row whose `row_key` column is `integer`.
+    pub fn from_i32(value: i32) -> Self {
+        Self::new(value.to_string().into_bytes())
+    }
+
+    /// The key of a row whose `row_key` column is `bigint`.
+    pub fn from_i64(value: i64) -> Self {
+        Self::new(value.to_string().into_bytes())
+    }
+
+    /// The key of a row whose `row_key` column is `text` or `varchar`. Its own
+    /// canonical form; nothing to normalise.
+    pub fn from_text(value: &str) -> Self {
+        Self::new(value.as_bytes().to_vec())
+    }
+
+    /// The key of a row whose `row_key` column is `uuid`, from any spelling
+    /// PostgreSQL accepts (upper or lower case, braced, hyphenated or not).
+    /// Refused when it is not a UUID, so a typo fails here rather than sealing
+    /// a value no read can name.
+    pub fn from_uuid(value: &str) -> Result<Self, Error> {
+        canonical(oid::UUID, Format::Text, Some(value.as_bytes()))
+    }
+
+    /// The key of a row whose `row_key` column is `uuid`, from its 16 raw
+    /// bytes — what a `uuid::Uuid::as_bytes()` hands out.
+    pub fn from_uuid_bytes(value: &[u8; 16]) -> Self {
+        Self::new(hyphenated(&hex::encode(value)).into_bytes())
+    }
+}
+
 /// Row key bytes as a `&str`, or a refusal. Borrowed rather than owned: the
 /// pass-through arms copy once into the key and never build a `String` on the
 /// way (PERF-3).
@@ -186,6 +223,39 @@ fn hyphenated(hex: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The typed constructors and `canonical` must land on the same bytes: a
+    /// library seal and a proxy read name the same row, or the value never
+    /// opens. Each constructor is its own implementation of the form, so this
+    /// is what ties them together.
+    #[test]
+    fn typed_constructors_agree_with_canonical() {
+        assert_eq!(
+            RowKey::from_i16(-7),
+            canonical(oid::INT2, Format::Binary, Some(&(-7i16).to_be_bytes())).unwrap()
+        );
+        assert_eq!(RowKey::from_i32(42), canonical(oid::INT4, Format::Text, Some(b"042")).unwrap());
+        assert_eq!(
+            RowKey::from_i64(i64::MAX),
+            canonical(oid::INT8, Format::Binary, Some(&i64::MAX.to_be_bytes())).unwrap()
+        );
+        assert_eq!(
+            RowKey::from_text(" padded "),
+            canonical(oid::TEXT, Format::Text, Some(b" padded ")).unwrap()
+        );
+        let bytes: [u8; 16] = [
+            0x55, 0x0e, 0x84, 0x00, 0xe2, 0x9b, 0x41, 0xd4, 0xa7, 0x16, 0x44, 0x66, 0x55, 0x44,
+            0x00, 0x00,
+        ];
+        assert_eq!(
+            RowKey::from_uuid_bytes(&bytes),
+            canonical(oid::UUID, Format::Binary, Some(&bytes)).unwrap()
+        );
+        assert_eq!(
+            RowKey::from_uuid("{550E8400-E29B-41D4-A716-446655440000}").unwrap(),
+            canonical(oid::UUID, Format::Binary, Some(&bytes)).unwrap()
+        );
+    }
 
     /// The property the whole module exists for: the same row, bound the same
     /// way, whichever format the client chose. A failure here means a row
