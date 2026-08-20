@@ -65,6 +65,25 @@ jobs:
       - name: cargo doc
         run: cargo doc --no-deps --document-private-items --all-features
 
+  # The library crates declare a `rust-version`, and a declaration nobody
+  # compiles against drifts the first time a contributor uses a newer std API.
+  # `--locked` so the check is against the lockfile a downstream would resolve
+  # to today. The proxy binary is deliberately left out: it has no MSRV.
+  msrv:
+    name: MSRV (library crates)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@1.85
+      - uses: Swatinem/rust-cache@v2
+      - name: cargo check at the declared rust-version
+        run: cargo check --locked -p dbsec-core -p dbsec-derive -p dbsec-pgwire --all-features
+
   # The reusable workflows above follow forge automatically because they are
   # referenced by tag; the config files copied out of forge do not. This job is
   # what makes "keep in sync" a checked claim rather than a remembered one.

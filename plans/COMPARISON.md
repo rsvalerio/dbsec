@@ -106,10 +106,13 @@ The stated goal: `dbsec-core` should be an independent, reusable crate that
 gives a Rust application the *same* protection the proxy gives, at code time
 instead of at runtime, with minimal glue left to the caller.
 
-**Status: partially met.** The README's framing — "a library does the work; the
-binary is a thin tokio TCP wrapper around it" — no longer describes the split.
-It is ~2,800 LOC of library against ~19,600 LOC of proxy, and several things a
-library user cannot do without are inside the binary crate.
+**Status: met for the code path; packaging is the remainder.** The library is
+`dbsec-core` (crypto, policy, `Protector`) plus `dbsec-derive`
+(`#[derive(Protect)]`), and the README leads with it. The binary is still by
+far the larger crate — ~19,600 LOC against ~3,700 — but that is the SQL
+rewrite and the wire protocol, which a library does not need; nothing a
+library user depends on is inside it any more except the Vault/OpenBao
+`KeySource` (TASK-0192.02).
 
 What already works. `dbsec-core` depends on no tokio, no sqlparser and no
 `vaultrs`, and `transform::FieldTransform` is the right code-time abstraction:
@@ -128,7 +131,7 @@ What a framework author must reimplement today, all of it security-critical:
 
 | Missing from the library | Lives in | Cost of getting it wrong |
 |---|---|---|
-| Vault/OpenBao `KeySource` | `crates/proxy/src/vault.rs` | The library ships only `FileKeySource`, whose own docs say "dev/test". The README's headline "Vault/OpenBao-backed keys" is not a library feature. |
+| Vault/OpenBao `KeySource` | `crates/proxy/src/vault.rs` | The library ships only `FileKeySource` (behind the `keyfile` feature, documented as dev/test). An embedder writes its own `KeySource` over its KMS; the Vault one is not yet reusable. |
 
 Already closed: the PostgreSQL wire codec moved out of the library into
 `dbsec-pgwire` (TASK-0192.04); row-key canonicalization plus identifier
@@ -143,8 +146,11 @@ than degraded, and a pre-migration plaintext returned as a named
 `Opened::Unprotected` rather than as a value. `crates/core/examples/embedded.rs`
 is the sqlx application with no proxy, and
 `library_and_proxy_share_one_table` in the proxy's e2e suite is the proof that
-the two front ends agree byte-for-byte. An embedder can no longer diverge from
-the proxy on any of them. What still runs the wrong way is the KMS integration: the
+the two front ends agree byte-for-byte. On each of those — the
+policy and its key-naming convention, row-key canonicalization, identifier
+folding, the transforms, and the Vault key source — an embedder now runs the
+proxy's own code, and the round-trip test is the check that they agree; what it
+does not cover is a `KeySource` an embedder writes itself. What still runs the wrong way is the KMS integration: the
 Vault/OpenBao source sits in the *binary*.
 
 Two further things the table does not show but an embedder meets:

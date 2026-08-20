@@ -1,14 +1,20 @@
-//! Key material access. Transforms obtain keys through `KeySource`; the
-//! Vault/OpenBao implementation arrives in milestone 9. `FileKeySource`
-//! exists for development and tests.
+//! Key material access. Transforms obtain keys through [`KeySource`]; an
+//! application supplies its own implementation over its KMS (the `dbsec`
+//! proxy's Vault/OpenBao source is one), and [`FileKeySource`] — behind the
+//! `keyfile` feature — exists for development and tests.
 
+#[cfg(feature = "keyfile")]
 use std::collections::HashMap;
+#[cfg(feature = "keyfile")]
 use std::path::Path;
 
-use serde::Deserialize;
-use zeroize::{Zeroize, Zeroizing};
+#[cfg(feature = "keyfile")]
+use zeroize::Zeroize;
+use zeroize::Zeroizing;
 
-use crate::envelope::{KeyId, KEY_ID_LEN};
+use crate::envelope::KeyId;
+#[cfg(feature = "keyfile")]
+use crate::envelope::KEY_ID_LEN;
 use crate::Error;
 
 /// 32 bytes of live key material: a DEK, or one of the deterministic index
@@ -29,6 +35,7 @@ use crate::Error;
 pub struct Key(Zeroizing<[u8; 32]>);
 
 impl Key {
+    /// Wraps 32 bytes of key material; they are wiped when the `Key` drops.
     pub fn new(bytes: [u8; 32]) -> Self {
         Self(Zeroizing::new(bytes))
     }
@@ -61,6 +68,12 @@ impl From<Zeroizing<[u8; 32]>> for Key {
     }
 }
 
+/// Where keys come from: the active DEK for new envelopes, any DEK by id for
+/// stored ones, and the named deterministic keys.
+///
+/// Synchronous by design — see the crate docs. An implementation that reaches
+/// a KMS over the network should cache, so that only a cold miss or a rotation
+/// touches the wire.
 pub trait KeySource: Send + Sync {
     /// The DEK new envelopes are encrypted under, with the id stamped into them.
     fn active_key(&self) -> Result<(KeyId, Key), Error>;
@@ -71,7 +84,7 @@ pub trait KeySource: Send + Sync {
     fn index_key(&self, name: &str) -> Result<Key, Error>;
 }
 
-/// Dev/test key source backed by a flat TOML file:
+/// Dev/test key source backed by a flat TOML file (`keyfile` feature):
 ///
 /// ```toml
 /// active = "00112233445566778899aabbccddeeff"
@@ -82,6 +95,7 @@ pub trait KeySource: Send + Sync {
 /// [index_keys]
 /// email = "<64 hex chars>"
 /// ```
+#[cfg(feature = "keyfile")]
 pub struct FileKeySource {
     active: KeyId,
     keys: HashMap<KeyId, Key>,
@@ -97,7 +111,8 @@ pub struct FileKeySource {
 /// Erasure is best-effort by construction: `toml` builds its own intermediate
 /// buffers while parsing, and this crate can neither name nor reach them. The
 /// goal is to remove the copies it does own.
-#[derive(Deserialize)]
+#[cfg(feature = "keyfile")]
+#[derive(serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 struct KeyFile {
     /// A key *id*, not key material — left in the clear so it can still be
@@ -108,6 +123,7 @@ struct KeyFile {
     index_keys: HashMap<String, String>,
 }
 
+#[cfg(feature = "keyfile")]
 impl Drop for KeyFile {
     fn drop(&mut self) {
         for hex_key in self.keys.values_mut().chain(self.index_keys.values_mut()) {
@@ -116,7 +132,10 @@ impl Drop for KeyFile {
     }
 }
 
+#[cfg(feature = "keyfile")]
 impl FileKeySource {
+    /// Reads and validates a keyfile. The caller is responsible for the
+    /// file's permissions; the proxy refuses one that is not mode 0600.
     pub fn load(path: &Path) -> Result<Self, Error> {
         // The whole file is every DEK and every deterministic index key in
         // plaintext hex, so it is held in a buffer that is wiped when it
@@ -189,6 +208,7 @@ impl FileKeySource {
     }
 }
 
+#[cfg(feature = "keyfile")]
 impl KeySource for FileKeySource {
     fn active_key(&self) -> Result<(KeyId, Key), Error> {
         Ok((self.active, self.keys[&self.active].clone()))
@@ -203,6 +223,7 @@ impl KeySource for FileKeySource {
     }
 }
 
+#[cfg(feature = "keyfile")]
 fn decode<const N: usize>(hex_str: &str, what: &str) -> Result<[u8; N], Error> {
     let mut raw =
         hex::decode(hex_str).map_err(|_| Error::KeySource(format!("{what} is not valid hex")))?;
@@ -212,6 +233,7 @@ fn decode<const N: usize>(hex_str: &str, what: &str) -> Result<[u8; N], Error> {
     result
 }
 
+#[cfg(feature = "keyfile")]
 fn decode_key(hex_str: &str) -> Result<Key, Error> {
     decode::<32>(hex_str, "key").map(Key::new)
 }
@@ -219,6 +241,7 @@ fn decode_key(hex_str: &str) -> Result<Key, Error> {
 /// Appends `bytes` as lowercase hex straight into `out`. `hex::encode` would
 /// hand back key material in a fresh `String` that nothing wipes; this writes
 /// it into the caller's zeroizing buffer instead.
+#[cfg(feature = "keyfile")]
 fn push_hex(out: &mut String, bytes: &[u8]) {
     const DIGITS: &[u8; 16] = b"0123456789abcdef";
     for &byte in bytes {
@@ -227,7 +250,7 @@ fn push_hex(out: &mut String, bytes: &[u8]) {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "keyfile"))]
 mod tests {
     use super::*;
 

@@ -26,6 +26,7 @@ pub trait Protect: Sized {
 
 /// The stored form of a [`Protect`] record.
 pub trait Sealed: Sized {
+    /// The record this is the stored form of.
     type Record: Protect<Sealed = Self>;
     /// Opens every protected field. A value that was never sealed is
     /// [`Error::Unprotected`].
@@ -39,6 +40,7 @@ pub trait Sealed: Sized {
 /// any other key type, by producing the same bytes the typed
 /// [`RowKey`] constructors do.
 pub trait ToRowKey {
+    /// The canonical row key for this value.
     fn to_row_key(&self) -> Result<RowKey, Error>;
 }
 

@@ -39,11 +39,17 @@ use crate::Error;
 /// `pg_catalog.pg_type`; these are stable across versions and are what the
 /// catalog lookup returns in `atttypid`.
 pub mod oid {
+    /// `bigint`.
     pub const INT8: u32 = 20;
+    /// `smallint`.
     pub const INT2: u32 = 21;
+    /// `integer`.
     pub const INT4: u32 = 23;
+    /// `text`.
     pub const TEXT: u32 = 25;
+    /// `varchar`.
     pub const VARCHAR: u32 = 1043;
+    /// `uuid`.
     pub const UUID: u32 = 2950;
 }
 
@@ -57,7 +63,9 @@ pub mod oid {
 /// (`proxy::portal::value_format`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Format {
+    /// PostgreSQL text format: the value as its textual spelling.
     Text,
+    /// PostgreSQL binary format: big-endian integers, raw uuid bytes.
     Binary,
 }
 

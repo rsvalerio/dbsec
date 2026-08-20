@@ -1,7 +1,7 @@
 //! `#[derive(Protect)]` against a `Protector`: the generated seal/open/term/
 //! mask agree with calling the protector by hand, and the struct's own policy
 //! is the one the protector was built from.
-#![cfg(feature = "derive")]
+#![cfg(all(feature = "derive", feature = "keyfile"))]
 
 use std::sync::Arc;
 

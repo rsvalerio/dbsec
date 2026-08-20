@@ -8,6 +8,7 @@ use sha2::Sha256;
 
 use crate::envelope;
 
+/// Length of the blind index stored ahead of a searchable column's envelope.
 pub const BLIND_INDEX_LEN: usize = 32;
 
 /// Computes the blind index for a plaintext under an index key.
