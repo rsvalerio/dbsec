@@ -1,19 +1,104 @@
 # dbsec
 
-Transparent PostgreSQL proxy for field-level encryption — deliberately small.
-A library (`dbsec-core`) does the work; the `dbsec` binary is a thin tokio TCP
-wrapper around it.
+Field-level encryption for PostgreSQL columns, as a Rust library — with a
+transparent proxy for the applications that cannot be changed. Both write the
+same bytes, so one table can serve an application that links the library and
+clients that go through the proxy.
 
-- AES-256-GCM ciphertext envelope with key ids (rotation-friendly) and the column bound
-  into the associated data, so stored bytes do not authenticate in another column;
-  Vault/OpenBao-backed keys
-- Searchable encryption via deterministic HMAC blind index
+- AES-256-GCM ciphertext envelope with key ids (rotation-friendly), bound to its
+  **column** and, opt-in, to its **row** — stored bytes moved elsewhere stop
+  authenticating
+- Equality search over ciphertext via a deterministic blind index
 - Storage-free pseudonymization (FF1 FPE + HMAC tokens) and read-path masking
-- TLS on both hops (rustls), flat TOML config, PostgreSQL only
+- Keys behind a `KeySource` trait (the proxy ships a Vault/OpenBao source);
+  `unsafe_code = "forbid"` workspace-wide
+- PostgreSQL only; TLS on both proxy hops (rustls); flat TOML config
 
-Status: scaffold. Roadmap and design in [plans/PLAN.md](plans/PLAN.md); how it
-compares to Acra, CipherStash and the rest in
-[plans/COMPARISON.md](plans/COMPARISON.md).
+Design and scope decisions in [plans/PLAN.md](plans/PLAN.md); how it compares
+to Acra, CipherStash and the rest in [plans/COMPARISON.md](plans/COMPARISON.md).
+
+## The library
+
+`dbsec-core` is the product; the policy is declared on the struct that holds
+the data.
+
+```toml
+[dependencies]
+dbsec-core = { version = "0.5", features = ["derive"] }
+```
+
+```rust
+use dbsec_core::{protector::Protector, Protect};
+
+#[derive(Protect, Clone)]
+#[dbsec(table = "users", row_key = "id", sealed_derive(sqlx::FromRow))]
+struct User {
+    id: i64,
+    #[dbsec(searchable)]               email: String,
+    #[dbsec(fpe, mask(keep_last = 4))] phone: String,
+    display_name: String,
+}
+
+let p = Protector::new(User::policy(), keys)?;   // keys: Arc<dyn KeySource> — your KMS
+
+// write
+let sealed = user.seal(&p)?;                      // UserSealed: email is Vec<u8>, phone a String
+sqlx::query("INSERT INTO users (id, email, phone, display_name) VALUES ($1, $2, $3, $4)")
+    .bind(sealed.id).bind(&sealed.email).bind(&sealed.phone).bind(&sealed.display_name)
+    .execute(&mut conn).await?;
+
+// search by equality — the same predicate the proxy rewrites `email = $1` to
+let rows: Vec<UserSealed> =
+    sqlx::query_as("SELECT * FROM users WHERE substring(email from 1 for 32) = $1")
+        .bind(User::email_term(&p, b"a@b.io")?).fetch_all(&mut conn).await?;
+
+// read
+let user = rows[0].clone().open(&p)?;             // bound to its row: the wrong row is Error::Decrypt
+let shown = user.masked(&p)?;                     // phone = "********4567"
+```
+
+Getting it wrong is an error, not a weaker seal: a column the policy does not
+name, a row-bound column without its row key, a struct that disagrees with the
+protector's policy on a column's stored form, an attempt to open a value that
+was never sealed (`open_lenient` accepts one, by name). Without the derive,
+`Protector` offers `seal` / `open` / `search_term` / `mask` by column name, and
+a policy can also be read from the proxy's TOML (`serde` feature) so the two
+share one file. `crates/core/examples/embedded.rs` is the complete sqlx
+application, run by `make e2e`; the crate docs carry the runnable example, the
+stored-format table and what the library does *not* protect.
+
+## The proxy
+
+For an application that cannot be changed, the `dbsec` binary sits between the
+client and PostgreSQL and does the same work on the wire: it seals values in
+`INSERT`/`UPDATE`, rewrites equality predicates over searchable columns to the
+blind index, and opens and masks result columns — with TLS on both hops and the
+same policy, in TOML:
+
+```toml
+listen      = "127.0.0.1:6432"
+upstream    = "127.0.0.1:5432"
+control_dsn = "postgres://dbsec@127.0.0.1:5432/app?sslmode=require"
+keys_file   = "/etc/dbsec/keys.toml"      # or a [vault] section
+
+[[column]]
+table = "users"
+column = "email"
+searchable = true
+
+[[column]]
+table = "users"
+column = "phone"
+transform = "fpe"
+mask = { keep_last = 4 }
+
+[[table]]
+table = "users"
+row_key = "id"
+```
+
+A proxy cannot see everything a library can, and the rest of this document is
+about exactly that: what it refuses, what it warns about, and how to run it.
 
 ## Operating the proxy
 
@@ -369,7 +454,8 @@ Both e2e targets also run in CI (`.github/workflows/e2e.yml`) against service
 containers, since the QA gates alone never reach them.
 
 `make e2e` runs the proxy between a dockerized Postgres and tokio-postgres, sqlx
-and psycopg 2/3; the Python cases are skipped unless
+and psycopg 2/3, then the library's `embedded` example against the same
+database; the Python cases are skipped unless
 `pip install 'psycopg[binary]' psycopg2-binary` has run — set
 `DBSEC_E2E_STRICT_DRIVERS=1` to make that a failure instead. Both targets reuse
 services you already run when `DBSEC_E2E_DSN` / `DBSEC_E2E_VAULT_ADDR` are set,
