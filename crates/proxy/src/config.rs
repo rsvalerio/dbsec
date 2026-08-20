@@ -53,57 +53,18 @@ use dbsec_core::ident::MAX_IDENTIFIER_BYTES;
 #[cfg(test)]
 use dbsec_core::policy::TransformKind;
 use dbsec_core::policy::{ColumnPolicy, Policy, TablePolicy};
+pub use dbsec_vault::{VaultConfig, VaultSetup};
 use serde::Deserialize;
 use zeroize::Zeroizing;
 
 use crate::Error;
 
-/// What a redacted secret renders as, in both [`Secret`] and [`Dsn`].
+/// What a redacted secret renders as, in both [`dbsec_vault::Secret`] and [`Dsn`].
 const REDACTED: &str = "<redacted>";
-
-/// A configured credential, held in a buffer that is wiped when it drops and
-/// whose [`Debug`] never prints the value.
-///
-/// [`Config`] derives `Debug`, and the reason to derive it is that somebody
-/// eventually writes `?config` into a `tracing` call while chasing a startup
-/// failure. The Vault token is the credential that unwraps every DEK and reads
-/// every deterministic index key, so it is the one value in the config that
-/// must survive that without leaking. `expose` is deliberately ugly: it makes
-/// every read site greppable.
-///
-/// Erasure is best-effort at the edges. `serde` materialises the token in its
-/// own `String` before this type can take ownership of it, and `toml` keeps
-/// intermediate buffers of the whole config text — neither is reachable from
-/// here. What this removes is the copies the proxy itself owns and keeps.
-#[derive(Clone)]
-pub struct Secret(Zeroizing<String>);
-
-impl Secret {
-    pub fn new(value: String) -> Self {
-        Self(Zeroizing::new(value))
-    }
-
-    /// The credential itself, for the one call that has to send it.
-    pub fn expose(&self) -> &str {
-        &self.0
-    }
-}
-
-impl fmt::Debug for Secret {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(REDACTED)
-    }
-}
-
-impl<'de> Deserialize<'de> for Secret {
-    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        String::deserialize(deserializer).map(Self::new)
-    }
-}
 
 /// A PostgreSQL connection string, printed with its password masked.
 ///
-/// Unlike [`Secret`] the whole value is not sensitive: the scheme, user, host,
+/// Unlike [`dbsec_vault::Secret`] the whole value is not sensitive: the scheme, user, host,
 /// port and database name are exactly what an operator needs when the control
 /// connection fails at boot, which is the most failure-prone step there is.
 /// Only the password is hidden, so a `?config` stays useful.
@@ -254,64 +215,11 @@ fn mask_password_parameters(input: &str, out: &mut String) {
     }
 }
 
-/// Refuses a secret file that anyone but its owner can read.
-///
-/// `keys_file` is every master key in plaintext hex, `[vault] token_file`
-/// is the credential that unwraps them, and `[tls.downstream] key` is the
-/// private key the proxy authenticates itself with — so a `0644` on any of
-/// them defeats the product outright, and `0644` is what `cp`, a Docker
-/// `COPY`, an editor that recreates the file on save, or a config-management
-/// template with no explicit mode all produce silently. `ssh` refuses a
-/// private key on the same grounds (SEC-29). Refusing rather than warning is
-/// deliberate: a startup warning scrolls past, and the failure mode this
-/// prevents is permanent.
-///
-/// The TLS key gets the same refusal as the other two rather than a warning,
-/// even though a service group sharing a key is a real deployment shape. The
-/// group-readable case is not a safe exception here: this proxy is a single
-/// process that reads the key itself at startup, so nothing else in the group
-/// needs it, and a group-readable copy hands every local member the ability
-/// to impersonate the proxy to its clients and to decrypt any captured
-/// session that did not negotiate forward secrecy. A deployment that must
-/// share the key with another service should give that service its own
-/// `0600` copy — or, if the sharing is genuinely required, say so in config
-/// rather than have the proxy infer consent from a permission bit.
-///
-/// A file that cannot be stat'ed is left alone. The read that follows reports
-/// the real I/O error with its path (ERR-13), which is a better message than
-/// anything this check could invent for a path that may not exist yet.
-///
-/// `holds` names the credential in the refusal, because the file this is
-/// applied to is not always obviously a secret: the config file itself gets
-/// the same check once it carries an inline `[vault] token` or a
-/// password-bearing `control_dsn`, and "dbsec.toml is readable beyond its
-/// owner" without saying *why* reads as a bug rather than as the thing to fix.
-#[cfg(unix)]
+/// The secret-file check every credential-bearing path goes through
+/// ([`dbsec_core::keys::check_secret_file_mode`]), as a config error.
 fn check_secret_file_mode(path: &Path, holds: &str) -> Result<(), Error> {
-    use std::os::unix::fs::PermissionsExt as _;
-
-    let Ok(metadata) = std::fs::metadata(path) else {
-        return Ok(());
-    };
-    let mode = metadata.permissions().mode();
-    if mode & 0o077 != 0 {
-        return Err(Error::InvalidConfig(format!(
-            "{} is readable beyond its owner (mode {:04o}); it holds {holds} — chmod 600 {}",
-            path.display(),
-            mode & 0o7777,
-            path.display()
-        )));
-    }
-    Ok(())
-}
-
-/// Non-unix targets have no `st_mode` to inspect and no equivalent this crate
-/// can check portably, so the check is a documented no-op there rather than a
-/// build failure. Secret-file permissions on those platforms are the
-/// deployment's responsibility.
-#[cfg(not(unix))]
-fn check_secret_file_mode(_path: &Path, _holds: &str) -> Result<(), Error> {
-    Ok(())
+    dbsec_core::keys::check_secret_file_mode(path, holds)
+        .map_err(|e| Error::InvalidConfig(e.to_string()))
 }
 
 /// Key-name fragments whose value is, or may contain, a credential.
@@ -329,7 +237,7 @@ const SECRET_KEY_MARKERS: [&str; 5] = ["token", "password", "secret", "dsn", "ke
 /// `toml::de::Error`'s own `Display` quotes the input around the failure, so
 /// `error!("{e}")` on a config with a lost closing quote on `token = "…"`
 /// prints the Vault token — the credential that unwraps every DEK — into
-/// stderr and every log pipeline collecting it. [`Secret`] and [`Dsn`] cannot
+/// stderr and every log pipeline collecting it. [`dbsec_vault::Secret`] and [`Dsn`] cannot
 /// help: they only ever hold values that parsed.
 ///
 /// What survives is `message()` (the parser's own words, with no input in
@@ -505,133 +413,6 @@ pub enum OnUnprotected {
     Reject,
 }
 
-#[derive(Debug, Clone, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct VaultConfig {
-    /// e.g. `https://bao.internal:8200`. Validated as a URL with an `https`
-    /// scheme by [`VaultConfig::validate_addr`].
-    pub addr: String,
-    /// Accepts a plaintext `http://` [`Self::addr`]. Development only — see
-    /// [`VaultConfig::validate_addr`] for what travels over that channel.
-    #[serde(default)]
-    pub allow_insecure_addr: bool,
-    /// Static token; prefer `token_file` outside of dev.
-    pub token: Option<Secret>,
-    /// File containing the token (e.g. written by an agent sidecar).
-    pub token_file: Option<PathBuf>,
-    /// KV v2 mount holding wrapped DEKs and index keys.
-    #[serde(default = "default_vault_mount")]
-    pub mount: String,
-    /// Base path within the mount.
-    #[serde(default = "default_vault_path")]
-    pub path: String,
-    /// Transit mount used to wrap/unwrap DEKs.
-    #[serde(default = "default_transit_mount")]
-    pub transit_mount: String,
-    /// Transit key name the DEK envelope is encrypted under.
-    #[serde(default = "default_vault_path")]
-    pub transit_key: String,
-    /// Timeout for each Vault request, and the budget for one key lookup made
-    /// from the relay path. Unset, `vaultrs` leaves the HTTP client with no
-    /// timeout at all, so a Vault that accepts the connection and then stops
-    /// answering would park a runtime worker for the life of the process.
-    #[serde(default = "default_vault_timeout_secs")]
-    pub timeout_secs: u64,
-}
-
-impl VaultConfig {
-    /// Parses [`Self::addr`] and refuses anything that is not a TLS Vault
-    /// endpoint.
-    ///
-    /// Two properties are established here, both at startup rather than on the
-    /// connect path:
-    ///
-    /// - **It is a URL.** `vaultrs`' `VaultClientSettingsBuilder::address` is
-    ///   documented "# Panics" and parses with `Url::parse(..).unwrap()`, so a
-    ///   typo in `addr` would otherwise abort the process from inside
-    ///   `VaultKeySource::connect` instead of joining every neighbouring
-    ///   misconfiguration as a clean startup error (ERR-11).
-    /// - **Its scheme is `https`.** This is the channel that carries the Vault
-    ///   token, every DEK in plaintext and every deterministic index key. The
-    ///   proxy hard-refuses a plaintext peer on both pgwire hops once TLS is
-    ///   configured, so tolerating a fully plaintext KMS hop — the one whose
-    ///   compromise yields the entire key hierarchy — would be the weakest
-    ///   link deciding the whole (SEC-31). A `http://` dev address stays
-    ///   reachable, but only by writing `allow_insecure_addr = true`, which is
-    ///   a deliberate act rather than a config copied out of an example.
-    ///
-    /// `addr` is echoed in the refusals: unlike `control_dsn` it is an
-    /// endpoint, and the credential beside it lives in `token`/`token_file`.
-    fn validate_addr(&self) -> Result<(), Error> {
-        let addr = url::Url::parse(&self.addr).map_err(|e| {
-            Error::InvalidConfig(format!("[vault] addr {:?} is not a URL: {e}", self.addr))
-        })?;
-        match addr.scheme() {
-            "https" => Ok(()),
-            "http" if self.allow_insecure_addr => {
-                tracing::warn!(
-                    addr = self.addr,
-                    "[vault] allow_insecure_addr is set: the Vault token, every DEK plaintext \
-                     and every deterministic index key cross the network in the clear"
-                );
-                Ok(())
-            }
-            "http" => Err(Error::InvalidConfig(format!(
-                "[vault] addr {:?} is plaintext http, which would put the Vault token, every \
-                 DEK plaintext and every deterministic index key on the wire in the clear. Use \
-                 https, or set allow_insecure_addr = true to accept that in development",
-                self.addr
-            ))),
-            other => Err(Error::InvalidConfig(format!(
-                "[vault] addr {:?} has scheme {other:?}; Vault is reached over https",
-                self.addr
-            ))),
-        }
-    }
-
-    /// Resolves the token from whichever of the two sources is configured.
-    ///
-    /// Called once, by [`Config::validate`], and the result is carried in the
-    /// [`VaultSetup`] validation hands out — so `token_file` is read exactly
-    /// once per startup, and the async connect path neither re-reads it nor
-    /// performs blocking file I/O on the runtime (CONC-5).
-    fn resolve_token(&self) -> Result<Secret, Error> {
-        match (&self.token, &self.token_file) {
-            (Some(token), None) => Ok(token.clone()),
-            (None, Some(path)) => {
-                check_secret_file_mode(path, "the Vault token")?;
-                // The file contents are the token: read into a buffer that is
-                // wiped on drop, and hand the trimmed copy straight to
-                // `Secret`, which is wiped in turn.
-                let raw = Zeroizing::new(
-                    std::fs::read_to_string(path)
-                        .map_err(|source| Error::VaultToken { path: path.clone(), source })?,
-                );
-                Ok(Secret::new(raw.trim().to_owned()))
-            }
-            _ => {
-                Err(Error::InvalidConfig("[vault] needs exactly one of token or token_file".into()))
-            }
-        }
-    }
-}
-
-fn default_vault_mount() -> String {
-    "secret".to_owned()
-}
-
-fn default_vault_path() -> String {
-    "dbsec".to_owned()
-}
-
-fn default_transit_mount() -> String {
-    "transit".to_owned()
-}
-
-fn default_vault_timeout_secs() -> u64 {
-    5
-}
-
 #[derive(Debug, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct TlsSection {
@@ -725,15 +506,6 @@ pub enum KeySourceConfig {
     Vault(Box<VaultSetup>),
 }
 
-/// A `[vault]` section with its token already resolved — the form the connect
-/// path consumes. Validation proves the token is obtainable *by obtaining it*,
-/// rather than by resolving a throwaway copy and dropping it (SEC-5).
-#[derive(Debug, Clone)]
-pub struct VaultSetup {
-    pub config: VaultConfig,
-    pub token: Secret,
-}
-
 /// What the protected-column path needs, proved present by validation:
 /// exactly one key source and a control DSN. Constructed only by
 /// [`Config::validated`], and only when at least one `[[column]]` is
@@ -759,7 +531,7 @@ impl Config {
     pub fn load(path: &Path) -> Result<ValidatedConfig, Error> {
         // A config with an inline `[vault] token` holds a credential, so the
         // file's text is wiped when it drops rather than left in the heap for
-        // the life of the process. Same best-effort caveat as [`Secret`]:
+        // the life of the process. Same best-effort caveat as [`dbsec_vault::Secret`]:
         // `toml`'s own intermediate buffers are outside this crate's reach.
         let raw = Zeroizing::new(
             std::fs::read_to_string(path)
@@ -835,15 +607,7 @@ impl Config {
         // rather than once to prove it is readable and again to connect.
         let vault = match &self.vault {
             None => None,
-            Some(vault) => {
-                if vault.timeout_secs == 0 {
-                    return Err(Error::InvalidConfig(
-                        "[vault] timeout_secs must be greater than 0".into(),
-                    ));
-                }
-                vault.validate_addr()?;
-                Some(VaultSetup { config: vault.clone(), token: vault.resolve_token()? })
-            }
+            Some(vault) => Some(vault.resolve()?),
         };
         let protected = if self.columns.is_empty() {
             None

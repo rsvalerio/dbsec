@@ -13,6 +13,7 @@ path = "src/main.rs"
 [dependencies]
 dbsec-core = { workspace = true, features = ["keyfile"] }
 dbsec-pgwire = { workspace = true }
+dbsec-vault = { workspace = true }
 tokio = { workspace = true }
 rustls = { workspace = true }
 tokio-rustls = { workspace = true }
@@ -20,10 +21,6 @@ rustls-pki-types = { workspace = true }
 tokio-postgres = { workspace = true }
 tokio-postgres-rustls = { workspace = true }
 sqlparser = { workspace = true }
-vaultrs = { workspace = true }
-url = { workspace = true }
-base64 = { workspace = true }
-rand = { workspace = true }
 zeroize = { workspace = true }
 hex = { workspace = true }
 tracing = { workspace = true }

@@ -1,4 +1,4 @@
-//! OpenBao/Vault `KeySource` (milestone 9).
+//! The `KeySource` itself: storage layout, caches, and the token-lease watch.
 //!
 //! DEKs use a Transit envelope: at startup the proxy asks Transit for a fresh
 //! data key and stores only the wrapped ciphertext in KV v2 under the random
@@ -80,6 +80,7 @@ use std::sync::RwLock;
 use std::time::{Duration, Instant};
 
 use base64::Engine as _;
+use dbsec_core::diag::chain;
 use dbsec_core::envelope::{KeyId, KEY_ID_LEN};
 use dbsec_core::keys::{Key, KeySource};
 use dbsec_core::sync::Unpoisoned as _;
@@ -91,8 +92,7 @@ use vaultrs::client::{VaultClient, VaultClientSettings, VaultClientSettingsBuild
 use vaultrs::error::ClientError;
 use zeroize::{Zeroize, Zeroizing};
 
-use crate::config::{VaultConfig, VaultSetup};
-use crate::Error;
+use crate::{Error, VaultConfig, VaultSetup};
 
 /// Negative cache for DEK ids Vault has no record of.
 ///
@@ -104,7 +104,7 @@ use crate::Error;
 /// written under a lost DEK issues one Vault roundtrip *per value*
 /// (PERF-16, SEC-33). Only "no such secret" is cached — a transport failure
 /// or a permission denial is never remembered as an absent key.
-const MISSING_DEK_CACHE_TTL: Duration = Duration::from_mins(1);
+const MISSING_DEK_CACHE_TTL: Duration = Duration::from_secs(60);
 const MISSING_DEK_CACHE_MAX: usize = 4096;
 
 /// How often [`token_watch`] asks Vault about the token the proxy holds.
@@ -112,7 +112,7 @@ const MISSING_DEK_CACHE_MAX: usize = 4096;
 /// One request a minute against `auth/token/lookup-self` is nothing next to
 /// the traffic the proxy already carries, and it bounds how stale the
 /// "expiring soon" warning can be.
-const TOKEN_CHECK_INTERVAL: Duration = Duration::from_mins(1);
+const TOKEN_CHECK_INTERVAL: Duration = Duration::from_secs(60);
 
 /// A token with less lease than this left is renewed on the next check — or,
 /// when it cannot be renewed, warned about on every check until it is.
@@ -120,7 +120,7 @@ const TOKEN_CHECK_INTERVAL: Duration = Duration::from_mins(1);
 /// Comfortably more than one [`TOKEN_CHECK_INTERVAL`], so a renewal that
 /// fails still leaves several attempts (and several warnings) before the lease
 /// actually runs out.
-const TOKEN_RENEW_THRESHOLD: Duration = Duration::from_mins(10);
+const TOKEN_RENEW_THRESHOLD: Duration = Duration::from_secs(600);
 
 /// The environment variable `vaultrs` would otherwise let decide whether the
 /// Vault server's certificate is verified. See [`client_settings`].
@@ -139,7 +139,9 @@ struct WrappedDek {
 /// leaves a record of what the previous key was — the proxy itself only ever
 /// uses `current` (see the module docs).
 #[derive(Clone, Serialize, Deserialize)]
-pub(crate) struct IndexKeyRecord {
+/// Testing seam; not API.
+#[doc(hidden)]
+pub struct IndexKeyRecord {
     current: u32,
     versions: BTreeMap<u32, String>,
 }
@@ -189,7 +191,9 @@ impl Drop for IndexKeyRecord {
 /// never be rotated, so it is wiped on drop instead of being freed intact.
 /// Serde sees through the newtype, so the stored shape is unchanged.
 #[derive(Deserialize)]
-pub(crate) struct LegacyIndexKeys(HashMap<String, String>);
+/// Testing seam; not API.
+#[doc(hidden)]
+pub struct LegacyIndexKeys(HashMap<String, String>);
 
 impl LegacyIndexKeys {
     fn get(&self, name: &str) -> Option<&str> {
@@ -215,7 +219,10 @@ impl Drop for LegacyIndexKeys {
 /// — which branch mints, which propagates, which retries — is exercised
 /// without a live server. `None` means "no such secret"; every other failure
 /// is an `Err`, because the two are not interchangeable for key material.
-pub(crate) trait KeyStore: Send + Sync {
+/// The Vault operations the key source needs, as a trait so the caching and
+/// minting logic is tested against a fake. Testing seam; not API.
+#[doc(hidden)]
+pub trait KeyStore: Send + Sync {
     /// Reads the versioned record for `name`.
     fn read_index_key(
         &self,
@@ -249,11 +256,13 @@ pub(crate) trait KeyStore: Send + Sync {
 
 /// What Vault says about the proxy's own token.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct TokenStatus {
+/// Testing seam; not API.
+#[doc(hidden)]
+pub struct TokenStatus {
     /// Time left on the lease. Zero means "never expires" — a root token or a
     /// periodic one Vault reports without a TTL.
-    pub(crate) ttl: Duration,
-    pub(crate) renewable: bool,
+    pub ttl: Duration,
+    pub renewable: bool,
 }
 
 impl TokenStatus {
@@ -265,7 +274,9 @@ impl TokenStatus {
 /// The outcome of one pass of [`token_watch`], so the decision is testable
 /// without waiting on a timer.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum TokenCheck {
+/// Testing seam; not API.
+#[doc(hidden)]
+pub enum TokenCheck {
     /// Nothing to do: the token never expires, or has plenty of lease left.
     Healthy,
     /// The lease was running down and Vault extended it.
@@ -278,7 +289,8 @@ pub(crate) enum TokenCheck {
 }
 
 /// The live Vault-backed [`KeyStore`].
-pub(crate) struct VaultStore {
+/// The real [`KeyStore`]: a `vaultrs` client over Transit and KV v2.
+pub struct VaultStore {
     client: VaultClient,
     config: VaultConfig,
 }
@@ -475,7 +487,9 @@ fn client_settings(
         .map_err(|e| backend_error("building the vault client settings".to_owned(), e))
 }
 
-pub(crate) struct VaultKeySource<S = VaultStore> {
+/// The key source. Generic over its [`KeyStore`] so the cache and minting
+/// logic is tested against a fake; [`VaultStore`] is the real one.
+pub struct VaultKeySource<S = VaultStore> {
     store: S,
     handle: tokio::runtime::Handle,
     /// Budget for one key lookup made from the sync relay path, and the
@@ -491,7 +505,7 @@ pub(crate) struct VaultKeySource<S = VaultStore> {
 impl VaultKeySource<VaultStore> {
     /// Connects, generates this run's DEK through Transit, and records its
     /// wrapped form in KV. DEKs rotate freely — every startup gets a new one.
-    pub(crate) async fn connect(setup: &VaultSetup) -> Result<Self, Error> {
+    pub async fn connect(setup: &VaultSetup) -> Result<Self, Error> {
         let config = &setup.config;
         let timeout = Duration::from_secs(config.timeout_secs);
         let skip_verify = std::env::var(SKIP_VERIFY_ENV).ok();
@@ -680,7 +694,7 @@ impl<S: KeyStore> VaultKeySource<S> {
                 // Not evidence of a bad token: Vault may simply be
                 // unreachable, and the caches keep serving meanwhile.
                 tracing::warn!(
-                    error = %crate::diag::chain(&e),
+                    error = %chain(&e),
                     "could not check the vault token's lease"
                 );
                 return TokenCheck::Unknown;
@@ -705,7 +719,7 @@ impl<S: KeyStore> VaultKeySource<S> {
             }
             Err(e) => {
                 tracing::warn!(
-                    error = %crate::diag::chain(&e),
+                    error = %chain(&e),
                     ttl_secs = status.ttl.as_secs(),
                     "the vault token is near expiry and renewal failed; issue a fresh token \
                      and restart the proxy before the lease runs out"
@@ -725,17 +739,28 @@ impl<S: KeyStore> VaultKeySource<S> {
 /// ERROR with no hint that the cause is an expired lease. That failure mode is
 /// what pushes deployments towards long-lived or root tokens.
 ///
-/// Runs until `shutdown` flips, mirroring [`crate::resolve::refresh_loop`].
-pub(crate) async fn token_watch<S: KeyStore>(
+/// Runs until `shutdown` resolves.
+pub async fn token_watch<S: KeyStore>(
     source: std::sync::Arc<VaultKeySource<S>>,
-    mut shutdown: tokio::sync::watch::Receiver<bool>,
+    shutdown: impl Future<Output = ()>,
 ) {
+    tokio::pin!(shutdown);
     loop {
         tokio::select! {
             () = tokio::time::sleep(TOKEN_CHECK_INTERVAL) => {}
-            _ = shutdown.changed() => return,
+            () = &mut shutdown => return,
         }
         source.check_token().await;
+    }
+}
+
+impl<S: KeyStore + 'static> VaultKeySource<S> {
+    /// [`token_watch`] as a method: `keys.clone().token_watch(shutdown)`.
+    pub fn token_watch(
+        self: std::sync::Arc<Self>,
+        shutdown: impl Future<Output = ()>,
+    ) -> impl Future<Output = ()> {
+        token_watch(self, shutdown)
     }
 }
 
@@ -801,6 +826,60 @@ fn decode_key_hex(encoded: &str) -> Result<Key, CoreError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Claims the right to install a thread-local `tracing` subscriber and
+    /// assert on what it saw. Same mechanism as the proxy's `log_capture`:
+    /// `tracing` rebuilds its callsite-interest cache only when the count of
+    /// scoped subscribers rises from zero, so capture tests are serialised.
+    fn log_capture() -> std::sync::RwLockWriteGuard<'static, ()> {
+        static LOG_CAPTURE: RwLock<()> = RwLock::new(());
+        LOG_CAPTURE.write().unpoisoned()
+    }
+
+    #[derive(Clone, Default)]
+    struct CapturedEvents(std::sync::Arc<RwLock<Vec<String>>>);
+
+    impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for CapturedEvents {
+        fn on_event(
+            &self,
+            event: &tracing::Event<'_>,
+            _ctx: tracing_subscriber::layer::Context<'_, S>,
+        ) {
+            struct Fields<'a>(&'a mut String);
+            impl tracing::field::Visit for Fields<'_> {
+                fn record_debug(
+                    &mut self,
+                    field: &tracing::field::Field,
+                    value: &dyn std::fmt::Debug,
+                ) {
+                    use std::fmt::Write as _;
+                    let _ = write!(self.0, " {}={value:?}", field.name());
+                }
+            }
+            let mut line = event.metadata().level().to_string();
+            event.record(&mut Fields(&mut line));
+            self.0.write().unpoisoned().push(line);
+        }
+    }
+
+    /// Runs `drive` under a capturing subscriber and hands back what it
+    /// returned and every event it emitted. `drive` runs twice and the first
+    /// pass is discarded: it primes the callsite-interest cache, which
+    /// `rebuild_interest_cache` then recomputes against the capturing
+    /// subscriber.
+    fn captured_events<T>(mut drive: impl FnMut() -> T) -> (T, Vec<String>) {
+        use tracing_subscriber::layer::SubscriberExt as _;
+        let _capture = log_capture();
+        drop(drive());
+        let captured = CapturedEvents::default();
+        let subscriber = tracing_subscriber::registry().with(captured.clone());
+        let value = tracing::subscriber::with_default(subscriber, || {
+            tracing::callsite::rebuild_interest_cache();
+            drive()
+        });
+        let events = captured.0.read().unpoisoned().clone();
+        (value, events)
+    }
     use std::sync::Mutex;
 
     const NAME: &str = "public.users.email";
@@ -1024,7 +1103,7 @@ mod tests {
     fn migrating_out_of_the_shared_map_warns_and_names_the_key() {
         let runtime =
             tokio::runtime::Builder::new_current_thread().enable_all().build().expect("runtime");
-        let (_, events) = crate::captured_events(|| {
+        let (_, events) = captured_events(|| {
             // Built inside the runtime: `VaultKeySource` arms a timer as it is
             // constructed, which needs a reactor in scope.
             runtime.block_on(async {
@@ -1213,7 +1292,7 @@ mod tests {
     /// it believed it did something.
     #[test]
     fn vault_skip_verify_can_neither_disable_verification_nor_pass_unreported() {
-        let (settings, events) = crate::captured_events(|| {
+        let (settings, events) = captured_events(|| {
             client_settings(
                 &vault_config("https://bao.internal:8200"),
                 "t",

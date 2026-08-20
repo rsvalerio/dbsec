@@ -3,7 +3,8 @@
 //! decryption of configured columns on the read path. See plans/PLAN.md.
 
 mod config;
-mod diag;
+/// Error-chain rendering for the log, shared with the library crates.
+use dbsec_core::diag;
 mod encrypt;
 mod hardening;
 mod portal;
@@ -11,7 +12,6 @@ mod resolve;
 mod rows;
 mod session;
 mod tls;
-mod vault;
 
 use std::ffi::OsString;
 use std::future::Future;
@@ -211,6 +211,20 @@ pub fn captured_events<T>(mut drive: impl FnMut() -> T) -> (T, Vec<String>) {
     (value, captured.events())
 }
 
+/// The Vault crate's configuration errors are config errors here, its token
+/// file failure keeps its own variant, and anything from the key path is
+/// [`Error::Wire`] like every other `dbsec_core::Error`.
+impl From<dbsec_vault::Error> for Error {
+    fn from(err: dbsec_vault::Error) -> Self {
+        match err {
+            dbsec_vault::Error::Config(message) => Error::InvalidConfig(message),
+            dbsec_vault::Error::TokenFile { path, source } => Error::VaultToken { path, source },
+            dbsec_vault::Error::Key(inner) => Error::Wire(inner),
+            other => Error::InvalidConfig(other.to_string()),
+        }
+    }
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
     #[error("{message}; {USAGE}")]
@@ -231,7 +245,7 @@ pub enum Error {
     /// itself: that error's `Display` embeds the offending source line
     /// verbatim, so a lost quote on an inline `[vault] token` or a
     /// `control_dsn` password would print the credential to stderr — the one
-    /// leak [`config::Secret`] and [`config::Dsn`] cannot cover, because they
+    /// leak [`dbsec_vault::Secret`] and [`config::Dsn`] cannot cover, because they
     /// only ever hold values that parsed. [`config::describe_parse_error`]
     /// builds the reason, and the `toml` error is not kept as a `#[source]`
     /// either: anything walking the chain would print the snippet back.
@@ -618,7 +632,7 @@ async fn serve(validated: ValidatedConfig) -> Result<(), Error> {
             let keys: Arc<dyn dbsec_core::keys::KeySource> = match &protected.keys {
                 KeySourceConfig::File(keys_file) => Arc::new(FileKeySource::load(keys_file)?),
                 KeySourceConfig::Vault(setup) => {
-                    let source = Arc::new(vault::VaultKeySource::connect(setup).await?);
+                    let source = Arc::new(dbsec_vault::VaultKeySource::connect(setup).await?);
                     vault_keys = Some(source.clone());
                     source
                 }
@@ -684,8 +698,12 @@ async fn serve(validated: ValidatedConfig) -> Result<(), Error> {
             shutdown_rx.clone(),
         ))
     });
-    let token_watch =
-        vault_keys.map(|keys| tokio::spawn(vault::token_watch(keys, shutdown_rx.clone())));
+    let token_watch = vault_keys.map(|keys| {
+        let mut stop = shutdown_rx.clone();
+        tokio::spawn(keys.token_watch(async move {
+            let _ = stop.changed().await;
+        }))
+    });
     let mut sessions = JoinSet::new();
     let outcome = tokio::select! {
         result = accept_loop(listener, &ctx, config.max_sessions, &mut sessions, &shutdown_rx) => {

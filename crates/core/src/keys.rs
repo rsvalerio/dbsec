@@ -5,7 +5,6 @@
 
 #[cfg(feature = "keyfile")]
 use std::collections::HashMap;
-#[cfg(feature = "keyfile")]
 use std::path::Path;
 
 #[cfg(feature = "keyfile")]
@@ -82,6 +81,44 @@ pub trait KeySource: Send + Sync {
     /// A named deterministic key (blind index, FPE, HMAC tokens). These never
     /// rotate freely — rotating one breaks determinism (see plans/PLAN.md).
     fn index_key(&self, name: &str) -> Result<Key, Error>;
+}
+
+/// Refuses a secret-bearing file that anyone but its owner can read.
+///
+/// Mode `0600` or tighter, on unix. Group-readable is not a safe exception: a
+/// process that reads its own key at startup shares it with nobody, and a
+/// group-readable copy hands every local member the ability to impersonate it.
+/// A deployment that must share a key should give the other service its own
+/// `0600` copy.
+///
+/// A file that cannot be stat'ed is left alone: the read that follows reports
+/// the real I/O error with its path, which is a better message than anything
+/// this check could invent for a path that may not exist yet. `holds` names
+/// the credential in the refusal ("every master key", "the Vault token") so
+/// the message says why the file is a secret.
+///
+/// Non-unix targets have no `st_mode` to inspect, so the check is a documented
+/// no-op there; secret-file permissions are the deployment's responsibility.
+pub fn check_secret_file_mode(path: &Path, holds: &str) -> Result<(), Error> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        let Ok(metadata) = std::fs::metadata(path) else {
+            return Ok(());
+        };
+        let mode = metadata.permissions().mode();
+        if mode & 0o077 != 0 {
+            return Err(Error::SecretFileMode(format!(
+                "{} is readable beyond its owner (mode {:04o}); it holds {holds} — chmod 600 {}",
+                path.display(),
+                mode & 0o7777,
+                path.display()
+            )));
+        }
+    }
+    #[cfg(not(unix))]
+    let _ = (path, holds);
+    Ok(())
 }
 
 /// Dev/test key source backed by a flat TOML file (`keyfile` feature):

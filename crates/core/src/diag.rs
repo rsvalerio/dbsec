@@ -4,17 +4,16 @@
 //! `tracing_subscriber::fmt` does not walk [`std::error::Error::source`]. Every
 //! cause the error types in this workspace go out of their way to keep — the
 //! `io::Error` under a `tokio_postgres` connect failure, the `vaultrs` error
-//! under [`dbsec_core::Error::KeyBackend`] — is therefore invisible to the
+//! under [`crate::Error::KeyBackend`] — is therefore invisible to the
 //! operator, which is precisely the part that distinguishes "connection
 //! refused" from "certificate verify failed" and a Vault 403 from an
 //! unreachable Vault. [`chain`] is what the handling sites format instead.
 //!
 //! It renders only what the error types chose to expose. A variant that
-//! deliberately drops its cause keeps it dropped: [`crate::Error::ConfigParse`]
-//! holds a rendered `reason` and no `#[source]`, because the `toml` error's own
-//! `Display` echoes the offending config line — which, on a lost quote in an
-//! inline `[vault] token` or a `control_dsn`, is the credential itself. Nothing
-//! here can reach around that, and a test in `main` pins it.
+//! deliberately drops its cause keeps it dropped — the proxy's config-parse
+//! error holds a rendered reason and no `#[source]`, because the `toml`
+//! error's own `Display` echoes the offending config line, which may be a
+//! credential. Nothing here can reach around that.
 
 use std::fmt;
 
@@ -31,18 +30,18 @@ const MAX_CAUSES: usize = 8;
 ///
 /// Wraps rather than returning a `String` so nothing is formatted when the
 /// subscriber is not going to record the event.
-pub(crate) struct Chain<'a>(&'a (dyn std::error::Error + 'static));
+pub struct Chain<'a>(&'a (dyn std::error::Error + 'static));
 
 /// Formats `error` together with its `source()` chain — the value to pass to
 /// `tracing`'s `error = %…` field.
-pub(crate) fn chain<'a>(error: &'a (dyn std::error::Error + 'static)) -> Chain<'a> {
+pub fn chain<'a>(error: &'a (dyn std::error::Error + 'static)) -> Chain<'a> {
     Chain(error)
 }
 
 impl fmt::Display for Chain<'_> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        // Several variants in this crate interpolate `{source}` into their own
-        // message (`Error::Control`, `Error::Listen`, `Error::Hardening`), so
+        // Several proxy variants interpolate `{source}` into their own
+        // message, so
         // appending every link unconditionally would print the same sentence
         // twice before reaching the one link that is new. A cause whose text
         // the message above it already contains is therefore skipped — the

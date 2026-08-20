@@ -81,8 +81,12 @@ jobs:
           persist-credentials: false
       - uses: dtolnay/rust-toolchain@1.85
       - uses: Swatinem/rust-cache@v2
-      - name: cargo check at the declared rust-version
+      - name: cargo check at the declared rust-version (1.85)
         run: cargo check --locked -p dbsec-core -p dbsec-derive -p dbsec-pgwire --all-features
+      # dbsec-vault declares 1.86: its `url` -> `idna` -> `icu_*` graph needs it.
+      - uses: dtolnay/rust-toolchain@1.86
+      - name: cargo check at the declared rust-version (1.86, dbsec-vault)
+        run: cargo +1.86 check --locked -p dbsec-vault
 
   # The reusable workflows above follow forge automatically because they are
   # referenced by tag; the config files copied out of forge do not. This job is
