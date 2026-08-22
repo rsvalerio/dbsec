@@ -1,30 +1,22 @@
 # Command overrides for `ops`. Everything not defined here comes from the rust
 # stack defaults; `ops list` shows the merged set.
 
-# nextest runs the unit and integration tests; it does not run doctests, so
-# those stay on `cargo test --doc` (next-doc). The stack's `test` /
-# `test-ignored` are left alone as the plain-cargo escape hatch.
 [commands.next]
 program = "cargo"
 args = ["nextest", "run", "--workspace", "--all-features"]
 help = "Run unit and integration tests with nextest"
 category = "Code Quality"
 
-[commands.next-doc]
+[commands.test-doc]
 program = "cargo"
 args = ["test", "--workspace", "--all-features", "--doc"]
-help = "Run doctests (nextest does not run them)"
+help = "Run doctests"
 category = "Code Quality"
 
-# Replaces the rust stack default qa (deps, test, test-ignored). `test-ignored`
-# is deliberately not carried over: every `#[ignore]`d test in this workspace
-# either needs the Postgres/OpenBao containers (`make e2e`, `make e2e-vault`)
-# or is the throughput bench in crates/core/tests/bench.rs, which is a
-# stopwatch rather than a gate. Running them here would fail the local gate on
-# any machine without docker.
 [commands.qa]
-commands = ["deps", "next", "next-doc"]
+commands = ["deps", "next", "next-doc", "next-ignored", "sec"]
 parallel = false
 fail_fast = true
-help = "Run deps, next, next-doc"
+help = "Run deps, next, next-doc, next-ignored"
 category = "Code Quality"
+
